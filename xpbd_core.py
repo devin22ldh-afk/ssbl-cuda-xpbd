@@ -1,0 +1,522 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import bmesh
+import bpy
+import numpy as np
+
+
+_EPS = 1.0e-8
+SELF_COLLISION_OFF = 0
+SELF_COLLISION_FAST = 1
+DEFAULT_HARDNESS = 0.6
+_SOFT_STRETCH_COMPLIANCE = 8.0e-6
+_HARD_STRETCH_COMPLIANCE = 1.0e-9
+_SOFT_BEND_COMPLIANCE = 2.0e-3
+_HARD_BEND_COMPLIANCE = 1.0e-9
+_SOFT_TETHER_COMPLIANCE = 8.0e-4
+_HARD_TETHER_COMPLIANCE = 1.0e-9
+_SOFT_TETHER_SLACK = 1.20
+_HARD_TETHER_SLACK = 0.95
+_HARDNESS_OUTPUT_SCALE = 0.70
+_TETHER_START_HARDNESS = 0.50
+_LEGACY_BALANCED_STRETCH = 1.0e-6
+_LEGACY_BALANCED_BEND = 1.0e-4
+
+
+@dataclass
+class SolverOptions:
+    dt: float
+    damping: float
+    gravity: np.ndarray
+    stretch_compliance: float
+    bend_compliance: float
+    lra_compliance: float
+    collision_margin: float
+    use_ground: bool
+    ground_height: float
+    use_wall: bool
+    wall_origin: np.ndarray
+    wall_normal: np.ndarray
+    use_sphere: bool
+    sphere_center: np.ndarray
+    sphere_radius: float
+    self_collision: bool
+    self_collision_mode: int
+    cloth_thickness: float
+    self_collision_interval: int
+    max_self_collision_neighbors: int
+    use_volume_pressure: bool
+    volume_compliance: float
+    pressure_strength: float
+    volume_target_scale: float
+
+
+@dataclass
+class ClothBuildData:
+    positions_world: np.ndarray
+    inv_mass: np.ndarray
+    triangles: np.ndarray
+    edges: np.ndarray
+    edge_rest_lengths: np.ndarray
+    edge_color_offsets: np.ndarray
+    bends: np.ndarray
+    bend_rest_lengths: np.ndarray
+    bend_color_offsets: np.ndarray
+    lra_edges: np.ndarray
+    lra_rest_lengths: np.ndarray
+    lra_color_offsets: np.ndarray
+    pin_indices: np.ndarray
+    pin_targets_world: np.ndarray
+    matrix_world_inv: np.ndarray
+    rest_volume: float
+
+
+@dataclass(frozen=True)
+class HardnessDerivedSettings:
+    hardness: float
+    stretch_compliance: float
+    bend_compliance: float
+    hidden_tether_enabled: bool
+    hidden_tether_compliance: float
+    hidden_tether_slack: float
+
+
+def _clamp01(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
+
+
+def _log_interpolate(soft_value: float, hard_value: float, hardness: float) -> float:
+    hardness = _clamp01(hardness)
+    return float(np.exp(np.log(soft_value) * (1.0 - hardness) + np.log(hard_value) * hardness))
+
+
+def _inverse_log_interpolate(value: float, soft_value: float, hard_value: float) -> float:
+    value = max(float(value), _EPS)
+    numerator = np.log(value) - np.log(soft_value)
+    denominator = np.log(hard_value) - np.log(soft_value)
+    if abs(float(denominator)) <= _EPS:
+        return DEFAULT_HARDNESS
+    return _clamp01(float(numerator / denominator))
+
+
+def derive_hardness_settings(hardness: float) -> HardnessDerivedSettings:
+    hardness = _clamp01(hardness)
+    material_hardness = hardness * _HARDNESS_OUTPUT_SCALE
+    tether_enabled = hardness >= _TETHER_START_HARDNESS
+    if tether_enabled:
+        tether_hardness = ((hardness - _TETHER_START_HARDNESS) / (1.0 - _TETHER_START_HARDNESS)) * _HARDNESS_OUTPUT_SCALE
+    else:
+        tether_hardness = 0.0
+    return HardnessDerivedSettings(
+        hardness=hardness,
+        stretch_compliance=_log_interpolate(_SOFT_STRETCH_COMPLIANCE, _HARD_STRETCH_COMPLIANCE, material_hardness),
+        bend_compliance=_log_interpolate(_SOFT_BEND_COMPLIANCE, _HARD_BEND_COMPLIANCE, material_hardness),
+        hidden_tether_enabled=tether_enabled,
+        hidden_tether_compliance=_log_interpolate(_SOFT_TETHER_COMPLIANCE, _HARD_TETHER_COMPLIANCE, tether_hardness),
+        hidden_tether_slack=float(np.interp(tether_hardness, [0.0, 1.0], [_SOFT_TETHER_SLACK, _HARD_TETHER_SLACK])),
+    )
+
+
+def infer_hardness_from_legacy_settings(settings) -> float:
+    stretch = float(getattr(settings, "stretch_compliance", _LEGACY_BALANCED_STRETCH))
+    bend = float(getattr(settings, "bend_compliance", _LEGACY_BALANCED_BEND))
+    legacy_like_default = (
+        abs(stretch - _LEGACY_BALANCED_STRETCH) <= 1.0e-12
+        and abs(bend - _LEGACY_BALANCED_BEND) <= 1.0e-10
+    )
+    if legacy_like_default:
+        return DEFAULT_HARDNESS
+
+    stretch_hardness = _inverse_log_interpolate(stretch, _SOFT_STRETCH_COMPLIANCE, _HARD_STRETCH_COMPLIANCE)
+    bend_hardness = _inverse_log_interpolate(bend, _SOFT_BEND_COMPLIANCE, _HARD_BEND_COMPLIANCE)
+    return _clamp01((stretch_hardness + bend_hardness) * 0.5)
+
+
+def sync_hardness_settings(settings) -> HardnessDerivedSettings:
+    hardness = _clamp01(float(getattr(settings, "hardness", DEFAULT_HARDNESS)))
+    if not bool(getattr(settings, "hardness_initialized", False)):
+        hardness = infer_hardness_from_legacy_settings(settings)
+        settings.hardness = hardness
+        settings.hardness_initialized = True
+
+    derived = derive_hardness_settings(hardness)
+    settings.stretch_compliance = derived.stretch_compliance
+    settings.bend_compliance = derived.bend_compliance
+    settings.use_lra = derived.hidden_tether_enabled
+    settings.lra_compliance = derived.hidden_tether_compliance
+    settings.lra_slack = derived.hidden_tether_slack
+    return derived
+
+
+def preview_hardness_settings(settings) -> HardnessDerivedSettings:
+    if not bool(getattr(settings, "hardness_initialized", False)):
+        return derive_hardness_settings(infer_hardness_from_legacy_settings(settings))
+    return derive_hardness_settings(float(getattr(settings, "hardness", DEFAULT_HARDNESS)))
+
+
+def build_cloth_data(
+    obj: bpy.types.Object,
+    settings,
+    depsgraph: bpy.types.Depsgraph | None = None,
+) -> ClothBuildData:
+    if obj is None or obj.type != "MESH":
+        raise ValueError("当前活动对象必须是网格")
+
+    derived = sync_hardness_settings(settings)
+    use_evaluated_mesh = bool(getattr(settings, "use_evaluated_mesh", True))
+    local, triangles, matrix_world = mesh_input_data(
+        obj,
+        use_evaluated_mesh=use_evaluated_mesh,
+        depsgraph=depsgraph,
+        require_matching_vertex_count=True,
+    )
+    world, _matrix_world = to_world(local, matrix_world)
+    matrix_world_inv = np.array(matrix_world.inverted(), dtype=np.float32)
+    if len(triangles) == 0:
+        raise ValueError("当前网格至少需要一个面")
+
+    pin_mask = pin_mask_from_group(obj, str(settings.pin_vertex_group).strip(), len(local))
+    if np.all(pin_mask):
+        raise ValueError("所有顶点都被固定了，没有可模拟的部分")
+    use_volume_pressure = bool(getattr(settings, "use_volume_pressure", False))
+    rest_volume = signed_mesh_volume(world, triangles)
+    if use_volume_pressure:
+        if not is_closed_triangle_mesh(triangles):
+            raise ValueError("体积压力需要闭合流形网格；暂不支持开口布片网格。")
+        if abs(rest_volume) <= 1.0e-7:
+            raise ValueError("体积压力需要非零的静止有符号体积；请检查网格法线和拓扑。")
+        if np.count_nonzero(~pin_mask) < 4:
+            raise ValueError("体积压力至少需要四个未固定顶点才能保持体积。")
+
+    edges, edge_rest = edge_constraints(triangles, world)
+    edges, edge_rest, edge_color_offsets = color_distance_constraints(edges, edge_rest, len(world))
+    bends, bend_rest = bend_constraints(triangles, world)
+    bends, bend_rest, bend_color_offsets = color_distance_constraints(bends, bend_rest, len(world))
+    if derived.hidden_tether_enabled:
+        lra_edges, lra_rest = hidden_tether_constraints(world, pin_mask, derived.hidden_tether_slack)
+    else:
+        lra_edges = np.empty((0, 2), dtype=np.int32)
+        lra_rest = np.empty(0, dtype=np.float32)
+    lra_color_offsets = np.asarray([0], dtype=np.int32)
+    inv_mass = vertex_inverse_mass(world, triangles, float(settings.density), pin_mask)
+    pin_indices = np.flatnonzero(pin_mask).astype(np.int32)
+    pin_targets = world[pin_indices].astype(np.float32, copy=True)
+
+    return ClothBuildData(
+        positions_world=np.ascontiguousarray(world, dtype=np.float32),
+        inv_mass=np.ascontiguousarray(inv_mass, dtype=np.float32),
+        triangles=np.ascontiguousarray(triangles, dtype=np.int32),
+        edges=np.ascontiguousarray(edges, dtype=np.int32),
+        edge_rest_lengths=np.ascontiguousarray(edge_rest, dtype=np.float32),
+        edge_color_offsets=np.ascontiguousarray(edge_color_offsets, dtype=np.int32),
+        bends=np.ascontiguousarray(bends, dtype=np.int32),
+        bend_rest_lengths=np.ascontiguousarray(bend_rest, dtype=np.float32),
+        bend_color_offsets=np.ascontiguousarray(bend_color_offsets, dtype=np.int32),
+        lra_edges=np.ascontiguousarray(lra_edges, dtype=np.int32),
+        lra_rest_lengths=np.ascontiguousarray(lra_rest, dtype=np.float32),
+        lra_color_offsets=np.ascontiguousarray(lra_color_offsets, dtype=np.int32),
+        pin_indices=pin_indices,
+        pin_targets_world=pin_targets,
+        matrix_world_inv=matrix_world_inv,
+        rest_volume=float(rest_volume),
+    )
+
+
+def mesh_local_positions(mesh_or_obj) -> np.ndarray:
+    mesh = mesh_or_obj.data if hasattr(mesh_or_obj, "data") else mesh_or_obj
+    coords = np.empty(len(mesh.vertices) * 3, dtype=np.float64)
+    mesh.vertices.foreach_get("co", coords)
+    return coords.reshape((-1, 3))
+
+
+def mesh_input_data(
+    obj: bpy.types.Object,
+    use_evaluated_mesh: bool,
+    depsgraph: bpy.types.Depsgraph | None = None,
+    require_matching_vertex_count: bool = False,
+) -> tuple[np.ndarray, np.ndarray, bpy.types.Matrix]:
+    if not use_evaluated_mesh:
+        return mesh_local_positions(obj.data), triangulated_faces(obj.data), obj.matrix_world.copy()
+
+    depsgraph = depsgraph or bpy.context.evaluated_depsgraph_get()
+    eval_obj = obj.evaluated_get(depsgraph)
+    mesh = eval_obj.to_mesh()
+    try:
+        if require_matching_vertex_count and len(mesh.vertices) != len(obj.data.vertices):
+            raise ValueError(
+                "在 v1 中，求值后的布料输入必须与源网格保持相同顶点数；"
+                "暂不支持会改变拓扑的布料修改器。"
+            )
+        return (
+            mesh_local_positions(mesh),
+            triangulated_faces(mesh),
+            eval_obj.matrix_world.copy(),
+        )
+    finally:
+        eval_obj.to_mesh_clear()
+
+
+def world_positions_from_object(
+    obj: bpy.types.Object,
+    use_evaluated_mesh: bool,
+    depsgraph: bpy.types.Depsgraph | None = None,
+    expected_vertex_count: int | None = None,
+) -> tuple[np.ndarray, bpy.types.Matrix]:
+    if use_evaluated_mesh:
+        depsgraph = depsgraph or bpy.context.evaluated_depsgraph_get()
+        eval_obj = obj.evaluated_get(depsgraph)
+        mesh = eval_obj.to_mesh()
+        try:
+            if expected_vertex_count is not None and len(mesh.vertices) != expected_vertex_count:
+                raise ValueError(
+                    "动画布料输入的顶点数发生了变化；求值后的布料输入必须保持固定拓扑。"
+                )
+            local = mesh_local_positions(mesh)
+            world, _matrix_world = to_world(local, eval_obj.matrix_world.copy())
+            return world, eval_obj.matrix_world.copy()
+        finally:
+            eval_obj.to_mesh_clear()
+
+    local = mesh_local_positions(obj.data)
+    if expected_vertex_count is not None and len(local) != expected_vertex_count:
+        raise ValueError("动画布料输入的顶点数发生了变化；必须保持固定的布料拓扑。")
+    world, _matrix_world = to_world(local, obj.matrix_world.copy())
+    return world, obj.matrix_world.copy()
+
+
+def to_world(local: np.ndarray, matrix) -> tuple[np.ndarray, np.ndarray]:
+    mat = np.array(matrix, dtype=np.float64)
+    local_h = np.concatenate([local, np.ones((len(local), 1), dtype=np.float64)], axis=1)
+    world = (mat @ local_h.T).T[:, :3]
+    return world, mat
+
+
+def to_local(world: np.ndarray, matrix_inv: np.ndarray) -> np.ndarray:
+    world = np.asarray(world, dtype=np.float32)
+    matrix_inv = np.asarray(matrix_inv, dtype=np.float32)
+    return world @ matrix_inv[:3, :3].T + matrix_inv[:3, 3]
+
+
+def triangulated_faces(mesh: bpy.types.Mesh) -> np.ndarray:
+    bm = bmesh.new()
+    try:
+        bm.from_mesh(mesh)
+        bm.verts.ensure_lookup_table()
+        bm.verts.index_update()
+        bmesh.ops.triangulate(bm, faces=list(bm.faces))
+        bm.faces.ensure_lookup_table()
+        triangles = [[vert.index for vert in face.verts] for face in bm.faces if len(face.verts) == 3]
+        return np.asarray(triangles, dtype=np.int32).reshape((-1, 3))
+    finally:
+        bm.free()
+
+
+def is_closed_triangle_mesh(triangles: np.ndarray) -> bool:
+    if len(triangles) == 0:
+        return False
+    edge_use: dict[tuple[int, int], int] = {}
+    for tri in triangles:
+        a, b, c = int(tri[0]), int(tri[1]), int(tri[2])
+        for x, y in ((a, b), (b, c), (c, a)):
+            edge = (x, y) if x < y else (y, x)
+            edge_use[edge] = edge_use.get(edge, 0) + 1
+    return bool(edge_use) and all(count == 2 for count in edge_use.values())
+
+
+def signed_mesh_volume(rest_world: np.ndarray, triangles: np.ndarray) -> float:
+    if len(triangles) == 0:
+        return 0.0
+    a = rest_world[triangles[:, 0]]
+    b = rest_world[triangles[:, 1]]
+    c = rest_world[triangles[:, 2]]
+    return float(np.sum(np.einsum("ij,ij->i", a, np.cross(b, c))) / 6.0)
+
+
+def pin_mask_from_group(obj: bpy.types.Object, group_name: str, vertex_count: int) -> np.ndarray:
+    mask = np.zeros(vertex_count, dtype=bool)
+    if not group_name:
+        return mask
+    group = obj.vertex_groups.get(group_name)
+    if group is None:
+        return mask
+    group_index = group.index
+    for vert in obj.data.vertices:
+        for assignment in vert.groups:
+            if assignment.group == group_index and assignment.weight > 0.0:
+                mask[vert.index] = True
+                break
+    return mask
+
+
+def edge_constraints(triangles: np.ndarray, rest_world: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    edges: set[tuple[int, int]] = set()
+    for tri in triangles:
+        a, b, c = int(tri[0]), int(tri[1]), int(tri[2])
+        edges.add((min(a, b), max(a, b)))
+        edges.add((min(b, c), max(b, c)))
+        edges.add((min(c, a), max(c, a)))
+    edge_array = np.asarray(sorted(edges), dtype=np.int32).reshape((-1, 2))
+    if len(edge_array) == 0:
+        return edge_array, np.empty(0, dtype=np.float32)
+    delta = rest_world[edge_array[:, 1]] - rest_world[edge_array[:, 0]]
+    rest_lengths = np.maximum(np.linalg.norm(delta, axis=1), _EPS)
+    return edge_array, rest_lengths
+
+
+def bend_constraints(triangles: np.ndarray, rest_world: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    edge_to_opposite: dict[tuple[int, int], int] = {}
+    pairs: set[tuple[int, int]] = set()
+    for tri in triangles:
+        a, b, c = int(tri[0]), int(tri[1]), int(tri[2])
+        for x, y, opposite in ((a, b, c), (b, c, a), (c, a, b)):
+            edge = (min(x, y), max(x, y))
+            previous = edge_to_opposite.get(edge)
+            if previous is None:
+                edge_to_opposite[edge] = opposite
+            elif previous != opposite:
+                pairs.add((min(previous, opposite), max(previous, opposite)))
+    bend_array = np.asarray(sorted(pairs), dtype=np.int32).reshape((-1, 2))
+    if len(bend_array) == 0:
+        return bend_array, np.empty(0, dtype=np.float32)
+    delta = rest_world[bend_array[:, 1]] - rest_world[bend_array[:, 0]]
+    rest_lengths = np.maximum(np.linalg.norm(delta, axis=1), _EPS)
+    return bend_array, rest_lengths
+
+
+def hidden_tether_constraints(
+    rest_world: np.ndarray,
+    pin_mask: np.ndarray,
+    slack: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    pin_indices = np.flatnonzero(pin_mask).astype(np.int32)
+    dynamic_indices = np.flatnonzero(~pin_mask).astype(np.int32)
+    if len(pin_indices) == 0 or len(dynamic_indices) == 0:
+        return np.empty((0, 2), dtype=np.int32), np.empty(0, dtype=np.float32)
+
+    pin_positions = rest_world[pin_indices].astype(np.float64, copy=False)
+    dynamic_positions = rest_world[dynamic_indices].astype(np.float64, copy=False)
+    nearest_pin = np.empty(len(dynamic_indices), dtype=np.int32)
+    nearest_distance = np.empty(len(dynamic_indices), dtype=np.float64)
+    chunk_size = 2048
+    for start in range(0, len(dynamic_indices), chunk_size):
+        end = min(start + chunk_size, len(dynamic_indices))
+        delta = dynamic_positions[start:end, None, :] - pin_positions[None, :, :]
+        distances_sq = np.einsum("cpi,cpi->cp", delta, delta, optimize=True)
+        local_nearest = np.argmin(distances_sq, axis=1)
+        nearest_pin[start:end] = pin_indices[local_nearest]
+        nearest_distance[start:end] = np.sqrt(distances_sq[np.arange(end - start), local_nearest])
+
+    pairs = np.column_stack((nearest_pin, dynamic_indices)).astype(np.int32, copy=False)
+    rest = np.maximum(nearest_distance * max(float(slack), 0.5), _EPS).astype(np.float32)
+    return pairs, rest
+
+
+def color_distance_constraints(
+    constraints: np.ndarray,
+    rest_lengths: np.ndarray,
+    vertex_count: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if len(constraints) == 0:
+        return constraints.reshape((0, 2)), rest_lengths.astype(np.float32), np.asarray([0], dtype=np.int32)
+
+    used_colors_by_vertex: list[set[int]] = [set() for _ in range(vertex_count)]
+    colors = np.empty(len(constraints), dtype=np.int32)
+    for index, row in enumerate(constraints):
+        vertices = [int(v) for v in row]
+        blocked: set[int] = set()
+        for vertex in vertices:
+            if 0 <= vertex < vertex_count:
+                blocked.update(used_colors_by_vertex[vertex])
+        color = 0
+        while color in blocked:
+            color += 1
+        colors[index] = color
+        for vertex in vertices:
+            if 0 <= vertex < vertex_count:
+                used_colors_by_vertex[vertex].add(color)
+
+    order = np.argsort(colors, kind="stable")
+    sorted_constraints = np.ascontiguousarray(constraints[order], dtype=np.int32)
+    sorted_rest = np.ascontiguousarray(rest_lengths[order], dtype=np.float32)
+    sorted_colors = colors[order]
+    color_count = int(sorted_colors[-1]) + 1
+    counts = np.bincount(sorted_colors, minlength=color_count).astype(np.int32)
+    offsets = np.concatenate(([0], np.cumsum(counts))).astype(np.int32)
+    return sorted_constraints, sorted_rest, offsets
+
+
+def vertex_inverse_mass(
+    rest_world: np.ndarray,
+    triangles: np.ndarray,
+    density: float,
+    pin_mask: np.ndarray,
+) -> np.ndarray:
+    mass = np.zeros(len(rest_world), dtype=np.float64)
+    p0 = rest_world[triangles[:, 0]]
+    p1 = rest_world[triangles[:, 1]]
+    p2 = rest_world[triangles[:, 2]]
+    area = 0.5 * np.linalg.norm(np.cross(p1 - p0, p2 - p0), axis=1)
+    tri_mass = np.maximum(area * max(density, _EPS), _EPS)
+    share = tri_mass / 3.0
+    np.add.at(mass, triangles[:, 0], share)
+    np.add.at(mass, triangles[:, 1], share)
+    np.add.at(mass, triangles[:, 2], share)
+    mass[mass <= 0.0] = 1.0
+    inv_mass = 1.0 / mass
+    inv_mass[pin_mask] = 0.0
+    return inv_mass
+
+
+def settings_to_options(settings) -> SolverOptions:
+    derived = sync_hardness_settings(settings)
+    sphere_center = np.zeros(3, dtype=np.float32)
+    sphere_radius = 0.0
+    sphere_obj = getattr(settings, "sphere_object", None)
+    if bool(settings.use_sphere) and sphere_obj is not None:
+        sphere_center = np.array(sphere_obj.matrix_world.translation, dtype=np.float32)
+        sphere_radius = max(float(max(sphere_obj.dimensions)) * 0.5, 0.0)
+
+    wall_normal = np.array(settings.wall_normal, dtype=np.float32)
+    norm = float(np.linalg.norm(wall_normal))
+    if norm <= _EPS:
+        wall_normal = np.array((0.0, 0.0, 1.0), dtype=np.float32)
+    else:
+        wall_normal = wall_normal / norm
+
+    mode_name = str(getattr(settings, "self_collision_mode", "off")).lower()
+    if mode_name == "quality":
+        # Legacy scenes/scripts may still store the removed Quality mode.
+        # Keep them usable by running the remaining fast self-collision path.
+        mode_name = "fast"
+    if bool(getattr(settings, "self_collision", False)) and mode_name == "off":
+        mode_name = "fast"
+    mode_value = {"off": SELF_COLLISION_OFF, "fast": SELF_COLLISION_FAST}.get(mode_name, SELF_COLLISION_OFF)
+
+    return SolverOptions(
+        dt=float(settings.dt),
+        damping=float(settings.damping),
+        gravity=np.asarray(settings.gravity, dtype=np.float32),
+        stretch_compliance=float(derived.stretch_compliance),
+        bend_compliance=float(derived.bend_compliance),
+        lra_compliance=float(derived.hidden_tether_compliance if derived.hidden_tether_enabled else 0.0),
+        collision_margin=float(settings.collision_margin),
+        use_ground=bool(settings.use_ground),
+        ground_height=float(settings.ground_height),
+        use_wall=bool(settings.use_wall),
+        wall_origin=np.asarray(settings.wall_origin, dtype=np.float32),
+        wall_normal=wall_normal,
+        use_sphere=bool(settings.use_sphere and sphere_obj is not None),
+        sphere_center=sphere_center,
+        sphere_radius=float(sphere_radius),
+        self_collision=mode_value > 0,
+        self_collision_mode=mode_value,
+        cloth_thickness=float(getattr(settings, "cloth_thickness", 0.02)),
+        self_collision_interval=max(int(getattr(settings, "self_collision_interval", 2)), 1),
+        max_self_collision_neighbors=max(int(getattr(settings, "max_self_collision_neighbors", 32)), 4),
+        use_volume_pressure=bool(getattr(settings, "use_volume_pressure", False)),
+        volume_compliance=float(getattr(settings, "volume_compliance", 1e-6)),
+        pressure_strength=max(float(getattr(settings, "pressure_strength", 1.0)), 0.0),
+        volume_target_scale=float(getattr(settings, "volume_target_scale", 1.0)),
+    )

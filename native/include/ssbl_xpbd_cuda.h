@@ -1,0 +1,90 @@
+#pragma once
+
+#ifdef _WIN32
+#define SSBL_API __declspec(dllexport)
+#else
+#define SSBL_API
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct SsblXpbdConfig {
+    int vertex_count;
+    int edge_count;
+    int bend_count;
+    int lra_count;
+    int triangle_count;
+    int static_triangle_count;
+    int edge_color_count;
+    int bend_color_count;
+    int lra_color_count;
+    float dt;
+    float damping;
+    float gravity[3];
+    float stretch_compliance;
+    float bend_compliance;
+    float lra_compliance;
+    float collision_margin;
+    int use_ground;
+    float ground_height;
+    int use_wall;
+    float wall_origin[3];
+    float wall_normal[3];
+    int use_sphere;
+    float sphere_center[3];
+    float sphere_radius;
+    int self_collision;
+    int self_collision_mode;
+    float cloth_thickness;
+    int self_collision_interval;
+    int max_self_collision_neighbors;
+    int use_volume_pressure;
+    float rest_volume;
+    float volume_compliance;
+    float pressure_strength;
+    float volume_target_scale;
+} SsblXpbdConfig;
+
+typedef struct SsblXpbdMesh {
+    const float* positions;
+    const float* inv_mass;
+    const int* edges;
+    const float* edge_rest_lengths;
+    const int* edge_color_offsets;
+    const int* bends;
+    const float* bend_rest_lengths;
+    const int* bend_color_offsets;
+    const int* lra_edges;
+    const float* lra_rest_lengths;
+    const int* lra_color_offsets;
+    const int* triangles;
+    const float* static_triangles;
+} SsblXpbdMesh;
+
+typedef struct SsblXpbdRuntimeColliders {
+    int use_ground;
+    float ground_height;
+    int use_wall;
+    float wall_origin[3];
+    float wall_normal[3];
+    int use_sphere;
+    float sphere_center[3];
+    float sphere_radius;
+} SsblXpbdRuntimeColliders;
+
+SSBL_API void* ssbl_create_solver(const SsblXpbdConfig* config, const SsblXpbdMesh* mesh);
+SSBL_API int ssbl_destroy_solver(void* handle);
+SSBL_API int ssbl_reset_solver(void* handle);
+SSBL_API int ssbl_update_pin_targets(void* handle, const int* indices, const float* positions, int count);
+SSBL_API int ssbl_update_runtime_colliders(void* handle, const SsblXpbdRuntimeColliders* inputs);
+SSBL_API int ssbl_update_static_triangles(void* handle, const float* triangles, int triangle_count);
+SSBL_API int ssbl_update_dynamic_triangles(void* handle, const float* triangles, int triangle_count);
+SSBL_API int ssbl_step_solver(void* handle, int substeps, int iterations);
+SSBL_API int ssbl_download_positions(void* handle, float* out_positions, int max_floats);
+SSBL_API const char* ssbl_last_error(void);
+
+#ifdef __cplusplus
+}
+#endif

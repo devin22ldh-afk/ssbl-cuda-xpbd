@@ -1,0 +1,46 @@
+cmake_minimum_required(VERSION 3.25)
+
+project(ssbl_xpbd_cuda LANGUAGES CXX CUDA)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_ARCHITECTURES 89 CACHE STRING "CUDA architectures")
+
+add_library(ssbl_xpbd_cuda SHARED
+    src/ssbl_xpbd_cuda.cu
+)
+
+target_include_directories(ssbl_xpbd_cuda
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+set_target_properties(ssbl_xpbd_cuda PROPERTIES
+    OUTPUT_NAME ssbl_xpbd_cuda_abi16
+    CUDA_ARCHITECTURES 89
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RUNTIME_LIBRARY Static
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/bin
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG ${CMAKE_CURRENT_SOURCE_DIR}/bin
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_CURRENT_SOURCE_DIR}/bin
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/bin
+    LIBRARY_OUTPUT_DIRECTORY_DEBUG ${CMAKE_CURRENT_SOURCE_DIR}/bin
+    LIBRARY_OUTPUT_DIRECTORY_RELEASE ${CMAKE_CURRENT_SOURCE_DIR}/bin
+    ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/lib
+    ARCHIVE_OUTPUT_DIRECTORY_DEBUG ${CMAKE_CURRENT_SOURCE_DIR}/lib
+    ARCHIVE_OUTPUT_DIRECTORY_RELEASE ${CMAKE_CURRENT_SOURCE_DIR}/lib
+)
+
+if (MSVC)
+    target_compile_options(ssbl_xpbd_cuda PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:/W4>
+        $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math -Xcompiler=/utf-8>
+    )
+else()
+    target_compile_options(ssbl_xpbd_cuda PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra>
+        $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>
+    )
+endif()

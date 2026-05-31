@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+
+# Local planning scratch files
+task_plan.md
+findings.md
+progress.md
+
+# Native build outputs and import libraries
+native/build/
+native/lib/
+native/bin/*.dll
+!native/bin/ssbl_xpbd_cuda_abi16.dll
+native/bin/*.exp
+native/bin/*.lib
+
+# Generated validation media
+recordings/
+
+# Read-only upstream reference checkout
+_reference/
+
+# Local MCP/runtime scratch
+tools/mcp_blender_pid.txt
+tools/mcp_blender_stdout.log
+tools/mcp_blender_stderr.log
