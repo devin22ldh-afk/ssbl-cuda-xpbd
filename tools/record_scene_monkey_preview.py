@@ -133,6 +133,7 @@ def _snapshot(obj, label, diagnostics):
     bbox = [tuple(obj.matrix_world @ Vector(corner)) for corner in obj.bound_box]
     coords = [component for vert in obj.data.vertices for component in (vert.co.x, vert.co.y, vert.co.z)]
     z_coords = [vert.co.z for vert in obj.data.vertices]
+    session_diag = ssbl.solver.session_diagnostics(obj)
     diagnostics.append(
         {
             "label": label,
@@ -147,6 +148,16 @@ def _snapshot(obj, label, diagnostics):
             "bbox_max_z": max(point[2] for point in bbox),
             "data_min_z": min(z_coords) if z_coords else None,
             "data_max_z": max(z_coords) if z_coords else None,
+            "step_ms": float(session_diag.step_ms),
+            "hash_build_ms": float(session_diag.hash_build_ms),
+            "candidate_count": int(session_diag.candidate_count),
+            "resolved_contacts": int(session_diag.resolved_contacts),
+            "min_gap": None if session_diag.min_gap is None else float(session_diag.min_gap),
+            "penetration_depth": float(session_diag.penetration_depth),
+            "ccd_clamp_count": int(session_diag.ccd_clamp_count),
+            "recovery_passes": int(session_diag.recovery_passes),
+            "local_retry_count": int(session_diag.local_retry_count),
+            "finite_flag": int(session_diag.finite),
         }
     )
 

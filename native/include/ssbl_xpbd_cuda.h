@@ -47,6 +47,18 @@ typedef struct SsblXpbdConfig {
     float volume_target_scale;
 } SsblXpbdConfig;
 
+typedef struct SsblXpbdDiagnostics {
+    float step_ms;
+    float hash_build_ms;
+    long long candidate_count;
+    long long resolved_contacts;
+    float min_gap;
+    long long ccd_clamp_count;
+    long long recovery_passes;
+    long long local_retry_count;
+    int finite_flag;
+} SsblXpbdDiagnostics;
+
 typedef struct SsblXpbdMesh {
     const float* positions;
     const float* inv_mass;
@@ -83,6 +95,7 @@ SSBL_API int ssbl_update_static_triangles(void* handle, const float* triangles, 
 SSBL_API int ssbl_update_dynamic_triangles(void* handle, const float* triangles, int triangle_count);
 SSBL_API int ssbl_step_solver(void* handle, int substeps, int iterations);
 SSBL_API int ssbl_download_positions(void* handle, float* out_positions, int max_floats);
+SSBL_API int ssbl_get_diagnostics(void* handle, SsblXpbdDiagnostics* out_diag);
 SSBL_API const char* ssbl_last_error(void);
 
 #ifdef __cplusplus

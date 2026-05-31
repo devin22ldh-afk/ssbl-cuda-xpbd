@@ -87,11 +87,44 @@ class _NativeRuntimeColliders(ctypes.Structure):
     ]
 
 
+class _NativeDiagnostics(ctypes.Structure):
+    _fields_ = [
+        ("step_ms", ctypes.c_float),
+        ("hash_build_ms", ctypes.c_float),
+        ("candidate_count", ctypes.c_longlong),
+        ("resolved_contacts", ctypes.c_longlong),
+        ("min_gap", ctypes.c_float),
+        ("ccd_clamp_count", ctypes.c_longlong),
+        ("recovery_passes", ctypes.c_longlong),
+        ("local_retry_count", ctypes.c_longlong),
+        ("finite_flag", ctypes.c_int),
+    ]
+
+
 @dataclass
 class NativeStatus:
     available: bool
     message: str
     dll_path: str
+
+
+@dataclass(frozen=True)
+class NativeStepDiagnostics:
+    step_ms: float = 0.0
+    hash_build_ms: float = 0.0
+    candidate_count: int = 0
+    resolved_contacts: int = 0
+    min_gap: float | None = None
+    ccd_clamp_count: int = 0
+    recovery_passes: int = 0
+    local_retry_count: int = 0
+    finite: bool = True
+
+    @property
+    def penetration_depth(self) -> float:
+        if self.min_gap is None:
+            return 0.0
+        return max(0.0, -float(self.min_gap))
 
 
 _LIB = None
@@ -100,7 +133,7 @@ _LOAD_ERROR = ""
 
 def dll_path() -> str:
     root = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(root, "native", "bin", "ssbl_xpbd_cuda_abi17.dll")
+    return os.path.join(root, "native", "bin", "ssbl_xpbd_cuda_abi21.dll")
 
 
 def status() -> NativeStatus:
@@ -160,6 +193,8 @@ def _load_library():
         ctypes.c_int,
     ]
     lib.ssbl_download_positions.restype = ctypes.c_int
+    lib.ssbl_get_diagnostics.argtypes = [ctypes.c_void_p, ctypes.POINTER(_NativeDiagnostics)]
+    lib.ssbl_get_diagnostics.restype = ctypes.c_int
     lib.ssbl_last_error.argtypes = []
     lib.ssbl_last_error.restype = ctypes.c_char_p
     _LIB = lib
@@ -248,6 +283,7 @@ class NativeXpbdSolver:
         self._positions_out = np.empty((self._vertex_count, 3), dtype=np.float32)
         self._static_triangle_count = int(len(static_triangles))
         self._dynamic_triangle_count: int | None = None
+        self._last_diagnostics = NativeStepDiagnostics()
         static_flat = np.ascontiguousarray(static_triangles.reshape((-1, 3)), dtype=np.float32)
         cfg = _config_from_options(cloth, options, static_triangles)
         self._runtime_colliders = _runtime_colliders_from_options(options)
@@ -329,6 +365,7 @@ class NativeXpbdSolver:
     def step(self, substeps: int, iterations: int) -> None:
         if not self._lib.ssbl_step_solver(self._handle, int(substeps), int(iterations)):
             raise NativeSolverError(_last_error(self._lib))
+        self._last_diagnostics = self.diagnostics()
 
     def download_positions(self) -> np.ndarray:
         out = self._positions_out
@@ -340,6 +377,29 @@ class NativeXpbdSolver:
         if not ok:
             raise NativeSolverError(_last_error(self._lib))
         return out
+
+    def diagnostics(self) -> NativeStepDiagnostics:
+        if not getattr(self, "_handle", None):
+            return self._last_diagnostics
+        raw = _NativeDiagnostics()
+        if not self._lib.ssbl_get_diagnostics(self._handle, ctypes.byref(raw)):
+            raise NativeSolverError(_last_error(self._lib))
+        min_gap = float(raw.min_gap)
+        if not np.isfinite(min_gap) or min_gap >= 1.0e29:
+            min_gap = None
+        diag = NativeStepDiagnostics(
+            step_ms=float(raw.step_ms),
+            hash_build_ms=float(raw.hash_build_ms),
+            candidate_count=int(raw.candidate_count),
+            resolved_contacts=int(raw.resolved_contacts),
+            min_gap=min_gap,
+            ccd_clamp_count=int(raw.ccd_clamp_count),
+            recovery_passes=int(raw.recovery_passes),
+            local_retry_count=int(raw.local_retry_count),
+            finite=bool(raw.finite_flag),
+        )
+        self._last_diagnostics = diag
+        return diag
 
     def __del__(self):
         try:

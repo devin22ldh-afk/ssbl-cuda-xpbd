@@ -48,9 +48,9 @@ def _configure_scene(obj):
     settings.self_collision = True
     settings.self_collision_mode = "fast"
     settings.self_collision_interval = 1
-    settings.max_self_collision_neighbors = 64
+    settings.max_self_collision_neighbors = 128
     settings.collision_margin = 0.015
-    settings.cloth_thickness = 0.035
+    settings.cloth_thickness = 0.045
     settings.use_ground = False
     settings.use_wall = False
     settings.use_sphere = False
@@ -117,6 +117,23 @@ def _render_frame(frame):
     bpy.ops.render.render(write_still=True)
 
 
+def _diag_snapshot(obj):
+    diag = ssbl.solver.session_diagnostics(obj)
+    return {
+        "frame": int(bpy.context.scene.frame_current),
+        "step_ms": float(diag.step_ms),
+        "hash_build_ms": float(diag.hash_build_ms),
+        "candidate_count": int(diag.candidate_count),
+        "resolved_contacts": int(diag.resolved_contacts),
+        "min_gap": None if diag.min_gap is None else float(diag.min_gap),
+        "penetration_depth": float(diag.penetration_depth),
+        "ccd_clamp_count": int(diag.ccd_clamp_count),
+        "recovery_passes": int(diag.recovery_passes),
+        "local_retry_count": int(diag.local_retry_count),
+        "finite_flag": int(diag.finite),
+    }
+
+
 def main():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     (OUT_DIR / "sequence").mkdir(parents=True, exist_ok=True)
@@ -164,14 +181,17 @@ def main():
         "frames": FRAME_END - FRAME_START + 1,
         "sequence_dir": str(OUT_DIR / "sequence"),
         "expected_video": str(OUT_DIR / "hook_driven_xpbd_preview.mp4"),
+        "diagnostics": [],
     }
     if repair_result is not None:
         result["repair"] = repair_result
 
     try:
         _render_frame(FRAME_START)
+        result["diagnostics"].append(_diag_snapshot(obj))
         for frame in range(FRAME_START + 1, FRAME_END + 1):
             finished = ssbl.solver.step_preview(bpy.context, obj.name)
+            result["diagnostics"].append(_diag_snapshot(obj))
             if finished:
                 result["finished_early_at"] = frame
                 break

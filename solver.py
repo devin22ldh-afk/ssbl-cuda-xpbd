@@ -16,6 +16,7 @@ from .session_manager import (
     preview_warnings,
     request_stop,
     reset_preview_object,
+    session_diagnostics,
     session_fps,
     session_status,
     start_preview,

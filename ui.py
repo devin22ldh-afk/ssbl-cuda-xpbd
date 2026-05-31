@@ -18,18 +18,18 @@ class SSBL_PT_preview_panel(bpy.types.Panel):
         settings = context.scene.ssbl_preview
         obj = context.active_object
         derived = preview_hardness_settings(settings)
+        diagnostics = solver.session_diagnostics(obj)
 
         status_box = layout.box()
         status_box.label(text=f"状态：{solver.session_status(obj)}")
         if solver.has_session(obj):
-            fps = solver.session_fps(obj)
-            status_box.label(text=f"预览 FPS：{fps:.1f}")
+            status_box.label(text=f"预览 FPS：{solver.session_fps(obj):.1f}")
         else:
-            status_box.label(text="预览 FPS：--")
+            status_box.label(text="预览 FPS：-")
         if obj is not None:
             status_box.label(text=f"对象：{obj.name}")
         status_box.label(text=solver.backend_status_text())
-        status_box.label(text="适用范围：仅支持 cloth MESH；暂不支持 rod/solid/stitch/tet")
+        status_box.label(text="适用范围：仅支持 cloth MESH，暂不支持 rod/solid/stitch/tet")
 
         runtime_box = layout.box()
         runtime_box.label(text="运行")
@@ -96,6 +96,19 @@ class SSBL_PT_preview_panel(bpy.types.Panel):
             derived_box.label(text=f"拉伸柔顺度：{derived.stretch_compliance:.3g}")
             derived_box.label(text=f"弯曲柔顺度：{derived.bend_compliance:.3g}")
             derived_box.label(text=f"当前硬度：{derived.hardness:.3f}")
+
+            diag_box = advanced_box.box()
+            diag_box.label(text="接触诊断")
+            diag_box.label(text=f"step_ms：{diagnostics.step_ms:.2f}")
+            diag_box.label(text=f"hash_build_ms：{diagnostics.hash_build_ms:.2f}")
+            diag_box.label(text=f"candidate_count：{diagnostics.candidate_count}")
+            diag_box.label(text=f"resolved_contacts：{diagnostics.resolved_contacts}")
+            diag_box.label(text="min_gap：-" if diagnostics.min_gap is None else f"min_gap：{diagnostics.min_gap:.5f}")
+            diag_box.label(text=f"penetration_depth：{diagnostics.penetration_depth:.5f}")
+            diag_box.label(text=f"ccd_clamp_count：{diagnostics.ccd_clamp_count}")
+            diag_box.label(text=f"recovery_passes：{diagnostics.recovery_passes}")
+            diag_box.label(text=f"local_retry_count：{diagnostics.local_retry_count}")
+            diag_box.label(text=f"finite_flag：{1 if diagnostics.finite else 0}")
 
             tuning_box = advanced_box.box()
             tuning_box.label(text="高级解算")

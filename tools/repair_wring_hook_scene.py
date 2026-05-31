@@ -168,9 +168,9 @@ def repair_current_scene():
         settings.self_collision = True
         settings.self_collision_mode = "fast"
         settings.self_collision_interval = 1
-        settings.max_self_collision_neighbors = 64
+        settings.max_self_collision_neighbors = 128
         settings.collision_margin = 0.015
-        settings.cloth_thickness = 0.035
+        settings.cloth_thickness = 0.045
         settings.use_ground = False
         settings.use_wall = False
         settings.use_sphere = False

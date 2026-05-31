@@ -61,10 +61,26 @@ def run_case(label, mode, hardness, steps):
     min_z = 999.0
     free_sum_z = 0.0
     free_count = 0
+    worst_gap = None
+    peak_penetration = 0.0
+    peak_candidates = 0
+    peak_resolved = 0
+    peak_ccd = 0
+    peak_recovery = 0
+    peak_retry = 0
     for _ in range(steps):
         solver.step_preview(bpy.context, obj.name)
         _assert_finite(obj, label)
         min_z = min(min_z, min((obj.matrix_world @ v.co).z for v in obj.data.vertices))
+        diag = solver.session_diagnostics(obj)
+        if diag.min_gap is not None:
+            worst_gap = diag.min_gap if worst_gap is None else min(worst_gap, diag.min_gap)
+        peak_penetration = max(peak_penetration, float(diag.penetration_depth))
+        peak_candidates = max(peak_candidates, int(diag.candidate_count))
+        peak_resolved = max(peak_resolved, int(diag.resolved_contacts))
+        peak_ccd = max(peak_ccd, int(diag.ccd_clamp_count))
+        peak_recovery = max(peak_recovery, int(diag.recovery_passes))
+        peak_retry = max(peak_retry, int(diag.local_retry_count))
     for vertex in obj.data.vertices:
         if vertex.co.y <= 1.05:
             free_sum_z += float((obj.matrix_world @ vertex.co).z)
@@ -72,6 +88,7 @@ def run_case(label, mode, hardness, steps):
     elapsed = max(time.perf_counter() - start, 1.0e-6)
     fps = steps / elapsed
     free_mean_z = free_sum_z / max(free_count, 1)
+    diag = solver.session_diagnostics(obj)
     solver.request_stop(obj)
 
     print(
@@ -85,6 +102,16 @@ def run_case(label, mode, hardness, steps):
         f"edges={len(session.cloth.edges)}",
         f"tethers={len(session.cloth.lra_edges)}",
         f"fps={fps:.2f}",
+        f"step_ms={diag.step_ms:.2f}",
+        f"hash_build_ms={diag.hash_build_ms:.2f}",
+        f"peak_candidates={peak_candidates}",
+        f"peak_resolved={peak_resolved}",
+        f"peak_ccd={peak_ccd}",
+        f"peak_penetration={peak_penetration:.5f}",
+        f"peak_recovery={peak_recovery}",
+        f"peak_retry={peak_retry}",
+        f"worst_gap={(worst_gap if worst_gap is not None else float('nan')):.5f}",
+        f"finite={int(diag.finite)}",
         f"min_z={min_z:.4f}",
         f"free_mean_z={free_mean_z:.4f}",
     )

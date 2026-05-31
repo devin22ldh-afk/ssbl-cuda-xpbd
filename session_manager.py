@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 import re
 import struct
@@ -13,7 +13,7 @@ from mathutils import Vector
 import numpy as np
 
 from .collision import collect_static_triangles
-from .native_backend import NativeXpbdSolver, status as native_status
+from .native_backend import NativeStepDiagnostics, NativeXpbdSolver, status as native_status
 from .xpbd_core import (
     ClothBuildData,
     build_cloth_data,
@@ -26,6 +26,7 @@ from .xpbd_core import (
 _SCENE_SESSIONS: dict[str, "SceneSession"] = {}
 _OBJECT_TO_SCENE_SESSION: dict[str, str] = {}
 _STATUS: dict[str, str] = {}
+_LAST_DIAGNOSTICS: dict[str, NativeStepDiagnostics] = {}
 _CACHE_PATH_PROP = "_ssbl_xpbd_cache_path"
 _CACHE_MODIFIER_NAME = "SSBL XPBD Cache"
 _UNSUPPORTED_INPUT_TYPES = {"solid", "rod", "stitch", "tet"}
@@ -69,6 +70,7 @@ class SceneSession:
     last_fps_time: float
     fps_sample_frames: int
     actual_fps: float
+    last_diagnostics: NativeStepDiagnostics = field(default_factory=NativeStepDiagnostics)
     stop_requested: bool = False
 
     @property
@@ -101,6 +103,15 @@ def session_fps(obj: Optional[bpy.types.Object]) -> float:
     if session is None:
         return 0.0
     return float(session.actual_fps)
+
+
+def session_diagnostics(obj: Optional[bpy.types.Object]) -> NativeStepDiagnostics:
+    if obj is None:
+        return NativeStepDiagnostics()
+    session = _session_for_object_name(obj.name)
+    if session is not None:
+        return session.last_diagnostics
+    return _LAST_DIAGNOSTICS.get(obj.name, NativeStepDiagnostics())
 
 
 def has_session(obj: Optional[bpy.types.Object]) -> bool:
@@ -433,6 +444,9 @@ def _step_session_slots(session: SceneSession) -> None:
         slot.native.update_dynamic_triangles(dynamic_triangles)
         slot.native.step(session.substeps, session.iterations)
         slot.current_positions_world = np.array(slot.native.download_positions(), dtype=np.float32, copy=True)
+    session.last_diagnostics = _aggregate_session_diagnostics(session)
+    for slot_name in session.solve_order:
+        _LAST_DIAGNOSTICS[slot_name] = session.last_diagnostics
 
 
 def _collect_cross_cloth_triangles(session: SceneSession, target: ClothSlot) -> np.ndarray:
@@ -560,6 +574,7 @@ def _mesh_is_probably_closed(mesh: bpy.types.Mesh) -> bool:
 
 def _finish_session(session: SceneSession, status: str) -> None:
     for slot in list(session.slots.values()):
+        _LAST_DIAGNOSTICS[slot.object_name] = session.last_diagnostics
         obj = bpy.data.objects.get(slot.object_name)
         if obj is not None and obj.type == "MESH" and obj.data == slot.preview_mesh:
             obj.data = slot.original_mesh
@@ -651,6 +666,41 @@ def _update_session_fps(session: SceneSession, _step_started: float) -> None:
         session.actual_fps = session.actual_fps * 0.65 + sample_fps * 0.35
     session.fps_sample_frames = 0
     session.last_fps_time = now
+
+
+def _aggregate_session_diagnostics(session: SceneSession) -> NativeStepDiagnostics:
+    step_ms = 0.0
+    hash_build_ms = 0.0
+    candidate_count = 0
+    resolved_contacts = 0
+    min_gap: float | None = None
+    ccd_clamp_count = 0
+    recovery_passes = 0
+    local_retry_count = 0
+    finite = True
+    for slot in session.slots.values():
+        diag = slot.native.diagnostics()
+        step_ms += float(diag.step_ms)
+        hash_build_ms += float(diag.hash_build_ms)
+        candidate_count += int(diag.candidate_count)
+        resolved_contacts += int(diag.resolved_contacts)
+        ccd_clamp_count += int(diag.ccd_clamp_count)
+        recovery_passes += int(diag.recovery_passes)
+        local_retry_count += int(diag.local_retry_count)
+        finite = finite and bool(diag.finite)
+        if diag.min_gap is not None:
+            min_gap = float(diag.min_gap) if min_gap is None else min(min_gap, float(diag.min_gap))
+    return NativeStepDiagnostics(
+        step_ms=step_ms,
+        hash_build_ms=hash_build_ms,
+        candidate_count=candidate_count,
+        resolved_contacts=resolved_contacts,
+        min_gap=min_gap,
+        ccd_clamp_count=ccd_clamp_count,
+        recovery_passes=recovery_passes,
+        local_retry_count=local_retry_count,
+        finite=finite,
+    )
 
 
 def _cache_path_for_object(obj: bpy.types.Object) -> str:
