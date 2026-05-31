@@ -236,9 +236,6 @@ def step_preview(context: bpy.types.Context, object_name: str) -> bool:
 
     session.frame_index += 1
     _update_session_fps(session, step_started)
-    if session.frame_index >= session.frame_count or next_frame >= int(scene.frame_end):
-        _finish_session(session, STATUS_FINISHED)
-        return True
     return False
 
 
@@ -345,9 +342,15 @@ def _create_cloth_slot(
     settings,
     depsgraph: bpy.types.Depsgraph,
 ) -> ClothSlot:
-    cloth, native, static_signature = _create_native_solver(context, obj, settings, depsgraph=depsgraph)
     original_mesh = obj.data
-    use_evaluated_mesh = bool(getattr(settings, "use_evaluated_mesh", True))
+    use_evaluated_mesh = _effective_use_evaluated_mesh(obj, settings)
+    cloth, native, static_signature = _create_native_solver(
+        context,
+        obj,
+        settings,
+        depsgraph=depsgraph,
+        use_evaluated_mesh_override=use_evaluated_mesh,
+    )
     suspended_modifiers = _suspend_preview_modifiers(obj, suspend_all=use_evaluated_mesh)
     preview_mesh = original_mesh.copy()
     preview_mesh.name = f"{original_mesh.name}_SSBL_XPBD_Preview"
@@ -372,16 +375,23 @@ def _create_native_solver(
     obj: bpy.types.Object,
     settings,
     depsgraph: bpy.types.Depsgraph | None = None,
+    use_evaluated_mesh_override: bool | None = None,
 ) -> tuple[ClothBuildData, NativeXpbdSolver, tuple[tuple[str, int, int], ...]]:
     try:
         depsgraph = depsgraph or context.evaluated_depsgraph_get()
-        cloth = build_cloth_data(obj, settings, depsgraph=depsgraph)
+        use_evaluated_mesh = (
+            bool(use_evaluated_mesh_override)
+            if use_evaluated_mesh_override is not None
+            else _effective_use_evaluated_mesh(obj, settings)
+        )
+        with _temporary_setting(settings, "use_evaluated_mesh", use_evaluated_mesh):
+            cloth = build_cloth_data(obj, settings, depsgraph=depsgraph)
         options = settings_to_options(settings)
         static_tris, static_signature = collect_static_triangles(
             settings.static_collider_collection,
             obj,
             depsgraph=depsgraph,
-            use_evaluated_mesh=bool(getattr(settings, "use_evaluated_mesh", True)),
+            use_evaluated_mesh=use_evaluated_mesh,
         )
         native = NativeXpbdSolver(cloth, options, static_tris)
         native.update_runtime_colliders(options)
@@ -399,6 +409,8 @@ def _refresh_session_runtime_inputs(context: bpy.types.Context, session: SceneSe
         if obj is None or obj.type != "MESH":
             raise ValueError(f"预览对象已丢失：{slot.object_name}")
         with _with_preview_source_state(slot, obj):
+            context.view_layer.update()
+            depsgraph = context.evaluated_depsgraph_get()
             world_positions, matrix_world = world_positions_from_object(
                 obj,
                 slot.use_evaluated_mesh,
@@ -452,7 +464,7 @@ def _refresh_bake_runtime_inputs(
 ) -> None:
     context.scene.frame_set(frame)
     depsgraph = context.evaluated_depsgraph_get()
-    use_evaluated_mesh = bool(getattr(context.scene.ssbl_preview, "use_evaluated_mesh", True))
+    use_evaluated_mesh = _effective_use_evaluated_mesh(obj, context.scene.ssbl_preview)
     world_positions, matrix_world = world_positions_from_object(
         obj,
         use_evaluated_mesh,
@@ -486,6 +498,18 @@ def _apply_runtime_inputs(
     native.update_pin_targets(cloth.pin_indices, pin_targets)
     native.update_runtime_colliders(settings_to_options(context.scene.ssbl_preview))
     native.update_static_triangles(static_tris)
+
+
+def _effective_use_evaluated_mesh(obj: bpy.types.Object, settings) -> bool:
+    if bool(getattr(settings, "use_evaluated_mesh", True)):
+        return True
+    # Hook modifiers are often used as animated handles for pin targets. If we
+    # read the raw mesh in that case, the handles move in Blender but the solver
+    # receives unmoved pins, producing the "only raw Hook deformation" look.
+    return any(
+        modifier.type == "HOOK" and bool(modifier.show_viewport)
+        for modifier in obj.modifiers
+    )
 
 
 def _ensure_supported_cloth_object(obj: bpy.types.Object) -> None:
@@ -579,6 +603,16 @@ def _disable_suspended_modifiers(obj: bpy.types.Object, suspended: list[tuple[st
             continue
         modifier.show_viewport = False
         modifier.show_render = False
+
+
+@contextmanager
+def _temporary_setting(settings, name: str, value):
+    old_value = getattr(settings, name)
+    setattr(settings, name, value)
+    try:
+        yield
+    finally:
+        setattr(settings, name, old_value)
 
 
 @contextmanager

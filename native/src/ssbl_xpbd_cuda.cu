@@ -1299,6 +1299,9 @@ extern "C" SSBL_API int ssbl_step_solver(void* handle, int substeps, int iterati
 
     for (int s = 0; s < substeps; ++s) {
         integrate_kernel<<<v_blocks, 256>>>(*solver, sub_dt);
+        if (solver->pin_count > 0) {
+            pin_project_kernel<<<p_blocks, 256>>>(*solver);
+        }
         for (int it = 0; it < iterations; ++it) {
             if (solver->cfg.edge_count > 0) {
                 if (solver->cfg.edge_color_count > 0 && solver->edge_color_offsets_host) {

@@ -100,7 +100,7 @@ _LOAD_ERROR = ""
 
 def dll_path() -> str:
     root = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(root, "native", "bin", "ssbl_xpbd_cuda_abi16.dll")
+    return os.path.join(root, "native", "bin", "ssbl_xpbd_cuda_abi17.dll")
 
 
 def status() -> NativeStatus:

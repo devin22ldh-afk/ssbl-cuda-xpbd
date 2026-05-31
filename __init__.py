@@ -54,12 +54,15 @@ def _apply_hardness(settings, _context):
 @persistent
 def _initialize_hardness_for_scenes(_dummy=None):
     if not hasattr(bpy.types.Scene, "ssbl_preview"):
-        return
+        return None
+    if not hasattr(bpy.data, "scenes"):
+        return None
     for scene in bpy.data.scenes:
         try:
             sync_hardness_settings(scene.ssbl_preview)
         except Exception:
             pass
+    return None
 
 
 class SSBL_PreviewSettings(PropertyGroup):
