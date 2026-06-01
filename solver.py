@@ -14,6 +14,7 @@ from .session_manager import (
     clear_xpbd_cache,
     has_session,
     preview_warnings,
+    record_viewport_tag_ms,
     request_stop,
     reset_preview_object,
     session_diagnostics,

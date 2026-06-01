@@ -45,6 +45,9 @@ typedef struct SsblXpbdConfig {
     float volume_compliance;
     float pressure_strength;
     float volume_target_scale;
+    int volume_solve_interval;
+    int self_probe_interval;
+    int self_surface_pair_interval;
 } SsblXpbdConfig;
 
 typedef struct SsblXpbdDiagnostics {

@@ -51,6 +51,9 @@ class SolverOptions:
     volume_compliance: float
     pressure_strength: float
     volume_target_scale: float
+    volume_solve_interval: int
+    self_probe_interval: int
+    self_surface_pair_interval: int
 
 
 @dataclass
@@ -519,4 +522,7 @@ def settings_to_options(settings) -> SolverOptions:
         volume_compliance=float(getattr(settings, "volume_compliance", 1e-6)),
         pressure_strength=max(float(getattr(settings, "pressure_strength", 1.0)), 0.0),
         volume_target_scale=float(getattr(settings, "volume_target_scale", 1.0)),
+        volume_solve_interval=max(int(getattr(settings, "volume_solve_interval", 1)), 1),
+        self_probe_interval=max(int(getattr(settings, "self_probe_interval", 1)), 1),
+        self_surface_pair_interval=max(int(getattr(settings, "self_surface_pair_interval", 1)), 1),
     )

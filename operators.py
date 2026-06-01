@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import bpy
 import blf
+import time
 
 from . import solver
 
@@ -105,7 +106,9 @@ class SSBL_OT_start_preview(bpy.types.Operator):
             finished = True
             self.report({"ERROR"}, str(exc))
 
+        viewport_started = time.perf_counter()
         _tag_viewports(context)
+        solver.record_viewport_tag_ms(self._object_name, (time.perf_counter() - viewport_started) * 1000.0)
         if not finished:
             return {"RUNNING_MODAL"}
 

@@ -114,6 +114,7 @@ struct Solver {
     int self_sample_count = 0;
     int self_samples_per_triangle = kSelfSurfaceSamplesPerTriangleDefault;
     int self_recovery_mode = 0;
+    long long self_collision_run_count = 0;
     float self_contact_distance_value = 0.0f;
     int* pin_indices = nullptr;
     Vec3* pin_targets = nullptr;
@@ -1026,7 +1027,7 @@ __global__ void static_collision_hashed_kernel(Solver solver) {
     int max_y = cell_coord(fmaxf(p.y, prev.y) + expand, cell_size);
     int max_z = cell_coord(fmaxf(p.z, prev.z) + expand, cell_size);
     int queried = 0;
-    int visited[kMaxDynamicVertexCandidates];
+    int visited[kMaxStaticVertexCandidates];
     int visited_count = 0;
     bool found = false;
     float best_score = 1.0e30f;
@@ -1144,9 +1145,9 @@ __global__ void build_dynamic_triangle_hash_kernel(Solver solver) {
     int max_y = cell_coord(fmaxf(fmaxf(a.y, b.y), c.y) + expand, cell_size);
     int max_z = cell_coord(fmaxf(fmaxf(a.z, b.z), c.z) + expand, cell_size);
     int inserted = 0;
-    for (int z = min_z; z <= max_z && inserted < kMaxStaticTriangleHashCells; ++z) {
-        for (int y = min_y; y <= max_y && inserted < kMaxStaticTriangleHashCells; ++y) {
-            for (int x = min_x; x <= max_x && inserted < kMaxStaticTriangleHashCells; ++x) {
+    for (int z = min_z; z <= max_z && inserted < kMaxDynamicTriangleHashCells; ++z) {
+        for (int y = min_y; y <= max_y && inserted < kMaxDynamicTriangleHashCells; ++y) {
+            for (int x = min_x; x <= max_x && inserted < kMaxDynamicTriangleHashCells; ++x) {
                 int entry = atomicAdd(solver.dynamic_tri_entry_count, 1);
                 if (entry >= solver.dynamic_tri_entry_capacity) {
                     return;
@@ -1177,7 +1178,7 @@ __global__ void dynamic_collision_hashed_kernel(Solver solver) {
     int max_y = cell_coord(fmaxf(p.y, prev.y) + expand, cell_size);
     int max_z = cell_coord(fmaxf(p.z, prev.z) + expand, cell_size);
     int queried = 0;
-    int visited[kMaxStaticVertexCandidates];
+    int visited[kMaxDynamicVertexCandidates];
     int visited_count = 0;
     bool found = false;
     float best_score = 1.0e30f;
@@ -2249,6 +2250,7 @@ bool run_substep(
     float sub_dt,
     int iterations,
     bool run_self_collision,
+    bool run_volume_pressure,
     int v_blocks,
     int e_blocks,
     int b_blocks,
@@ -2302,7 +2304,7 @@ bool run_substep(
         if (solver->cfg.lra_count > 0) {
             lra_project_kernel<<<lra_blocks, 256>>>(*solver, sub_dt);
         }
-        if (solver->cfg.use_volume_pressure && solver->volume_gradient && solver->volume_accum && solver->cfg.triangle_count > 0) {
+        if (run_volume_pressure && solver->volume_gradient && solver->volume_accum && solver->cfg.triangle_count > 0) {
             cudaMemset(solver->volume_gradient, 0, sizeof(Vec3) * solver->cfg.vertex_count);
             cudaMemset(solver->volume_accum, 0, sizeof(float) * 2);
             volume_accumulate_kernel<<<t_blocks, 256>>>(*solver);
@@ -2340,11 +2342,21 @@ bool run_substep(
             }
         }
         if (run_self_collision && it == iterations - 1) {
+            ++solver->self_collision_run_count;
+            int surface_pair_interval = std::max(solver->cfg.self_surface_pair_interval, 1);
+            bool run_surface_pairs = (solver->self_collision_run_count % surface_pair_interval) == 0;
             for (int self_pass = 0; self_pass < kSelfCollisionPasses; ++self_pass) {
-                bool run_surface_sample_pairs = (self_pass == kSelfCollisionPasses - 1);
+                bool run_surface_sample_pairs = run_surface_pairs && (self_pass == kSelfCollisionPasses - 1);
                 if (!run_self_collision_pass(solver, v_blocks, false, run_surface_sample_pairs)) {
                     return false;
                 }
+            }
+
+            int probe_interval = std::max(solver->cfg.self_probe_interval, 1);
+            bool run_probe = (solver->self_collision_run_count % probe_interval) == 0;
+            if (!run_probe) {
+                sanitize_positions_kernel<<<v_blocks, 256>>>(*solver);
+                continue;
             }
 
             SsblXpbdDiagnostics probe_diag{};
@@ -2380,6 +2392,7 @@ bool run_substep(
                         half_dt,
                         iterations,
                         run_self_collision,
+                        run_volume_pressure,
                         v_blocks,
                         e_blocks,
                         b_blocks,
@@ -2396,6 +2409,7 @@ bool run_substep(
                     half_dt,
                     iterations,
                     run_self_collision,
+                    run_volume_pressure,
                     v_blocks,
                     e_blocks,
                     b_blocks,
@@ -2767,11 +2781,15 @@ extern "C" SSBL_API int ssbl_step_solver(void* handle, int substeps, int iterati
         int interval = std::max(solver->cfg.self_collision_interval, 1);
         bool run_self_collision = solver->cfg.self_collision
             && (((s + 1) % interval) == 0 || s == substeps - 1);
+        int volume_interval = std::max(solver->cfg.volume_solve_interval, 1);
+        bool run_volume_pressure = solver->cfg.use_volume_pressure
+            && (((s + 1) % volume_interval) == 0 || s == substeps - 1);
         if (!run_substep(
                 solver,
                 sub_dt,
                 iterations,
                 run_self_collision,
+                run_volume_pressure,
                 v_blocks,
                 e_blocks,
                 b_blocks,

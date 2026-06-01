@@ -36,6 +36,7 @@ class SSBL_PT_preview_panel(bpy.types.Panel):
         runtime_box.prop(settings, "runtime_mode")
         runtime_box.prop(settings, "solver_preset")
         runtime_box.prop(settings, "preview_target_fps")
+        runtime_box.prop(settings, "preview_writeback_interval")
         runtime_box.prop(settings, "use_evaluated_mesh")
         runtime_box.prop(settings, "multi_cloth_preview")
         if settings.multi_cloth_preview:
@@ -101,6 +102,16 @@ class SSBL_PT_preview_panel(bpy.types.Panel):
             diag_box.label(text="接触诊断")
             diag_box.label(text=f"step_ms：{diagnostics.step_ms:.2f}")
             diag_box.label(text=f"hash_build_ms：{diagnostics.hash_build_ms:.2f}")
+            diag_box.label(text=f"frame_ms：{diagnostics.frame_ms:.2f}")
+            diag_box.label(text=f"frame_set_ms：{diagnostics.frame_set_ms:.2f}")
+            diag_box.label(text=f"input_refresh_ms：{diagnostics.input_refresh_ms:.2f}")
+            diag_box.label(text=f"pin_upload_ms：{diagnostics.pin_upload_ms:.2f}")
+            diag_box.label(text=f"static_upload_ms：{diagnostics.static_upload_ms:.2f}")
+            diag_box.label(text=f"dynamic_upload_ms：{diagnostics.dynamic_upload_ms:.2f}")
+            diag_box.label(text=f"cuda_call_ms：{diagnostics.cuda_step_call_ms:.2f}")
+            diag_box.label(text=f"download_ms：{diagnostics.download_ms:.2f}")
+            diag_box.label(text=f"writeback_ms：{diagnostics.writeback_ms:.2f}")
+            diag_box.label(text=f"viewport_tag_ms：{diagnostics.viewport_tag_ms:.2f}")
             diag_box.label(text=f"candidate_count：{diagnostics.candidate_count}")
             diag_box.label(text=f"resolved_contacts：{diagnostics.resolved_contacts}")
             diag_box.label(text="min_gap：-" if diagnostics.min_gap is None else f"min_gap：{diagnostics.min_gap:.5f}")
@@ -120,5 +131,8 @@ class SSBL_PT_preview_panel(bpy.types.Panel):
             if settings.self_collision_mode != "off":
                 tuning_box.prop(settings, "self_collision_interval")
                 tuning_box.prop(settings, "max_self_collision_neighbors")
+                tuning_box.prop(settings, "self_probe_interval")
+                tuning_box.prop(settings, "self_surface_pair_interval")
             if settings.use_volume_pressure:
                 tuning_box.prop(settings, "volume_compliance")
+                tuning_box.prop(settings, "volume_solve_interval")

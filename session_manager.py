@@ -41,6 +41,22 @@ STATUS_ERROR = "错误"
 
 
 @dataclass
+class FramePerf:
+    frame_ms: float = 0.0
+    frame_set_ms: float = 0.0
+    input_refresh_ms: float = 0.0
+    pin_upload_ms: float = 0.0
+    runtime_upload_ms: float = 0.0
+    static_upload_ms: float = 0.0
+    dynamic_upload_ms: float = 0.0
+    cuda_step_call_ms: float = 0.0
+    download_ms: float = 0.0
+    writeback_ms: float = 0.0
+    diagnostics_ms: float = 0.0
+    viewport_tag_ms: float = 0.0
+
+
+@dataclass
 class ClothSlot:
     object_name: str
     cloth: ClothBuildData
@@ -50,6 +66,10 @@ class ClothSlot:
     suspended_modifiers: list[tuple[str, bool, bool]]
     use_evaluated_mesh: bool
     static_collider_signature: tuple[tuple[str, int, int], ...]
+    static_triangles: np.ndarray
+    static_runtime_signature: tuple
+    pin_targets_world: np.ndarray
+    runtime_options_signature: tuple
     collision_layer: int
     cross_cloth_collision: bool
     current_positions_world: np.ndarray
@@ -66,6 +86,7 @@ class SceneSession:
     start_frame: int
     substeps: int
     iterations: int
+    writeback_interval: int
     cross_cloth_mode: str
     last_fps_time: float
     fps_sample_frames: int
@@ -112,6 +133,38 @@ def session_diagnostics(obj: Optional[bpy.types.Object]) -> NativeStepDiagnostic
     if session is not None:
         return session.last_diagnostics
     return _LAST_DIAGNOSTICS.get(obj.name, NativeStepDiagnostics())
+
+
+def record_viewport_tag_ms(object_name: str, elapsed_ms: float) -> None:
+    session = _session_for_object_name(object_name)
+    if session is None:
+        return
+    diag = session.last_diagnostics
+    session.last_diagnostics = NativeStepDiagnostics(
+        step_ms=diag.step_ms,
+        hash_build_ms=diag.hash_build_ms,
+        candidate_count=diag.candidate_count,
+        resolved_contacts=diag.resolved_contacts,
+        min_gap=diag.min_gap,
+        ccd_clamp_count=diag.ccd_clamp_count,
+        recovery_passes=diag.recovery_passes,
+        local_retry_count=diag.local_retry_count,
+        finite=diag.finite,
+        frame_ms=diag.frame_ms,
+        frame_set_ms=diag.frame_set_ms,
+        input_refresh_ms=diag.input_refresh_ms,
+        pin_upload_ms=diag.pin_upload_ms,
+        runtime_upload_ms=diag.runtime_upload_ms,
+        static_upload_ms=diag.static_upload_ms,
+        dynamic_upload_ms=diag.dynamic_upload_ms,
+        cuda_step_call_ms=diag.cuda_step_call_ms,
+        download_ms=diag.download_ms,
+        writeback_ms=diag.writeback_ms,
+        diagnostics_ms=diag.diagnostics_ms,
+        viewport_tag_ms=float(elapsed_ms),
+    )
+    for slot_name in session.solve_order:
+        _LAST_DIAGNOSTICS[slot_name] = session.last_diagnostics
 
 
 def has_session(obj: Optional[bpy.types.Object]) -> bool:
@@ -198,6 +251,7 @@ def start_preview(context: bpy.types.Context, obj: bpy.types.Object) -> SceneSes
             start_frame=int(context.scene.frame_current),
             substeps=max(int(settings.substeps), 1),
             iterations=max(int(settings.iterations), 1),
+            writeback_interval=max(int(getattr(settings, "preview_writeback_interval", 1)), 1),
             cross_cloth_mode=str(getattr(settings, "cross_cloth_collision", "lower_layers")),
             last_fps_time=time.perf_counter(),
             fps_sample_frames=0,
@@ -232,20 +286,37 @@ def step_preview(context: bpy.types.Context, object_name: str) -> bool:
         return True
 
     step_started = time.perf_counter()
+    perf = FramePerf()
+    should_writeback = (
+        session.frame_index == 0
+        or ((session.frame_index + 1) % max(session.writeback_interval, 1)) == 0
+        or session.frame_index + 1 >= session.frame_count
+        or next_frame >= int(scene.frame_end)
+        or (len(session.slots) > 1 and str(session.cross_cloth_mode or "off").lower() != "off")
+    )
     try:
+        started = time.perf_counter()
         scene.frame_set(next_frame)
-        _refresh_session_runtime_inputs(context, session)
-        _step_session_slots(session)
-        for slot in session.slots.values():
-            obj = bpy.data.objects.get(slot.object_name)
-            if obj is None or obj.type != "MESH":
-                raise ValueError(f"预览对象已丢失：{slot.object_name}")
-            _apply_world_positions(obj, slot.current_positions_world, slot.cloth.matrix_world_inv)
+        perf.frame_set_ms += _elapsed_ms(started)
+        _refresh_session_runtime_inputs(context, session, perf)
+        _step_session_slots(session, should_writeback, perf)
+        if should_writeback:
+            started = time.perf_counter()
+            for slot in session.slots.values():
+                obj = bpy.data.objects.get(slot.object_name)
+                if obj is None or obj.type != "MESH":
+                    raise ValueError(f"预览对象已丢失：{slot.object_name}")
+                _apply_world_positions(obj, slot.current_positions_world, slot.cloth.matrix_world_inv)
+            perf.writeback_ms += _elapsed_ms(started)
     except Exception:
         _finish_session(session, STATUS_ERROR)
         raise
 
     session.frame_index += 1
+    perf.frame_ms = _elapsed_ms(step_started)
+    session.last_diagnostics = _aggregate_session_diagnostics(session, perf)
+    for slot_name in session.solve_order:
+        _LAST_DIAGNOSTICS[slot_name] = session.last_diagnostics
     _update_session_fps(session, step_started)
     return False
 
@@ -264,7 +335,7 @@ def bake_xpbd_cache(context: bpy.types.Context, obj: bpy.types.Object) -> str:
     original_frame = int(context.scene.frame_current)
     try:
         context.scene.frame_set(start)
-        cloth, native, static_signature = _create_native_solver(context, obj, settings)
+        cloth, native, static_signature, _static_tris = _create_native_solver(context, obj, settings)
         path = _cache_path_for_object(obj)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         sample_count = end - start + 1
@@ -311,6 +382,95 @@ def _scene_key(scene: bpy.types.Scene) -> str:
     return scene.name
 
 
+def _elapsed_ms(started: float) -> float:
+    return (time.perf_counter() - started) * 1000.0
+
+
+def _array_equal(a: np.ndarray, b: np.ndarray) -> bool:
+    if a.shape != b.shape:
+        return False
+    if a.size == 0 and b.size == 0:
+        return True
+    return bool(np.array_equal(a, b))
+
+
+def _matrix_signature(matrix) -> tuple[float, ...]:
+    return tuple(round(float(value), 6) for row in matrix for value in row)
+
+
+def _runtime_options_signature(options) -> tuple:
+    return (
+        bool(options.use_ground),
+        round(float(options.ground_height), 6),
+        bool(options.use_wall),
+        tuple(round(float(value), 6) for value in options.wall_origin),
+        tuple(round(float(value), 6) for value in options.wall_normal),
+        bool(options.use_sphere),
+        tuple(round(float(value), 6) for value in options.sphere_center),
+        round(float(options.sphere_radius), 6),
+    )
+
+
+def _static_collider_runtime_signature(
+    collection: bpy.types.Collection | None,
+    exclude_obj: bpy.types.Object | None,
+    depsgraph: bpy.types.Depsgraph | None,
+    use_evaluated_mesh: bool,
+) -> tuple:
+    if collection is None:
+        return ()
+    entries = []
+    depsgraph = depsgraph or bpy.context.evaluated_depsgraph_get()
+    for obj in sorted(collection.objects, key=lambda item: item.name):
+        if obj is None or obj == exclude_obj or obj.type != "MESH":
+            continue
+        source = obj.evaluated_get(depsgraph) if use_evaluated_mesh else obj
+        mesh = source.data
+        entries.append(
+            (
+                obj.name,
+                len(mesh.vertices),
+                len(mesh.polygons),
+                _matrix_signature(source.matrix_world),
+            )
+        )
+    return tuple(entries)
+
+
+def _pin_targets_from_object(
+    obj: bpy.types.Object,
+    pin_indices: np.ndarray,
+    use_evaluated_mesh: bool,
+    depsgraph: bpy.types.Depsgraph | None = None,
+    expected_vertex_count: int | None = None,
+) -> tuple[np.ndarray, bpy.types.Matrix]:
+    if use_evaluated_mesh:
+        depsgraph = depsgraph or bpy.context.evaluated_depsgraph_get()
+        eval_obj = obj.evaluated_get(depsgraph)
+        mesh = eval_obj.to_mesh()
+        try:
+            if expected_vertex_count is not None and len(mesh.vertices) != expected_vertex_count:
+                raise ValueError("动画布料输入的顶点数发生了变化；求值后的布料输入必须保持固定拓扑。")
+            return _pin_targets_from_mesh(mesh, eval_obj.matrix_world.copy(), pin_indices), eval_obj.matrix_world.copy()
+        finally:
+            eval_obj.to_mesh_clear()
+
+    mesh = obj.data
+    if expected_vertex_count is not None and len(mesh.vertices) != expected_vertex_count:
+        raise ValueError("动画布料输入的顶点数发生了变化；必须保持固定的布料拓扑。")
+    return _pin_targets_from_mesh(mesh, obj.matrix_world.copy(), pin_indices), obj.matrix_world.copy()
+
+
+def _pin_targets_from_mesh(mesh: bpy.types.Mesh, matrix_world, pin_indices: np.ndarray) -> np.ndarray:
+    if len(pin_indices) == 0:
+        return np.empty((0, 3), dtype=np.float32)
+    coords = np.empty((len(pin_indices), 3), dtype=np.float32)
+    for out_index, vertex_index in enumerate(pin_indices):
+        coords[out_index] = mesh.vertices[int(vertex_index)].co
+    mat = np.array(matrix_world, dtype=np.float32)
+    return coords @ mat[:3, :3].T + mat[:3, 3]
+
+
 def _session_for_object_name(object_name: str) -> SceneSession | None:
     scene_key = _OBJECT_TO_SCENE_SESSION.get(object_name)
     if scene_key is None:
@@ -355,7 +515,7 @@ def _create_cloth_slot(
 ) -> ClothSlot:
     original_mesh = obj.data
     use_evaluated_mesh = _effective_use_evaluated_mesh(obj, settings)
-    cloth, native, static_signature = _create_native_solver(
+    cloth, native, static_signature, static_tris = _create_native_solver(
         context,
         obj,
         settings,
@@ -375,6 +535,15 @@ def _create_cloth_slot(
         suspended_modifiers=suspended_modifiers,
         use_evaluated_mesh=use_evaluated_mesh,
         static_collider_signature=static_signature,
+        static_triangles=np.array(static_tris, dtype=np.float32, copy=True),
+        static_runtime_signature=_static_collider_runtime_signature(
+            settings.static_collider_collection,
+            obj,
+            depsgraph,
+            use_evaluated_mesh,
+        ),
+        pin_targets_world=np.array(cloth.pin_targets_world, dtype=np.float32, copy=True),
+        runtime_options_signature=_runtime_options_signature(settings_to_options(settings)),
         collision_layer=_object_collision_layer(obj),
         cross_cloth_collision=_object_cross_collision_enabled(obj),
         current_positions_world=np.array(cloth.positions_world, dtype=np.float32, copy=True),
@@ -387,7 +556,7 @@ def _create_native_solver(
     settings,
     depsgraph: bpy.types.Depsgraph | None = None,
     use_evaluated_mesh_override: bool | None = None,
-) -> tuple[ClothBuildData, NativeXpbdSolver, tuple[tuple[str, int, int], ...]]:
+) -> tuple[ClothBuildData, NativeXpbdSolver, tuple[tuple[str, int, int], ...], np.ndarray]:
     try:
         depsgraph = depsgraph or context.evaluated_depsgraph_get()
         use_evaluated_mesh = (
@@ -409,12 +578,15 @@ def _create_native_solver(
     except Exception:
         _STATUS[obj.name] = STATUS_ERROR
         raise
-    return cloth, native, static_signature
+    return cloth, native, static_signature, static_tris
 
 
-def _refresh_session_runtime_inputs(context: bpy.types.Context, session: SceneSession) -> None:
+def _refresh_session_runtime_inputs(context: bpy.types.Context, session: SceneSession, perf: FramePerf | None = None) -> None:
+    refresh_started = time.perf_counter()
     depsgraph = context.evaluated_depsgraph_get()
     settings = context.scene.ssbl_preview
+    options = settings_to_options(settings)
+    runtime_signature = _runtime_options_signature(options)
     for slot in session.slots.values():
         obj = bpy.data.objects.get(slot.object_name)
         if obj is None or obj.type != "MESH":
@@ -422,31 +594,61 @@ def _refresh_session_runtime_inputs(context: bpy.types.Context, session: SceneSe
         with _with_preview_source_state(slot, obj):
             context.view_layer.update()
             depsgraph = context.evaluated_depsgraph_get()
-            world_positions, matrix_world = world_positions_from_object(
+            pin_targets, matrix_world = _pin_targets_from_object(
                 obj,
+                slot.cloth.pin_indices,
                 slot.use_evaluated_mesh,
                 depsgraph=depsgraph,
                 expected_vertex_count=len(slot.cloth.positions_world),
             )
-            static_tris, static_signature = collect_static_triangles(
+            static_runtime_signature = _static_collider_runtime_signature(
                 settings.static_collider_collection,
                 obj,
-                depsgraph=depsgraph,
-                use_evaluated_mesh=slot.use_evaluated_mesh,
+                depsgraph,
+                slot.use_evaluated_mesh,
             )
-        _apply_runtime_inputs(context, obj, slot.cloth, slot.native, world_positions, matrix_world, static_tris, static_signature, slot.static_collider_signature)
+            static_tris = None
+            static_signature = slot.static_collider_signature
+            if static_runtime_signature != slot.static_runtime_signature:
+                static_tris, static_signature = collect_static_triangles(
+                    settings.static_collider_collection,
+                    obj,
+                    depsgraph=depsgraph,
+                    use_evaluated_mesh=slot.use_evaluated_mesh,
+                )
+        _apply_runtime_inputs(
+            slot,
+            options,
+            runtime_signature,
+            pin_targets,
+            matrix_world,
+            static_tris,
+            static_signature,
+            static_runtime_signature,
+            perf,
+        )
+    if perf is not None:
+        perf.input_refresh_ms += _elapsed_ms(refresh_started)
 
 
-def _step_session_slots(session: SceneSession) -> None:
+def _step_session_slots(session: SceneSession, download_positions: bool, perf: FramePerf | None = None) -> None:
+    cross_cloth_needs_positions = len(session.slots) > 1 and str(session.cross_cloth_mode or "off").lower() != "off"
     for slot_name in session.solve_order:
         slot = session.slots[slot_name]
+        started = time.perf_counter()
         dynamic_triangles = _collect_cross_cloth_triangles(session, slot)
         slot.native.update_dynamic_triangles(dynamic_triangles)
+        if perf is not None:
+            perf.dynamic_upload_ms += _elapsed_ms(started)
+        started = time.perf_counter()
         slot.native.step(session.substeps, session.iterations)
-        slot.current_positions_world = np.array(slot.native.download_positions(), dtype=np.float32, copy=True)
-    session.last_diagnostics = _aggregate_session_diagnostics(session)
-    for slot_name in session.solve_order:
-        _LAST_DIAGNOSTICS[slot_name] = session.last_diagnostics
+        if perf is not None:
+            perf.cuda_step_call_ms += _elapsed_ms(started)
+        if download_positions or cross_cloth_needs_positions:
+            started = time.perf_counter()
+            slot.current_positions_world = np.array(slot.native.download_positions(), dtype=np.float32, copy=True)
+            if perf is not None:
+                perf.download_ms += _elapsed_ms(started)
 
 
 def _collect_cross_cloth_triangles(session: SceneSession, target: ClothSlot) -> np.ndarray:
@@ -491,20 +693,6 @@ def _refresh_bake_runtime_inputs(
         depsgraph=depsgraph,
         use_evaluated_mesh=use_evaluated_mesh,
     )
-    _apply_runtime_inputs(context, obj, cloth, native, world_positions, matrix_world, static_tris, static_signature, expected_static_signature)
-
-
-def _apply_runtime_inputs(
-    context: bpy.types.Context,
-    obj: bpy.types.Object,
-    cloth: ClothBuildData,
-    native: NativeXpbdSolver,
-    world_positions: np.ndarray,
-    matrix_world,
-    static_tris: np.ndarray,
-    static_signature: tuple[tuple[str, int, int], ...],
-    expected_static_signature: tuple[tuple[str, int, int], ...],
-) -> None:
     if static_signature != expected_static_signature:
         raise ValueError("动画静态碰撞体的拓扑或成员发生了变化；v1 要求各帧保持固定碰撞拓扑。")
     cloth.matrix_world_inv = np.array(matrix_world.inverted(), dtype=np.float32)
@@ -512,6 +700,42 @@ def _apply_runtime_inputs(
     native.update_pin_targets(cloth.pin_indices, pin_targets)
     native.update_runtime_colliders(settings_to_options(context.scene.ssbl_preview))
     native.update_static_triangles(static_tris)
+
+
+def _apply_runtime_inputs(
+    slot: ClothSlot,
+    options,
+    runtime_signature: tuple,
+    pin_targets: np.ndarray,
+    matrix_world,
+    static_tris: np.ndarray | None,
+    static_signature: tuple[tuple[str, int, int], ...],
+    static_runtime_signature: tuple,
+    perf: FramePerf | None = None,
+) -> None:
+    if static_signature != slot.static_collider_signature:
+        raise ValueError("动画静态碰撞体的拓扑或成员发生了变化；v1 要求各帧保持固定碰撞拓扑。")
+    slot.cloth.matrix_world_inv = np.array(matrix_world.inverted(), dtype=np.float32)
+    pin_targets = np.ascontiguousarray(pin_targets, dtype=np.float32)
+    if not _array_equal(pin_targets, slot.pin_targets_world):
+        started = time.perf_counter()
+        slot.native.update_pin_targets(slot.cloth.pin_indices, pin_targets)
+        if perf is not None:
+            perf.pin_upload_ms += _elapsed_ms(started)
+        slot.pin_targets_world = np.array(pin_targets, dtype=np.float32, copy=True)
+    if runtime_signature != slot.runtime_options_signature:
+        started = time.perf_counter()
+        slot.native.update_runtime_colliders(options)
+        if perf is not None:
+            perf.runtime_upload_ms += _elapsed_ms(started)
+        slot.runtime_options_signature = runtime_signature
+    if static_tris is not None:
+        started = time.perf_counter()
+        slot.native.update_static_triangles(static_tris)
+        if perf is not None:
+            perf.static_upload_ms += _elapsed_ms(started)
+        slot.static_triangles = np.array(static_tris, dtype=np.float32, copy=True)
+        slot.static_runtime_signature = static_runtime_signature
 
 
 def _effective_use_evaluated_mesh(obj: bpy.types.Object, settings) -> bool:
@@ -668,7 +892,7 @@ def _update_session_fps(session: SceneSession, _step_started: float) -> None:
     session.last_fps_time = now
 
 
-def _aggregate_session_diagnostics(session: SceneSession) -> NativeStepDiagnostics:
+def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None = None) -> NativeStepDiagnostics:
     step_ms = 0.0
     hash_build_ms = 0.0
     candidate_count = 0
@@ -678,8 +902,9 @@ def _aggregate_session_diagnostics(session: SceneSession) -> NativeStepDiagnosti
     recovery_passes = 0
     local_retry_count = 0
     finite = True
+    diag_started = time.perf_counter()
     for slot in session.slots.values():
-        diag = slot.native.diagnostics()
+        diag = slot.native.cached_diagnostics()
         step_ms += float(diag.step_ms)
         hash_build_ms += float(diag.hash_build_ms)
         candidate_count += int(diag.candidate_count)
@@ -690,6 +915,8 @@ def _aggregate_session_diagnostics(session: SceneSession) -> NativeStepDiagnosti
         finite = finite and bool(diag.finite)
         if diag.min_gap is not None:
             min_gap = float(diag.min_gap) if min_gap is None else min(min_gap, float(diag.min_gap))
+    if perf is not None:
+        perf.diagnostics_ms += _elapsed_ms(diag_started)
     return NativeStepDiagnostics(
         step_ms=step_ms,
         hash_build_ms=hash_build_ms,
@@ -700,6 +927,18 @@ def _aggregate_session_diagnostics(session: SceneSession) -> NativeStepDiagnosti
         recovery_passes=recovery_passes,
         local_retry_count=local_retry_count,
         finite=finite,
+        frame_ms=perf.frame_ms if perf is not None else 0.0,
+        frame_set_ms=perf.frame_set_ms if perf is not None else 0.0,
+        input_refresh_ms=perf.input_refresh_ms if perf is not None else 0.0,
+        pin_upload_ms=perf.pin_upload_ms if perf is not None else 0.0,
+        runtime_upload_ms=perf.runtime_upload_ms if perf is not None else 0.0,
+        static_upload_ms=perf.static_upload_ms if perf is not None else 0.0,
+        dynamic_upload_ms=perf.dynamic_upload_ms if perf is not None else 0.0,
+        cuda_step_call_ms=perf.cuda_step_call_ms if perf is not None else 0.0,
+        download_ms=perf.download_ms if perf is not None else 0.0,
+        writeback_ms=perf.writeback_ms if perf is not None else 0.0,
+        diagnostics_ms=perf.diagnostics_ms if perf is not None else 0.0,
+        viewport_tag_ms=perf.viewport_tag_ms if perf is not None else 0.0,
     )
 
 

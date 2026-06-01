@@ -31,6 +31,8 @@ def _apply_self_collision_mode(settings, _context):
     if mode == "fast":
         settings.self_collision_interval = 2
         settings.max_self_collision_neighbors = 32
+        settings.self_probe_interval = 2
+        settings.self_surface_pair_interval = 2
 
 
 def _apply_solver_preset(settings, _context):
@@ -38,12 +40,18 @@ def _apply_solver_preset(settings, _context):
     if preset == "fast":
         settings.substeps = 8
         settings.iterations = 1
+        settings.preview_writeback_interval = 2
+        settings.volume_solve_interval = 2
     elif preset == "stable":
         settings.substeps = 16
         settings.iterations = 2
+        settings.preview_writeback_interval = 1
+        settings.volume_solve_interval = 1
     else:
         settings.substeps = 12
         settings.iterations = 1
+        settings.preview_writeback_interval = 1
+        settings.volume_solve_interval = 1
 
 
 def _apply_hardness(settings, _context):
@@ -119,6 +127,13 @@ class SSBL_PreviewSettings(PropertyGroup):
         min=1.0,
         soft_max=120.0,
         description="预览时视口播放的目标频率",
+    )
+    preview_writeback_interval: IntProperty(
+        name="Preview writeback interval",
+        default=1,
+        min=1,
+        soft_max=8,
+        description="Only update the viewport mesh every N simulated preview frames; baking still writes every frame",
     )
     use_evaluated_mesh: BoolProperty(
         name="使用求值网格",
@@ -256,6 +271,13 @@ class SSBL_PreviewSettings(PropertyGroup):
         precision=3,
         description="目标体积相对于静止有符号体积的倍数",
     )
+    volume_solve_interval: IntProperty(
+        name="Volume solve interval",
+        default=1,
+        min=1,
+        soft_max=8,
+        description="Run global volume projection every N substeps; 1 preserves the original behavior",
+    )
     gravity: FloatVectorProperty(
         name="重力",
         default=(0.0, 0.0, -9.8),
@@ -312,6 +334,20 @@ class SSBL_PreviewSettings(PropertyGroup):
         min=4,
         soft_max=256,
         description="每个顶点或边在自碰撞中允许处理的最大邻居候选数",
+    )
+    self_probe_interval: IntProperty(
+        name="Self probe interval",
+        default=1,
+        min=1,
+        soft_max=8,
+        description="Run expensive self-collision probe/recovery every N self-collision passes; 1 preserves the original behavior",
+    )
+    self_surface_pair_interval: IntProperty(
+        name="Surface pair interval",
+        default=1,
+        min=1,
+        soft_max=8,
+        description="Run sample-sample self-collision every N self-collision passes; 1 preserves the original behavior",
     )
     use_ground: BoolProperty(
         name="地面平面",

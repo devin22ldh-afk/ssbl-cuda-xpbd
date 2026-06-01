@@ -53,6 +53,9 @@ class _NativeConfig(ctypes.Structure):
         ("volume_compliance", ctypes.c_float),
         ("pressure_strength", ctypes.c_float),
         ("volume_target_scale", ctypes.c_float),
+        ("volume_solve_interval", ctypes.c_int),
+        ("self_probe_interval", ctypes.c_int),
+        ("self_surface_pair_interval", ctypes.c_int),
     ]
 
 
@@ -119,6 +122,18 @@ class NativeStepDiagnostics:
     recovery_passes: int = 0
     local_retry_count: int = 0
     finite: bool = True
+    frame_ms: float = 0.0
+    frame_set_ms: float = 0.0
+    input_refresh_ms: float = 0.0
+    pin_upload_ms: float = 0.0
+    runtime_upload_ms: float = 0.0
+    static_upload_ms: float = 0.0
+    dynamic_upload_ms: float = 0.0
+    cuda_step_call_ms: float = 0.0
+    download_ms: float = 0.0
+    writeback_ms: float = 0.0
+    diagnostics_ms: float = 0.0
+    viewport_tag_ms: float = 0.0
 
     @property
     def penetration_depth(self) -> float:
@@ -133,7 +148,7 @@ _LOAD_ERROR = ""
 
 def dll_path() -> str:
     root = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(root, "native", "bin", "ssbl_xpbd_cuda_abi21.dll")
+    return os.path.join(root, "native", "bin", "ssbl_xpbd_cuda_abi22.dll")
 
 
 def status() -> NativeStatus:
@@ -260,6 +275,9 @@ def _config_from_options(
     cfg.volume_compliance = float(options.volume_compliance)
     cfg.pressure_strength = float(options.pressure_strength)
     cfg.volume_target_scale = float(options.volume_target_scale)
+    cfg.volume_solve_interval = int(options.volume_solve_interval)
+    cfg.self_probe_interval = int(options.self_probe_interval)
+    cfg.self_surface_pair_interval = int(options.self_surface_pair_interval)
     return cfg
 
 
@@ -334,6 +352,8 @@ class NativeXpbdSolver:
 
     def update_static_triangles(self, static_triangles: np.ndarray) -> None:
         triangle_count = int(len(static_triangles))
+        if triangle_count <= 0 and self._static_triangle_count <= 0:
+            return
         static_triangles = np.ascontiguousarray(static_triangles.reshape((-1, 3)), dtype=np.float32)
         if triangle_count != self._static_triangle_count:
             raise NativeSolverError(
@@ -348,6 +368,8 @@ class NativeXpbdSolver:
 
     def update_dynamic_triangles(self, dynamic_triangles: np.ndarray) -> None:
         triangle_count = int(len(dynamic_triangles))
+        if triangle_count <= 0 and (self._dynamic_triangle_count is None or self._dynamic_triangle_count <= 0):
+            return
         dynamic_triangles = np.ascontiguousarray(dynamic_triangles.reshape((-1, 3)), dtype=np.float32)
         if self._dynamic_triangle_count is None and triangle_count > 0:
             self._dynamic_triangle_count = triangle_count
@@ -366,6 +388,9 @@ class NativeXpbdSolver:
         if not self._lib.ssbl_step_solver(self._handle, int(substeps), int(iterations)):
             raise NativeSolverError(_last_error(self._lib))
         self._last_diagnostics = self.diagnostics()
+
+    def cached_diagnostics(self) -> NativeStepDiagnostics:
+        return self._last_diagnostics
 
     def download_positions(self) -> np.ndarray:
         out = self._positions_out
