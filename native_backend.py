@@ -169,6 +169,9 @@ class NativeStepDiagnostics:
     cuda_step_call_ms: float = 0.0
     download_ms: float = 0.0
     writeback_ms: float = 0.0
+    writeback_to_local_ms: float = 0.0
+    writeback_foreach_set_ms: float = 0.0
+    writeback_mesh_update_ms: float = 0.0
     frame_input_upload_ms: float = 0.0
     writeback_performed: bool = False
     diagnostics_ms: float = 0.0
@@ -187,7 +190,7 @@ _LOAD_ERROR = ""
 
 def dll_path() -> str:
     root = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(root, "native", "bin", "ssbl_xpbd_cuda_abi24.dll")
+    return os.path.join(root, "native", "bin", "ssbl_xpbd_cuda_abi25.dll")
 
 
 def status() -> NativeStatus:

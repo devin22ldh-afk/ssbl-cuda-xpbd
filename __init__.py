@@ -139,9 +139,9 @@ class SSBL_PreviewSettings(PropertyGroup):
         description="Only update the viewport mesh every N simulated preview frames; baking still writes every frame",
     )
     use_evaluated_mesh: BoolProperty(
-        name="使用求值网格",
+        name="动态网格",
         default=True,
-        description="在拓扑不变时，从 Blender 求值后的依赖图读取布料和碰撞体输入",
+        description="读取 Blender 修改器和绑定后的动态网格输入；顶点数和拓扑必须保持不变",
     )
     multi_cloth_preview: BoolProperty(
         name="多布料预览",

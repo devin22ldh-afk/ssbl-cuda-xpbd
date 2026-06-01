@@ -53,6 +53,9 @@ class FramePerf:
     cuda_step_call_ms: float = 0.0
     download_ms: float = 0.0
     writeback_ms: float = 0.0
+    writeback_to_local_ms: float = 0.0
+    writeback_foreach_set_ms: float = 0.0
+    writeback_mesh_update_ms: float = 0.0
     frame_input_upload_ms: float = 0.0
     writeback_performed: bool = False
     diagnostics_ms: float = 0.0
@@ -76,6 +79,7 @@ class ClothSlot:
     collision_layer: int
     cross_cloth_collision: bool
     current_positions_world: np.ndarray
+    writeback_local_buffer: np.ndarray
 
 
 @dataclass
@@ -173,6 +177,9 @@ def record_viewport_tag_ms(object_name: str, elapsed_ms: float) -> None:
         cuda_step_call_ms=diag.cuda_step_call_ms,
         download_ms=diag.download_ms,
         writeback_ms=diag.writeback_ms,
+        writeback_to_local_ms=diag.writeback_to_local_ms,
+        writeback_foreach_set_ms=diag.writeback_foreach_set_ms,
+        writeback_mesh_update_ms=diag.writeback_mesh_update_ms,
         frame_input_upload_ms=diag.frame_input_upload_ms,
         writeback_performed=diag.writeback_performed,
         diagnostics_ms=diag.diagnostics_ms,
@@ -276,7 +283,12 @@ def start_preview(context: bpy.types.Context, obj: bpy.types.Object) -> SceneSes
         for name, slot in slots.items():
             _OBJECT_TO_SCENE_SESSION[name] = scene_key
             _STATUS[name] = STATUS_PREVIEW_RUNNING
-            _apply_world_positions(bpy.data.objects[name], slot.current_positions_world, slot.cloth.matrix_world_inv)
+            _apply_world_positions(
+                bpy.data.objects[name],
+                slot.current_positions_world,
+                slot.cloth.matrix_world_inv,
+                local_buffer=slot.writeback_local_buffer,
+            )
         return session
     except Exception:
         if obj is not None:
@@ -322,7 +334,13 @@ def step_preview(context: bpy.types.Context, object_name: str) -> bool:
                 obj = bpy.data.objects.get(slot.object_name)
                 if obj is None or obj.type != "MESH":
                     raise ValueError(f"Missing preview object during writeback: {slot.object_name}")
-                _apply_world_positions(obj, slot.current_positions_world, slot.cloth.matrix_world_inv)
+                _apply_world_positions(
+                    obj,
+                    slot.current_positions_world,
+                    slot.cloth.matrix_world_inv,
+                    local_buffer=slot.writeback_local_buffer,
+                    perf=perf,
+                )
             perf.writeback_ms += _elapsed_ms(started)
     except Exception:
         _finish_session(session, STATUS_ERROR)
@@ -564,6 +582,7 @@ def _create_cloth_slot(
         collision_layer=_object_collision_layer(obj),
         cross_cloth_collision=_object_cross_collision_enabled(obj),
         current_positions_world=np.array(cloth.positions_world, dtype=np.float32, copy=True),
+        writeback_local_buffer=np.empty_like(cloth.positions_world, dtype=np.float32),
     )
 
 
@@ -603,31 +622,45 @@ def _refresh_session_runtime_inputs(context: bpy.types.Context, session: SceneSe
     settings = context.scene.ssbl_preview
     options = settings_to_options(settings)
     runtime_signature = _runtime_options_signature(options)
+    static_collection = settings.static_collider_collection
+    has_static_collection = static_collection is not None
+    needs_depsgraph = has_static_collection or any(
+        slot.use_evaluated_mesh and len(slot.cloth.pin_indices) > 0
+        for slot in session.slots.values()
+    )
     with _with_session_source_state(session):
         context.view_layer.update()
-        depsgraph = context.evaluated_depsgraph_get()
+        depsgraph = context.evaluated_depsgraph_get() if needs_depsgraph else None
         for slot in session.slots.values():
             obj = bpy.data.objects.get(slot.object_name)
             if obj is None or obj.type != "MESH":
                 raise ValueError(f"Missing preview object during input refresh: {slot.object_name}")
-            pin_targets, matrix_world = _pin_targets_from_object(
-                obj,
-                slot.cloth.pin_indices,
-                slot.use_evaluated_mesh,
-                depsgraph=depsgraph,
-                expected_vertex_count=len(slot.cloth.positions_world),
-            )
-            static_runtime_signature = _static_collider_runtime_signature(
-                settings.static_collider_collection,
-                obj,
-                depsgraph,
-                slot.use_evaluated_mesh,
+            if len(slot.cloth.pin_indices) > 0:
+                pin_targets, matrix_world = _pin_targets_from_object(
+                    obj,
+                    slot.cloth.pin_indices,
+                    slot.use_evaluated_mesh,
+                    depsgraph=depsgraph,
+                    expected_vertex_count=len(slot.cloth.positions_world),
+                )
+            else:
+                pin_targets = np.empty((0, 3), dtype=np.float32)
+                matrix_world = obj.matrix_world.copy()
+            static_runtime_signature = (
+                _static_collider_runtime_signature(
+                    static_collection,
+                    obj,
+                    depsgraph,
+                    slot.use_evaluated_mesh,
+                )
+                if has_static_collection
+                else ()
             )
             static_tris = None
             static_signature = slot.static_collider_signature
             if static_runtime_signature != slot.static_runtime_signature:
                 static_tris, static_signature = collect_static_triangles(
-                    settings.static_collider_collection,
+                    static_collection,
                     obj,
                     depsgraph=depsgraph,
                     use_evaluated_mesh=slot.use_evaluated_mesh,
@@ -943,16 +976,33 @@ def _apply_world_positions(
     obj: bpy.types.Object,
     world_positions: np.ndarray,
     matrix_world_inv: np.ndarray,
+    local_buffer: np.ndarray | None = None,
+    perf: FramePerf | None = None,
 ) -> None:
+    started = time.perf_counter()
     world = np.asarray(world_positions, dtype=np.float32)
     matrix_inv = np.asarray(matrix_world_inv, dtype=np.float32)
+    local = local_buffer if local_buffer is not None and local_buffer.shape == world.shape else None
+    if local is None:
+        local = np.empty_like(world, dtype=np.float32)
     if matrix_inv.shape == (4, 4) and np.allclose(matrix_inv, _IDENTITY_4X4, rtol=0.0, atol=1.0e-7):
-        local = world
+        np.copyto(local, world, casting="unsafe")
     else:
-        local = to_local(world, matrix_inv)
-    flat = np.ascontiguousarray(local, dtype=np.float32).reshape(-1)
+        np.matmul(world, matrix_inv[:3, :3].T, out=local)
+        local += matrix_inv[:3, 3]
+    if perf is not None:
+        perf.writeback_to_local_ms += _elapsed_ms(started)
+
+    flat = local.reshape(-1)
+    started = time.perf_counter()
     obj.data.vertices.foreach_set("co", flat)
+    if perf is not None:
+        perf.writeback_foreach_set_ms += _elapsed_ms(started)
+
+    started = time.perf_counter()
     obj.data.update()
+    if perf is not None:
+        perf.writeback_mesh_update_ms += _elapsed_ms(started)
 
 
 def _update_session_fps(session: SceneSession, _step_started: float) -> None:
@@ -1050,6 +1100,9 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
         cuda_step_call_ms=perf.cuda_step_call_ms if perf is not None else 0.0,
         download_ms=perf.download_ms if perf is not None else 0.0,
         writeback_ms=perf.writeback_ms if perf is not None else 0.0,
+        writeback_to_local_ms=perf.writeback_to_local_ms if perf is not None else 0.0,
+        writeback_foreach_set_ms=perf.writeback_foreach_set_ms if perf is not None else 0.0,
+        writeback_mesh_update_ms=perf.writeback_mesh_update_ms if perf is not None else 0.0,
         writeback_performed=perf.writeback_performed if perf is not None else writeback_performed,
         diagnostics_ms=perf.diagnostics_ms if perf is not None else 0.0,
         viewport_tag_ms=perf.viewport_tag_ms if perf is not None else 0.0,

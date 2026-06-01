@@ -70,13 +70,6 @@ class SSBL_PT_preview_panel(bpy.types.Panel):
         collision_box.prop(settings, "use_ground")
         if settings.use_ground:
             collision_box.prop(settings, "ground_height")
-        collision_box.prop(settings, "use_wall")
-        if settings.use_wall:
-            collision_box.prop(settings, "wall_origin")
-            collision_box.prop(settings, "wall_normal")
-        collision_box.prop(settings, "use_sphere")
-        if settings.use_sphere:
-            collision_box.prop(settings, "sphere_object")
         collision_box.prop(settings, "static_collider_collection")
 
         preview_row = layout.row(align=True)

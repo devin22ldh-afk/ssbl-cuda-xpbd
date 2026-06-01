@@ -19,6 +19,7 @@ constexpr float kEps = 1.0e-8f;
 constexpr float kProjectionRelaxation = 0.35f;
 constexpr float kSelfProjectionRelaxation = 0.40f;
 constexpr float kSelfRecoveryProjectionRelaxation = 0.70f;
+constexpr float kSelfRecoveryVelocityDamping = 0.65f;
 constexpr float kMaxSubstepMove = 0.35f;
 constexpr float kMaxVelocity = 35.0f;
 constexpr int kSelfCollisionPasses = 2;
@@ -117,6 +118,8 @@ struct Solver {
     int* self_sample_heads = nullptr;
     int* self_sample_next = nullptr;
     int* self_sample_hash_dirty = nullptr;
+    int* self_recovery_touched = nullptr;
+    Vec3* self_recovery_delta = nullptr;
     int self_sample_hash_table_size = 0;
     int self_sample_count = 0;
     int self_samples_per_triangle = kSelfSurfaceSamplesPerTriangleDefault;
@@ -547,6 +550,18 @@ __device__ void diag_note_ccd(Solver solver) {
 __device__ void diag_note_nonfinite(Solver solver) {
     if (solver.diag_counts) {
         atomicExch(&solver.diag_counts[kDiagFiniteFlag], 0ull);
+    }
+}
+
+__device__ void note_self_recovery_delta(Solver solver, int index, Vec3 delta) {
+    if (!solver.self_recovery_mode || index < 0 || index >= solver.cfg.vertex_count) {
+        return;
+    }
+    if (solver.self_recovery_touched) {
+        atomicExch(&solver.self_recovery_touched[index], 1);
+    }
+    if (solver.self_recovery_delta) {
+        atomic_add(&solver.self_recovery_delta[index], delta);
     }
 }
 
@@ -1601,8 +1616,12 @@ __global__ void self_particle_collision_kernel(Solver solver) {
                             float total = wi + wj;
                             if (total > 0.0f) {
                                 Vec3 correction = mul(normal, self_projection_relaxation(solver) * (thickness - contact_distance) / total);
-                                atomic_add(&solver.pos[i], mul(correction, wi));
-                                atomic_add(&solver.pos[j], mul(correction, -wj));
+                                Vec3 correction_i = mul(correction, wi);
+                                Vec3 correction_j = mul(correction, -wj);
+                                atomic_add(&solver.pos[i], correction_i);
+                                atomic_add(&solver.pos[j], correction_j);
+                                note_self_recovery_delta(solver, i, correction_i);
+                                note_self_recovery_delta(solver, j, correction_j);
                                 diag_note_resolved(solver);
                             }
                         }
@@ -1764,10 +1783,18 @@ __global__ void self_vertex_surface_collision_kernel(Solver solver) {
                                 if (solver.self_sample_hash_dirty) {
                                     atomicExch(solver.self_sample_hash_dirty, 1);
                                 }
-                                atomic_add(&solver.pos[i], mul(correction, wi));
-                                atomic_add(&solver.pos[tri.x], mul(correction, -wx * wa));
-                                atomic_add(&solver.pos[tri.y], mul(correction, -wy * wb));
-                                atomic_add(&solver.pos[tri.z], mul(correction, -wz * wc));
+                                Vec3 correction_i = mul(correction, wi);
+                                Vec3 correction_x = mul(correction, -wx * wa);
+                                Vec3 correction_y = mul(correction, -wy * wb);
+                                Vec3 correction_z = mul(correction, -wz * wc);
+                                atomic_add(&solver.pos[i], correction_i);
+                                atomic_add(&solver.pos[tri.x], correction_x);
+                                atomic_add(&solver.pos[tri.y], correction_y);
+                                atomic_add(&solver.pos[tri.z], correction_z);
+                                note_self_recovery_delta(solver, i, correction_i);
+                                note_self_recovery_delta(solver, tri.x, correction_x);
+                                note_self_recovery_delta(solver, tri.y, correction_y);
+                                note_self_recovery_delta(solver, tri.z, correction_z);
                                 diag_note_resolved(solver);
                             }
                         }
@@ -1893,12 +1920,24 @@ __global__ void self_surface_sample_collision_kernel(Solver solver) {
                                 float total = sample_weight_a + sample_weight_b;
                                 if (total > 0.0f) {
                                     Vec3 correction = mul(normal, self_projection_relaxation(solver) * (thickness - d) / total);
-                                    atomic_add(&solver.pos[tri_a.x], mul(correction, solver.inv_mass[tri_a.x] * aa));
-                                    atomic_add(&solver.pos[tri_a.y], mul(correction, solver.inv_mass[tri_a.y] * ab));
-                                    atomic_add(&solver.pos[tri_a.z], mul(correction, solver.inv_mass[tri_a.z] * ac));
-                                    atomic_add(&solver.pos[tri_b.x], mul(correction, -solver.inv_mass[tri_b.x] * ba));
-                                    atomic_add(&solver.pos[tri_b.y], mul(correction, -solver.inv_mass[tri_b.y] * bb));
-                                    atomic_add(&solver.pos[tri_b.z], mul(correction, -solver.inv_mass[tri_b.z] * bc));
+                                    Vec3 correction_ax = mul(correction, solver.inv_mass[tri_a.x] * aa);
+                                    Vec3 correction_ay = mul(correction, solver.inv_mass[tri_a.y] * ab);
+                                    Vec3 correction_az = mul(correction, solver.inv_mass[tri_a.z] * ac);
+                                    Vec3 correction_bx = mul(correction, -solver.inv_mass[tri_b.x] * ba);
+                                    Vec3 correction_by = mul(correction, -solver.inv_mass[tri_b.y] * bb);
+                                    Vec3 correction_bz = mul(correction, -solver.inv_mass[tri_b.z] * bc);
+                                    atomic_add(&solver.pos[tri_a.x], correction_ax);
+                                    atomic_add(&solver.pos[tri_a.y], correction_ay);
+                                    atomic_add(&solver.pos[tri_a.z], correction_az);
+                                    atomic_add(&solver.pos[tri_b.x], correction_bx);
+                                    atomic_add(&solver.pos[tri_b.y], correction_by);
+                                    atomic_add(&solver.pos[tri_b.z], correction_bz);
+                                    note_self_recovery_delta(solver, tri_a.x, correction_ax);
+                                    note_self_recovery_delta(solver, tri_a.y, correction_ay);
+                                    note_self_recovery_delta(solver, tri_a.z, correction_az);
+                                    note_self_recovery_delta(solver, tri_b.x, correction_bx);
+                                    note_self_recovery_delta(solver, tri_b.y, correction_by);
+                                    note_self_recovery_delta(solver, tri_b.z, correction_bz);
                                     diag_note_resolved(solver);
                                 }
                             }
@@ -2207,6 +2246,20 @@ __global__ void sanitize_positions_kernel(Solver solver) {
     if (step_len > kMaxSubstepMove) {
         solver.pos[i] = add(prev, mul(step_delta, kMaxSubstepMove / step_len));
     }
+}
+
+__global__ void damp_self_recovery_velocity_kernel(Solver solver) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= solver.cfg.vertex_count || !solver.self_recovery_touched || solver.self_recovery_touched[i] == 0) {
+        return;
+    }
+    if (solver.inv_mass[i] <= 0.0f) {
+        return;
+    }
+    Vec3 recovery_delta = solver.self_recovery_delta
+        ? solver.self_recovery_delta[i]
+        : sub(solver.pos[i], solver.prev[i]);
+    solver.prev[i] = add(solver.prev[i], mul(recovery_delta, kSelfRecoveryVelocityDamping));
 }
 
 int block_count(int count) {
@@ -2543,6 +2596,9 @@ bool run_self_collision_pass(
             }
             clear_self_surface_sample_hash_if_dirty_kernel<<<block_count(solver->self_sample_hash_table_size), 256>>>(collision_solver);
             build_self_surface_sample_hash_if_dirty_kernel<<<block_count(collision_solver.self_sample_count), 256>>>(collision_solver);
+            if (solver->self_sample_hash_dirty) {
+                cudaMemset(solver->self_sample_hash_dirty, 0, sizeof(int));
+            }
             if (!end_timed_segment(timings, &hash_segment, "end self surface-pair hash timing")) {
                 return false;
             }
@@ -2598,8 +2654,14 @@ bool probe_self_collision(
     if (solver->self_sample_heads
         && solver->self_sample_next
         && probe_solver.self_sample_count > 0) {
-        cudaMemset(solver->self_sample_heads, 0xff, sizeof(int) * solver->self_sample_hash_table_size);
-        build_self_surface_sample_hash_kernel<<<block_count(probe_solver.self_sample_count), 256>>>(probe_solver);
+        if (solver->self_sample_hash_dirty) {
+            clear_self_surface_sample_hash_if_dirty_kernel<<<block_count(solver->self_sample_hash_table_size), 256>>>(probe_solver);
+            build_self_surface_sample_hash_if_dirty_kernel<<<block_count(probe_solver.self_sample_count), 256>>>(probe_solver);
+            cudaMemset(solver->self_sample_hash_dirty, 0, sizeof(int));
+        } else {
+            cudaMemset(solver->self_sample_heads, 0xff, sizeof(int) * solver->self_sample_hash_table_size);
+            build_self_surface_sample_hash_kernel<<<block_count(probe_solver.self_sample_count), 256>>>(probe_solver);
+        }
         probe_self_vertex_surface_collision_kernel<<<v_blocks, 256>>>(probe_solver);
     }
     if (!end_timed_segment(timings, &probe_segment, "end self probe timing")) {
@@ -2808,6 +2870,20 @@ bool run_substep(
             }
             float cloth_thickness = std::max(solver->cfg.cloth_thickness, 1.0e-4f);
             int extra_recovery_passes = 0;
+            if (solver->self_recovery_touched) {
+                if (!set_cuda_error(
+                        cudaMemset(solver->self_recovery_touched, 0, sizeof(int) * solver->cfg.vertex_count),
+                        "clear self recovery touched flags")) {
+                    return false;
+                }
+            }
+            if (solver->self_recovery_delta) {
+                if (!set_cuda_error(
+                        cudaMemset(solver->self_recovery_delta, 0, sizeof(Vec3) * solver->cfg.vertex_count),
+                        "clear self recovery delta")) {
+                    return false;
+                }
+            }
             while (extra_recovery_passes < kSelfRecoveryPassLimit
                 && self_probe_triggers_recovery(probe_diag, cloth_thickness)) {
                 if (!run_self_collision_pass(solver, v_blocks, true, true, timings)) {
@@ -2818,6 +2894,15 @@ bool run_substep(
                     ++(*recovery_passes_total);
                 }
                 if (!probe_self_collision(solver, v_blocks, &probe_diag, timings)) {
+                    return false;
+                }
+            }
+            if (extra_recovery_passes > 0 && solver->self_recovery_touched) {
+                if (!begin_timed_segment(timings, kTimingSelfRecovery, &segment, "start recovery velocity damping timing")) {
+                    return false;
+                }
+                damp_self_recovery_velocity_kernel<<<v_blocks, 256>>>(*solver);
+                if (!end_timed_segment(timings, &segment, "end recovery velocity damping timing")) {
                     return false;
                 }
             }
@@ -2930,6 +3015,8 @@ void free_solver(Solver* solver) {
     cudaFree(solver->self_sample_heads);
     cudaFree(solver->self_sample_next);
     cudaFree(solver->self_sample_hash_dirty);
+    cudaFree(solver->self_recovery_touched);
+    cudaFree(solver->self_recovery_delta);
     cudaFree(solver->pin_indices);
     cudaFree(solver->pin_targets);
     cudaFreeHost(solver->pinned_download);
@@ -3173,6 +3260,18 @@ extern "C" SSBL_API void* ssbl_create_solver(const SsblXpbdConfig* config, const
         ok = ok && set_cuda_error(err, "self vertex hash allocation");
         err = cudaMalloc(reinterpret_cast<void**>(&solver->self_vert_next), sizeof(int) * config->vertex_count);
         ok = ok && set_cuda_error(err, "self vertex link allocation");
+        err = cudaMalloc(reinterpret_cast<void**>(&solver->self_recovery_touched), sizeof(int) * config->vertex_count);
+        ok = ok && set_cuda_error(err, "self recovery touched allocation");
+        ok = ok && set_cuda_error(
+            cudaMemset(solver->self_recovery_touched, 0, sizeof(int) * config->vertex_count),
+            "self recovery touched reset"
+        );
+        err = cudaMalloc(reinterpret_cast<void**>(&solver->self_recovery_delta), sizeof(Vec3) * config->vertex_count);
+        ok = ok && set_cuda_error(err, "self recovery delta allocation");
+        ok = ok && set_cuda_error(
+            cudaMemset(solver->self_recovery_delta, 0, sizeof(Vec3) * config->vertex_count),
+            "self recovery delta reset"
+        );
         if (ok && config->triangle_count > 0) {
             solver->self_sample_count = config->triangle_count * solver->self_samples_per_triangle;
             solver->self_sample_hash_table_size = next_power_of_two(std::max(1024, solver->self_sample_count * 2));
@@ -3210,6 +3309,18 @@ extern "C" SSBL_API int ssbl_reset_solver(void* handle) {
         return 0;
     }
     if (!set_cuda_error(cudaMemset(solver->vel, 0, sizeof(Vec3) * n), "reset velocities")) {
+        return 0;
+    }
+    if (solver->self_recovery_touched
+        && !set_cuda_error(
+            cudaMemset(solver->self_recovery_touched, 0, sizeof(int) * n),
+            "reset self recovery touched flags")) {
+        return 0;
+    }
+    if (solver->self_recovery_delta
+        && !set_cuda_error(
+            cudaMemset(solver->self_recovery_delta, 0, sizeof(Vec3) * n),
+            "reset self recovery delta")) {
         return 0;
     }
     return 1;

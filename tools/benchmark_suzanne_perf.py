@@ -25,6 +25,18 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
+def _p95(values: list[float]) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(float(value) for value in values)
+    index = min(len(ordered) - 1, int((len(ordered) - 1) * 0.95 + 0.999999))
+    return ordered[index]
+
+
+def _rounded_or_none(value: float | None) -> float | None:
+    return round(float(value), 2) if value is not None else None
+
+
 def _target_object() -> bpy.types.Object:
     obj = bpy.data.objects.get(os.environ.get("SSBL_SUZANNE_OBJECT", "Suzanne"))
     if obj is not None and obj.type == "MESH":
@@ -117,6 +129,10 @@ def _run_case(obj: bpy.types.Object, label: str, *, self_collision: bool, volume
     writeback_frame_ms_total = 0.0
     non_writeback_frame_count = 0
     non_writeback_frame_ms_total = 0.0
+    frame_ms_samples: list[float] = []
+    writeback_frame_ms_samples: list[float] = []
+    non_writeback_frame_ms_samples: list[float] = []
+    cuda_call_ms_samples: list[float] = []
     first_non_writeback_frame_ms = None
     first_writeback_frame_ms = None
     first_writeback_diag = None
@@ -129,6 +145,10 @@ def _run_case(obj: bpy.types.Object, label: str, *, self_collision: bool, volume
             writeback_frame_ms_total = 0.0
             non_writeback_frame_count = 0
             non_writeback_frame_ms_total = 0.0
+            frame_ms_samples.clear()
+            writeback_frame_ms_samples.clear()
+            non_writeback_frame_ms_samples.clear()
+            cuda_call_ms_samples.clear()
         frame_started = time.perf_counter()
         finished = ssbl.solver.step_preview(bpy.context, obj.name)
         frame_elapsed_ms = (time.perf_counter() - frame_started) * 1000.0
@@ -136,9 +156,12 @@ def _run_case(obj: bpy.types.Object, label: str, *, self_collision: bool, volume
         if index >= warmup:
             measured_steps += 1
             measured_frame_ms_total += frame_elapsed_ms
+            frame_ms_samples.append(frame_elapsed_ms)
+            cuda_call_ms_samples.append(float(current_diag.cuda_step_call_ms))
             if current_diag.writeback_performed:
                 writeback_frame_count += 1
                 writeback_frame_ms_total += frame_elapsed_ms
+                writeback_frame_ms_samples.append(frame_elapsed_ms)
                 if first_writeback_frame_ms is None:
                     first_writeback_frame_ms = frame_elapsed_ms
                 if first_writeback_diag is None:
@@ -146,6 +169,7 @@ def _run_case(obj: bpy.types.Object, label: str, *, self_collision: bool, volume
             else:
                 non_writeback_frame_count += 1
                 non_writeback_frame_ms_total += frame_elapsed_ms
+                non_writeback_frame_ms_samples.append(frame_elapsed_ms)
                 if first_non_writeback_frame_ms is None:
                     first_non_writeback_frame_ms = frame_elapsed_ms
         if finished:
@@ -160,14 +184,20 @@ def _run_case(obj: bpy.types.Object, label: str, *, self_collision: bool, volume
         "measured_steps": measured_steps,
         "fps": round(max(measured_steps, 1) / elapsed, 2),
         "avg_frame_ms": round(measured_frame_ms_total / max(measured_steps, 1), 2),
+        "p95_frame_ms": _rounded_or_none(_p95(frame_ms_samples)),
         "writeback_frame_count": writeback_frame_count,
+        "synchronized_writeback_frame_count": writeback_frame_count,
         "avg_writeback_frame_ms": (
             round(writeback_frame_ms_total / writeback_frame_count, 2) if writeback_frame_count > 0 else None
         ),
+        "p95_writeback_frame_ms": _rounded_or_none(_p95(writeback_frame_ms_samples)),
         "non_writeback_frame_count": non_writeback_frame_count,
+        "queued_frame_count": non_writeback_frame_count,
         "avg_non_writeback_frame_ms": (
             round(non_writeback_frame_ms_total / non_writeback_frame_count, 2) if non_writeback_frame_count > 0 else None
         ),
+        "p95_non_writeback_frame_ms": _rounded_or_none(_p95(non_writeback_frame_ms_samples)),
+        "avg_cuda_call_ms": round(sum(cuda_call_ms_samples) / max(len(cuda_call_ms_samples), 1), 2),
         "finite": bool(diag.finite),
         "restore_delta": _max_source_delta(obj, before),
         "step_ms": round(float(diag.step_ms), 2),
@@ -184,8 +214,12 @@ def _run_case(obj: bpy.types.Object, label: str, *, self_collision: bool, volume
         "frame_ms": round(float(diag.frame_ms), 2),
         "input_ms": round(float(diag.input_refresh_ms), 2),
         "frame_input_upload_ms": round(float(diag.frame_input_upload_ms), 2),
+        "cuda_call_ms": round(float(diag.cuda_step_call_ms), 2),
         "download_ms": round(float(diag.download_ms), 2),
         "writeback_ms": round(float(diag.writeback_ms), 2),
+        "to_local_ms": round(float(diag.writeback_to_local_ms), 2),
+        "foreach_set_ms": round(float(diag.writeback_foreach_set_ms), 2),
+        "mesh_update_ms": round(float(diag.writeback_mesh_update_ms), 2),
         "writeback_frame": bool(diag.writeback_performed),
         "sampled_non_writeback_frame_ms": (
             round(float(first_non_writeback_frame_ms), 2) if first_non_writeback_frame_ms is not None else None
