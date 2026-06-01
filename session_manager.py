@@ -32,12 +32,13 @@ _CACHE_MODIFIER_NAME = "SSBL XPBD Cache"
 _UNSUPPORTED_INPUT_TYPES = {"solid", "rod", "stitch", "tet"}
 _OBJECT_COLLISION_LAYER_PROP = "ssbl_collision_layer"
 _OBJECT_CROSS_COLLISION_PROP = "ssbl_enable_cross_cloth_collision"
-STATUS_IDLE = "空闲"
-STATUS_PREVIEW_RUNNING = "预览运行中"
-STATUS_PREVIEW_STOPPED = "预览已停止"
-STATUS_BAKING = "烘焙中"
-STATUS_FINISHED = "已完成"
-STATUS_ERROR = "错误"
+_IDENTITY_4X4 = np.eye(4, dtype=np.float32)
+STATUS_IDLE = "Idle"
+STATUS_PREVIEW_RUNNING = "Preview Running"
+STATUS_PREVIEW_STOPPED = "Preview Stopped"
+STATUS_BAKING = "Baking"
+STATUS_FINISHED = "Finished"
+STATUS_ERROR = "Error"
 
 
 @dataclass
@@ -52,6 +53,8 @@ class FramePerf:
     cuda_step_call_ms: float = 0.0
     download_ms: float = 0.0
     writeback_ms: float = 0.0
+    frame_input_upload_ms: float = 0.0
+    writeback_performed: bool = False
     diagnostics_ms: float = 0.0
     viewport_tag_ms: float = 0.0
 
@@ -143,6 +146,16 @@ def record_viewport_tag_ms(object_name: str, elapsed_ms: float) -> None:
     session.last_diagnostics = NativeStepDiagnostics(
         step_ms=diag.step_ms,
         hash_build_ms=diag.hash_build_ms,
+        constraints_ms=diag.constraints_ms,
+        volume_ms=diag.volume_ms,
+        static_collision_ms=diag.static_collision_ms,
+        dynamic_collision_ms=diag.dynamic_collision_ms,
+        self_hash_ms=diag.self_hash_ms,
+        self_solve_ms=diag.self_solve_ms,
+        self_probe_ms=diag.self_probe_ms,
+        self_recovery_ms=diag.self_recovery_ms,
+        sync_ms=diag.sync_ms,
+        diagnostics_fetch_ms=diag.diagnostics_fetch_ms,
         candidate_count=diag.candidate_count,
         resolved_contacts=diag.resolved_contacts,
         min_gap=diag.min_gap,
@@ -160,6 +173,8 @@ def record_viewport_tag_ms(object_name: str, elapsed_ms: float) -> None:
         cuda_step_call_ms=diag.cuda_step_call_ms,
         download_ms=diag.download_ms,
         writeback_ms=diag.writeback_ms,
+        frame_input_upload_ms=diag.frame_input_upload_ms,
+        writeback_performed=diag.writeback_performed,
         diagnostics_ms=diag.diagnostics_ms,
         viewport_tag_ms=float(elapsed_ms),
     )
@@ -178,18 +193,18 @@ def preview_warnings(obj: bpy.types.Object, settings) -> list[str]:
     closed_mesh = _mesh_is_probably_closed(obj.data)
     self_mode = str(getattr(settings, "self_collision_mode", "off")).lower()
     if closed_mesh and self_mode != "off" and not bool(getattr(settings, "use_volume_pressure", False)):
-        warnings.append("闭合网格若开启自碰撞但不启用“软体积 / 压力”，会像中空布壳一样塌陷。")
+        warnings.append("Closed meshes with self collision usually also need volume preservation enabled.")
     if len(obj.data.polygons) > 10000:
-        warnings.append("高面数布料在构建约束时可能需要数秒；预览时建议尽量使用低模代理。")
+        warnings.append("Large meshes may need optimized preview settings for stable realtime playback.")
     if bool(getattr(settings, "use_ground", False)):
         bbox_min_z = min((obj.matrix_world @ Vector(corner)).z for corner in obj.bound_box)
         ground_limit = float(getattr(settings, "ground_height", 0.0)) + float(getattr(settings, "collision_margin", 0.0))
         if bbox_min_z < ground_limit - 1.0e-4:
-            warnings.append("对象初始位置低于“地面 Z + 边距”；请降低地面 Z 或关闭地面碰撞，以避免起始即被碰撞压缩。")
+            warnings.append("The mesh starts below the ground collision plane; expect an upward correction on the first frame.")
     if bool(getattr(settings, "multi_cloth_preview", False)):
         selected_meshes = [item for item in bpy.context.selected_objects if item and item.type == "MESH"]
         if len(selected_meshes) > 1:
-            warnings.append("多布料预览会同时替换所有选中布料的临时网格；停止或重置会统一恢复。")
+            warnings.append("Multi-cloth preview scales with the number and density of selected cloth meshes.")
     return warnings
 
 
@@ -217,7 +232,7 @@ def cleanup_all_sessions() -> None:
 def start_preview(context: bpy.types.Context, obj: bpy.types.Object) -> SceneSession:
     try:
         if context.mode != "OBJECT":
-            raise ValueError("开始预览前请先切换到对象模式")
+            raise ValueError("Preview must be started in Object mode.")
         settings = context.scene.ssbl_preview
         cloth_objects = _preview_cloth_objects(context, obj, settings)
         for cloth_obj in cloth_objects:
@@ -294,6 +309,7 @@ def step_preview(context: bpy.types.Context, object_name: str) -> bool:
         or next_frame >= int(scene.frame_end)
         or (len(session.slots) > 1 and str(session.cross_cloth_mode or "off").lower() != "off")
     )
+    perf.writeback_performed = bool(should_writeback)
     try:
         started = time.perf_counter()
         scene.frame_set(next_frame)
@@ -305,7 +321,7 @@ def step_preview(context: bpy.types.Context, object_name: str) -> bool:
             for slot in session.slots.values():
                 obj = bpy.data.objects.get(slot.object_name)
                 if obj is None or obj.type != "MESH":
-                    raise ValueError(f"预览对象已丢失：{slot.object_name}")
+                    raise ValueError(f"Missing preview object during writeback: {slot.object_name}")
                 _apply_world_positions(obj, slot.current_positions_world, slot.cloth.matrix_world_inv)
             perf.writeback_ms += _elapsed_ms(started)
     except Exception:
@@ -328,7 +344,7 @@ def bake_xpbd_cache(context: bpy.types.Context, obj: bpy.types.Object) -> str:
     start = int(settings.bake_start)
     end = int(settings.bake_end)
     if end < start:
-        raise ValueError("烘焙结束帧必须大于或等于烘焙开始帧")
+        raise ValueError("Bake end frame must be greater than or equal to bake start frame.")
 
     native = None
     _STATUS[obj.name] = STATUS_BAKING
@@ -450,23 +466,24 @@ def _pin_targets_from_object(
         mesh = eval_obj.to_mesh()
         try:
             if expected_vertex_count is not None and len(mesh.vertices) != expected_vertex_count:
-                raise ValueError("动画布料输入的顶点数发生了变化；求值后的布料输入必须保持固定拓扑。")
+                raise ValueError("Evaluated mesh vertex count changed during preview input refresh.")
             return _pin_targets_from_mesh(mesh, eval_obj.matrix_world.copy(), pin_indices), eval_obj.matrix_world.copy()
         finally:
             eval_obj.to_mesh_clear()
 
     mesh = obj.data
     if expected_vertex_count is not None and len(mesh.vertices) != expected_vertex_count:
-        raise ValueError("动画布料输入的顶点数发生了变化；必须保持固定的布料拓扑。")
+        raise ValueError("Mesh vertex count changed during preview input refresh.")
     return _pin_targets_from_mesh(mesh, obj.matrix_world.copy(), pin_indices), obj.matrix_world.copy()
 
 
 def _pin_targets_from_mesh(mesh: bpy.types.Mesh, matrix_world, pin_indices: np.ndarray) -> np.ndarray:
     if len(pin_indices) == 0:
         return np.empty((0, 3), dtype=np.float32)
-    coords = np.empty((len(pin_indices), 3), dtype=np.float32)
-    for out_index, vertex_index in enumerate(pin_indices):
-        coords[out_index] = mesh.vertices[int(vertex_index)].co
+    indices = np.asarray(pin_indices, dtype=np.intp)
+    coords_flat = np.empty(len(mesh.vertices) * 3, dtype=np.float32)
+    mesh.vertices.foreach_get("co", coords_flat)
+    coords = coords_flat.reshape((-1, 3))[indices]
     mat = np.array(matrix_world, dtype=np.float32)
     return coords @ mat[:3, :3].T + mat[:3, 3]
 
@@ -492,7 +509,7 @@ def _sessions_for_objects(objects: list[bpy.types.Object]) -> list[SceneSession]
 
 def _preview_cloth_objects(context: bpy.types.Context, obj: bpy.types.Object, settings) -> list[bpy.types.Object]:
     if obj is None:
-        raise ValueError("请先选择一个布料网格对象")
+        raise ValueError("A mesh object is required to start preview.")
     if not bool(getattr(settings, "multi_cloth_preview", False)):
         return [obj]
     selected = []
@@ -583,17 +600,16 @@ def _create_native_solver(
 
 def _refresh_session_runtime_inputs(context: bpy.types.Context, session: SceneSession, perf: FramePerf | None = None) -> None:
     refresh_started = time.perf_counter()
-    depsgraph = context.evaluated_depsgraph_get()
     settings = context.scene.ssbl_preview
     options = settings_to_options(settings)
     runtime_signature = _runtime_options_signature(options)
-    for slot in session.slots.values():
-        obj = bpy.data.objects.get(slot.object_name)
-        if obj is None or obj.type != "MESH":
-            raise ValueError(f"预览对象已丢失：{slot.object_name}")
-        with _with_preview_source_state(slot, obj):
-            context.view_layer.update()
-            depsgraph = context.evaluated_depsgraph_get()
+    with _with_session_source_state(session):
+        context.view_layer.update()
+        depsgraph = context.evaluated_depsgraph_get()
+        for slot in session.slots.values():
+            obj = bpy.data.objects.get(slot.object_name)
+            if obj is None or obj.type != "MESH":
+                raise ValueError(f"Missing preview object during input refresh: {slot.object_name}")
             pin_targets, matrix_world = _pin_targets_from_object(
                 obj,
                 slot.cloth.pin_indices,
@@ -616,35 +632,54 @@ def _refresh_session_runtime_inputs(context: bpy.types.Context, session: SceneSe
                     depsgraph=depsgraph,
                     use_evaluated_mesh=slot.use_evaluated_mesh,
                 )
-        _apply_runtime_inputs(
-            slot,
-            options,
-            runtime_signature,
-            pin_targets,
-            matrix_world,
-            static_tris,
-            static_signature,
-            static_runtime_signature,
-            perf,
-        )
+            _apply_runtime_inputs(
+                slot,
+                options,
+                runtime_signature,
+                pin_targets,
+                matrix_world,
+                static_tris,
+                static_signature,
+                static_runtime_signature,
+                perf,
+            )
     if perf is not None:
         perf.input_refresh_ms += _elapsed_ms(refresh_started)
 
 
 def _step_session_slots(session: SceneSession, download_positions: bool, perf: FramePerf | None = None) -> None:
-    cross_cloth_needs_positions = len(session.slots) > 1 and str(session.cross_cloth_mode or "off").lower() != "off"
+    cross_cloth_enabled = len(session.slots) > 1 and str(session.cross_cloth_mode or "off").lower() != "off"
     for slot_name in session.solve_order:
         slot = session.slots[slot_name]
+        if cross_cloth_enabled:
+            started = time.perf_counter()
+            dynamic_triangles = _collect_cross_cloth_triangles(session, slot)
+            slot.native.update_frame_inputs(
+                pin_indices=None,
+                pin_positions=None,
+                update_pin=False,
+                options=None,
+                update_runtime=False,
+                static_triangles=None,
+                update_static=False,
+                dynamic_triangles=dynamic_triangles,
+                update_dynamic=True,
+            )
+            if perf is not None:
+                elapsed = _elapsed_ms(started)
+                perf.dynamic_upload_ms += elapsed
+                perf.frame_input_upload_ms += elapsed
         started = time.perf_counter()
-        dynamic_triangles = _collect_cross_cloth_triangles(session, slot)
-        slot.native.update_dynamic_triangles(dynamic_triangles)
-        if perf is not None:
-            perf.dynamic_upload_ms += _elapsed_ms(started)
-        started = time.perf_counter()
-        slot.native.step(session.substeps, session.iterations)
+        sample_diagnostics = bool(download_positions or cross_cloth_enabled)
+        slot.native.step(
+            session.substeps,
+            session.iterations,
+            diagnostics=sample_diagnostics,
+            synchronize=sample_diagnostics,
+        )
         if perf is not None:
             perf.cuda_step_call_ms += _elapsed_ms(started)
-        if download_positions or cross_cloth_needs_positions:
+        if download_positions or cross_cloth_enabled:
             started = time.perf_counter()
             slot.current_positions_world = np.array(slot.native.download_positions(), dtype=np.float32, copy=True)
             if perf is not None:
@@ -694,12 +729,20 @@ def _refresh_bake_runtime_inputs(
         use_evaluated_mesh=use_evaluated_mesh,
     )
     if static_signature != expected_static_signature:
-        raise ValueError("动画静态碰撞体的拓扑或成员发生了变化；v1 要求各帧保持固定碰撞拓扑。")
+        raise ValueError("Animated static collider topology changed during bake; fixed topology is required.")
     cloth.matrix_world_inv = np.array(matrix_world.inverted(), dtype=np.float32)
     pin_targets = np.ascontiguousarray(world_positions[cloth.pin_indices], dtype=np.float32)
-    native.update_pin_targets(cloth.pin_indices, pin_targets)
-    native.update_runtime_colliders(settings_to_options(context.scene.ssbl_preview))
-    native.update_static_triangles(static_tris)
+    native.update_frame_inputs(
+        pin_indices=cloth.pin_indices,
+        pin_positions=pin_targets,
+        update_pin=True,
+        options=settings_to_options(context.scene.ssbl_preview),
+        update_runtime=True,
+        static_triangles=static_tris,
+        update_static=True,
+        dynamic_triangles=None,
+        update_dynamic=False,
+    )
 
 
 def _apply_runtime_inputs(
@@ -714,26 +757,37 @@ def _apply_runtime_inputs(
     perf: FramePerf | None = None,
 ) -> None:
     if static_signature != slot.static_collider_signature:
-        raise ValueError("动画静态碰撞体的拓扑或成员发生了变化；v1 要求各帧保持固定碰撞拓扑。")
+        raise ValueError("Animated static collider topology changed during preview; fixed topology is required.")
     slot.cloth.matrix_world_inv = np.array(matrix_world.inverted(), dtype=np.float32)
     pin_targets = np.ascontiguousarray(pin_targets, dtype=np.float32)
-    if not _array_equal(pin_targets, slot.pin_targets_world):
+    update_pin = not _array_equal(pin_targets, slot.pin_targets_world)
+    update_runtime = runtime_signature != slot.runtime_options_signature
+    update_static = static_tris is not None
+    if update_pin or update_runtime or update_static:
         started = time.perf_counter()
-        slot.native.update_pin_targets(slot.cloth.pin_indices, pin_targets)
-        if perf is not None:
-            perf.pin_upload_ms += _elapsed_ms(started)
+        slot.native.update_frame_inputs(
+            pin_indices=slot.cloth.pin_indices,
+            pin_positions=pin_targets,
+            update_pin=update_pin,
+            options=options,
+            update_runtime=update_runtime,
+            static_triangles=static_tris,
+            update_static=update_static,
+            dynamic_triangles=None,
+            update_dynamic=False,
+        )
         slot.pin_targets_world = np.array(pin_targets, dtype=np.float32, copy=True)
-    if runtime_signature != slot.runtime_options_signature:
-        started = time.perf_counter()
-        slot.native.update_runtime_colliders(options)
         if perf is not None:
-            perf.runtime_upload_ms += _elapsed_ms(started)
+            elapsed = _elapsed_ms(started)
+            perf.frame_input_upload_ms += elapsed
+            if update_pin:
+                perf.pin_upload_ms += elapsed
+            if update_runtime:
+                perf.runtime_upload_ms += elapsed
+            if update_static:
+                perf.static_upload_ms += elapsed
         slot.runtime_options_signature = runtime_signature
-    if static_tris is not None:
-        started = time.perf_counter()
-        slot.native.update_static_triangles(static_tris)
-        if perf is not None:
-            perf.static_upload_ms += _elapsed_ms(started)
+    if update_static:
         slot.static_triangles = np.array(static_tris, dtype=np.float32, copy=True)
         slot.static_runtime_signature = static_runtime_signature
 
@@ -752,15 +806,15 @@ def _effective_use_evaluated_mesh(obj: bpy.types.Object, settings) -> bool:
 
 def _ensure_supported_cloth_object(obj: bpy.types.Object) -> None:
     if obj is None:
-        raise ValueError("请先选择一个布料网格对象")
+        raise ValueError("A mesh object is required.")
     declared_type = _declared_input_type(obj)
     if declared_type in _UNSUPPORTED_INPUT_TYPES:
-        raise ValueError(
-            f"SSBL v2 目前只支持 cloth MESH；不支持 {declared_type} 输入"
-            "（solid/rod/stitch/tet 暂不在当前范围内）。"
-        )
+        raise ValueError(f"SSBL v2 only supports cloth MESH input, not {declared_type}.")
+
+
+
     if obj.type != "MESH":
-        raise ValueError("SSBL v2 目前只支持布料 MESH 对象")
+        raise ValueError("SSBL v2 currently only supports cloth MESH objects.")
 
 
 def _declared_input_type(obj: bpy.types.Object) -> str:
@@ -866,13 +920,37 @@ def _with_preview_source_state(slot: ClothSlot, obj: bpy.types.Object):
         _disable_suspended_modifiers(obj, slot.suspended_modifiers)
 
 
+@contextmanager
+def _with_session_source_state(session: SceneSession):
+    owned: list[tuple[ClothSlot, bpy.types.Object]] = []
+    try:
+        for slot in session.slots.values():
+            obj = bpy.data.objects.get(slot.object_name)
+            if obj is None or obj.type != "MESH":
+                raise ValueError(f"Missing preview object: {slot.object_name}")
+            if slot.use_evaluated_mesh:
+                _restore_preview_modifiers(obj, slot.suspended_modifiers)
+            obj.data = slot.original_mesh
+            owned.append((slot, obj))
+        yield
+    finally:
+        for slot, obj in owned:
+            obj.data = slot.preview_mesh
+            _disable_suspended_modifiers(obj, slot.suspended_modifiers)
+
+
 def _apply_world_positions(
     obj: bpy.types.Object,
     world_positions: np.ndarray,
     matrix_world_inv: np.ndarray,
 ) -> None:
-    local = to_local(np.asarray(world_positions, dtype=np.float32), matrix_world_inv)
-    flat = np.asarray(local, dtype=np.float32).reshape(-1)
+    world = np.asarray(world_positions, dtype=np.float32)
+    matrix_inv = np.asarray(matrix_world_inv, dtype=np.float32)
+    if matrix_inv.shape == (4, 4) and np.allclose(matrix_inv, _IDENTITY_4X4, rtol=0.0, atol=1.0e-7):
+        local = world
+    else:
+        local = to_local(world, matrix_inv)
+    flat = np.ascontiguousarray(local, dtype=np.float32).reshape(-1)
     obj.data.vertices.foreach_set("co", flat)
     obj.data.update()
 
@@ -895,6 +973,17 @@ def _update_session_fps(session: SceneSession, _step_started: float) -> None:
 def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None = None) -> NativeStepDiagnostics:
     step_ms = 0.0
     hash_build_ms = 0.0
+    constraints_ms = 0.0
+    volume_ms = 0.0
+    static_collision_ms = 0.0
+    dynamic_collision_ms = 0.0
+    self_hash_ms = 0.0
+    self_solve_ms = 0.0
+    self_probe_ms = 0.0
+    self_recovery_ms = 0.0
+    sync_ms = 0.0
+    diagnostics_fetch_ms = 0.0
+    frame_input_upload_ms = 0.0
     candidate_count = 0
     resolved_contacts = 0
     min_gap: float | None = None
@@ -902,17 +991,30 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
     recovery_passes = 0
     local_retry_count = 0
     finite = True
+    writeback_performed = False
     diag_started = time.perf_counter()
     for slot in session.slots.values():
         diag = slot.native.cached_diagnostics()
         step_ms += float(diag.step_ms)
         hash_build_ms += float(diag.hash_build_ms)
+        constraints_ms += float(diag.constraints_ms)
+        volume_ms += float(diag.volume_ms)
+        static_collision_ms += float(diag.static_collision_ms)
+        dynamic_collision_ms += float(diag.dynamic_collision_ms)
+        self_hash_ms += float(diag.self_hash_ms)
+        self_solve_ms += float(diag.self_solve_ms)
+        self_probe_ms += float(diag.self_probe_ms)
+        self_recovery_ms += float(diag.self_recovery_ms)
+        sync_ms += float(diag.sync_ms)
+        diagnostics_fetch_ms += float(diag.diagnostics_fetch_ms)
+        frame_input_upload_ms += float(diag.frame_input_upload_ms)
         candidate_count += int(diag.candidate_count)
         resolved_contacts += int(diag.resolved_contacts)
         ccd_clamp_count += int(diag.ccd_clamp_count)
         recovery_passes += int(diag.recovery_passes)
         local_retry_count += int(diag.local_retry_count)
         finite = finite and bool(diag.finite)
+        writeback_performed = writeback_performed or bool(diag.writeback_performed)
         if diag.min_gap is not None:
             min_gap = float(diag.min_gap) if min_gap is None else min(min_gap, float(diag.min_gap))
     if perf is not None:
@@ -920,6 +1022,17 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
     return NativeStepDiagnostics(
         step_ms=step_ms,
         hash_build_ms=hash_build_ms,
+        constraints_ms=constraints_ms,
+        volume_ms=volume_ms,
+        static_collision_ms=static_collision_ms,
+        dynamic_collision_ms=dynamic_collision_ms,
+        self_hash_ms=self_hash_ms,
+        self_solve_ms=self_solve_ms,
+        self_probe_ms=self_probe_ms,
+        self_recovery_ms=self_recovery_ms,
+        sync_ms=sync_ms,
+        diagnostics_fetch_ms=diagnostics_fetch_ms,
+        frame_input_upload_ms=perf.frame_input_upload_ms if perf is not None else frame_input_upload_ms,
         candidate_count=candidate_count,
         resolved_contacts=resolved_contacts,
         min_gap=min_gap,
@@ -937,6 +1050,7 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
         cuda_step_call_ms=perf.cuda_step_call_ms if perf is not None else 0.0,
         download_ms=perf.download_ms if perf is not None else 0.0,
         writeback_ms=perf.writeback_ms if perf is not None else 0.0,
+        writeback_performed=perf.writeback_performed if perf is not None else writeback_performed,
         diagnostics_ms=perf.diagnostics_ms if perf is not None else 0.0,
         viewport_tag_ms=perf.viewport_tag_ms if perf is not None else 0.0,
     )

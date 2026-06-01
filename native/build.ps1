@@ -150,7 +150,7 @@ try {
     Remove-Item -LiteralPath $tempCmd -Force -ErrorAction SilentlyContinue
 }
 
-$dllPath = Join-Path $Root "bin\ssbl_xpbd_cuda_abi22.dll"
+$dllPath = Join-Path $Root "bin\ssbl_xpbd_cuda_abi24.dll"
 if (-not (Test-Path -LiteralPath $dllPath)) {
     throw "Build completed but DLL was not found at $dllPath."
 }

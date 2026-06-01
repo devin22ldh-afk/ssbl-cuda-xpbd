@@ -29,10 +29,10 @@ from .xpbd_core import DEFAULT_HARDNESS, sync_hardness_settings
 def _apply_self_collision_mode(settings, _context):
     mode = settings.self_collision_mode
     if mode == "fast":
-        settings.self_collision_interval = 2
+        settings.self_collision_interval = 4
         settings.max_self_collision_neighbors = 32
-        settings.self_probe_interval = 2
-        settings.self_surface_pair_interval = 2
+        settings.self_probe_interval = 16
+        settings.self_surface_pair_interval = 4
 
 
 def _apply_solver_preset(settings, _context):
@@ -40,8 +40,11 @@ def _apply_solver_preset(settings, _context):
     if preset == "fast":
         settings.substeps = 8
         settings.iterations = 1
-        settings.preview_writeback_interval = 2
+        settings.preview_writeback_interval = 4
         settings.volume_solve_interval = 2
+        settings.self_collision_interval = 4
+        settings.self_probe_interval = 16
+        settings.self_surface_pair_interval = 4
     elif preset == "stable":
         settings.substeps = 16
         settings.iterations = 2

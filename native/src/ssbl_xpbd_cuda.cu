@@ -75,6 +75,12 @@ struct Solver {
     float* inv_mass = nullptr;
     Vec3* volume_gradient = nullptr;
     float* volume_accum = nullptr;
+    int* volume_vertex_offsets = nullptr;
+    int* volume_vertex_triangles = nullptr;
+    int volume_vertex_triangle_count = 0;
+    float* volume_partial_values = nullptr;
+    float* volume_partial_denominators = nullptr;
+    int volume_partial_capacity = 0;
     Int2* edges = nullptr;
     float* edge_rest = nullptr;
     int* edge_color_offsets_host = nullptr;
@@ -110,6 +116,7 @@ struct Solver {
     int self_vert_hash_table_size = 0;
     int* self_sample_heads = nullptr;
     int* self_sample_next = nullptr;
+    int* self_sample_hash_dirty = nullptr;
     int self_sample_hash_table_size = 0;
     int self_sample_count = 0;
     int self_samples_per_triangle = kSelfSurfaceSamplesPerTriangleDefault;
@@ -149,6 +156,127 @@ bool set_cuda_error(cudaError_t err, const char* prefix) {
 float elapsed_ms_since(const std::chrono::high_resolution_clock::time_point& start) {
     const auto now = std::chrono::high_resolution_clock::now();
     return static_cast<float>(std::chrono::duration<double, std::milli>(now - start).count());
+}
+
+enum TimingSlot {
+    kTimingConstraints = 0,
+    kTimingVolume,
+    kTimingStaticCollision,
+    kTimingDynamicCollision,
+    kTimingSelfHash,
+    kTimingSelfSolve,
+    kTimingSelfProbe,
+    kTimingSelfRecovery,
+    kTimingCount
+};
+
+struct TimedSegment {
+    int slot = 0;
+    cudaEvent_t start = nullptr;
+    cudaEvent_t stop = nullptr;
+};
+
+float* timing_field(SsblXpbdDiagnostics* diag, int slot) {
+    if (!diag) {
+        return nullptr;
+    }
+    switch (slot) {
+        case kTimingConstraints:
+            return &diag->constraints_ms;
+        case kTimingVolume:
+            return &diag->volume_ms;
+        case kTimingStaticCollision:
+            return &diag->static_collision_ms;
+        case kTimingDynamicCollision:
+            return &diag->dynamic_collision_ms;
+        case kTimingSelfHash:
+            return &diag->self_hash_ms;
+        case kTimingSelfSolve:
+            return &diag->self_solve_ms;
+        case kTimingSelfProbe:
+            return &diag->self_probe_ms;
+        case kTimingSelfRecovery:
+            return &diag->self_recovery_ms;
+        default:
+            return nullptr;
+    }
+}
+
+bool begin_timed_segment(std::vector<TimedSegment>* timings, int slot, TimedSegment* segment, const char* label) {
+    if (!timings || !segment) {
+        return true;
+    }
+    *segment = {};
+    segment->slot = slot;
+    cudaError_t err = cudaEventCreate(&segment->start);
+    if (!set_cuda_error(err, label)) {
+        return false;
+    }
+    err = cudaEventCreate(&segment->stop);
+    if (!set_cuda_error(err, label)) {
+        cudaEventDestroy(segment->start);
+        segment->start = nullptr;
+        return false;
+    }
+    err = cudaEventRecord(segment->start, 0);
+    if (!set_cuda_error(err, label)) {
+        cudaEventDestroy(segment->start);
+        cudaEventDestroy(segment->stop);
+        *segment = {};
+        return false;
+    }
+    return true;
+}
+
+bool end_timed_segment(std::vector<TimedSegment>* timings, TimedSegment* segment, const char* label) {
+    if (!timings || !segment || !segment->start || !segment->stop) {
+        return true;
+    }
+    cudaError_t err = cudaEventRecord(segment->stop, 0);
+    if (!set_cuda_error(err, label)) {
+        cudaEventDestroy(segment->start);
+        cudaEventDestroy(segment->stop);
+        *segment = {};
+        return false;
+    }
+    timings->push_back(*segment);
+    *segment = {};
+    return true;
+}
+
+void destroy_timing_records(std::vector<TimedSegment>* timings) {
+    if (!timings) {
+        return;
+    }
+    for (TimedSegment& segment : *timings) {
+        if (segment.start) {
+            cudaEventDestroy(segment.start);
+        }
+        if (segment.stop) {
+            cudaEventDestroy(segment.stop);
+        }
+    }
+    timings->clear();
+}
+
+bool collect_timing_records(Solver* solver, std::vector<TimedSegment>* timings) {
+    if (!solver || !timings) {
+        return true;
+    }
+    for (TimedSegment& segment : *timings) {
+        float elapsed = 0.0f;
+        cudaError_t err = cudaEventElapsedTime(&elapsed, segment.start, segment.stop);
+        if (!set_cuda_error(err, "collect native timing")) {
+            destroy_timing_records(timings);
+            return false;
+        }
+        float* field = timing_field(&solver->diag, segment.slot);
+        if (field) {
+            *field += elapsed;
+        }
+    }
+    destroy_timing_records(timings);
+    return true;
 }
 
 template <typename T>
@@ -216,6 +344,55 @@ bool build_vertex_neighbors(Solver* solver, const SsblXpbdConfig* config, const 
     solver->vertex_neighbor_count = static_cast<int>(neighbors.size());
     bool ok = alloc_and_copy(&solver->vertex_neighbor_offsets, offsets.data(), vertex_count + 1, "missing vertex neighbor offsets");
     ok = ok && alloc_and_copy(&solver->vertex_neighbors, neighbors.data(), solver->vertex_neighbor_count, "missing vertex neighbor data");
+    return ok;
+}
+
+bool build_volume_vertex_triangles(Solver* solver, const SsblXpbdConfig* config, const SsblXpbdMesh* mesh) {
+    if (!solver || !config || !mesh || config->vertex_count <= 0 || config->triangle_count <= 0 || !mesh->triangles) {
+        return true;
+    }
+    const int vertex_count = config->vertex_count;
+    const int triangle_count = config->triangle_count;
+    const Int3* triangles = reinterpret_cast<const Int3*>(mesh->triangles);
+    std::vector<int> counts(vertex_count, 0);
+    for (int t = 0; t < triangle_count; ++t) {
+        const Int3 tri = triangles[t];
+        if (tri.x >= 0 && tri.x < vertex_count) {
+            ++counts[tri.x];
+        }
+        if (tri.y >= 0 && tri.y < vertex_count) {
+            ++counts[tri.y];
+        }
+        if (tri.z >= 0 && tri.z < vertex_count) {
+            ++counts[tri.z];
+        }
+    }
+    std::vector<int> offsets(vertex_count + 1, 0);
+    for (int i = 0; i < vertex_count; ++i) {
+        offsets[i + 1] = offsets[i] + counts[i];
+    }
+    std::vector<int> cursor(offsets.begin(), offsets.end());
+    std::vector<int> incident(offsets.back(), -1);
+    for (int t = 0; t < triangle_count; ++t) {
+        const Int3 tri = triangles[t];
+        if (tri.x >= 0 && tri.x < vertex_count) {
+            incident[cursor[tri.x]++] = t;
+        }
+        if (tri.y >= 0 && tri.y < vertex_count) {
+            incident[cursor[tri.y]++] = t;
+        }
+        if (tri.z >= 0 && tri.z < vertex_count) {
+            incident[cursor[tri.z]++] = t;
+        }
+    }
+    solver->volume_vertex_triangle_count = static_cast<int>(incident.size());
+    bool ok = alloc_and_copy(&solver->volume_vertex_offsets, offsets.data(), vertex_count + 1, "missing volume vertex offsets");
+    ok = ok && alloc_and_copy(
+        &solver->volume_vertex_triangles,
+        incident.data(),
+        solver->volume_vertex_triangle_count,
+        "missing volume incident triangles"
+    );
     return ok;
 }
 
@@ -755,6 +932,115 @@ __global__ void volume_denominator_kernel(Solver solver) {
         return;
     }
     atomicAdd(&solver.volume_accum[1], solver.inv_mass[i] * dot(grad, grad));
+}
+
+__global__ void volume_value_partial_kernel(Solver solver, float* partials) {
+    extern __shared__ float shared[];
+    int global = blockIdx.x * blockDim.x + threadIdx.x;
+    float value = 0.0f;
+    if (global < solver.cfg.triangle_count) {
+        Int3 tri = solver.triangles[global];
+        Vec3 a = solver.pos[tri.x];
+        Vec3 b = solver.pos[tri.y];
+        Vec3 c = solver.pos[tri.z];
+        value = dot(a, cross(b, c)) / 6.0f;
+    }
+    shared[threadIdx.x] = value;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            shared[threadIdx.x] += shared[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        partials[blockIdx.x] = shared[0];
+    }
+}
+
+__global__ void volume_gradient_incident_kernel(Solver solver) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= solver.cfg.vertex_count) {
+        return;
+    }
+    Vec3 grad{0.0f, 0.0f, 0.0f};
+    int start = solver.volume_vertex_offsets[i];
+    int end = solver.volume_vertex_offsets[i + 1];
+    for (int cursor = start; cursor < end; ++cursor) {
+        int t = solver.volume_vertex_triangles[cursor];
+        if (t < 0 || t >= solver.cfg.triangle_count) {
+            continue;
+        }
+        Int3 tri = solver.triangles[t];
+        Vec3 a = solver.pos[tri.x];
+        Vec3 b = solver.pos[tri.y];
+        Vec3 c = solver.pos[tri.z];
+        if (tri.x == i) {
+            grad = add(grad, mul(cross(b, c), 1.0f / 6.0f));
+        } else if (tri.y == i) {
+            grad = add(grad, mul(cross(c, a), 1.0f / 6.0f));
+        } else if (tri.z == i) {
+            grad = add(grad, mul(cross(a, b), 1.0f / 6.0f));
+        }
+    }
+    solver.volume_gradient[i] = grad;
+}
+
+__global__ void volume_denominator_partial_kernel(Solver solver, float* partials) {
+    extern __shared__ float shared[];
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    float value = 0.0f;
+    if (i < solver.cfg.vertex_count && solver.inv_mass[i] > 0.0f) {
+        Vec3 grad = solver.volume_gradient[i];
+        if (finite_vec(grad)) {
+            value = solver.inv_mass[i] * dot(grad, grad);
+        }
+    }
+    shared[threadIdx.x] = value;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            shared[threadIdx.x] += shared[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        partials[blockIdx.x] = shared[0];
+    }
+}
+
+__global__ void volume_reduce_partials_kernel(
+    const float* volume_partials,
+    int volume_count,
+    const float* denominator_partials,
+    int denominator_count,
+    float* accum
+) {
+    extern __shared__ float shared[];
+    float* volume_shared = shared;
+    float* denominator_shared = shared + blockDim.x;
+    float volume = 0.0f;
+    float denominator = 0.0f;
+    for (int i = threadIdx.x; i < volume_count; i += blockDim.x) {
+        volume += volume_partials[i];
+    }
+    for (int i = threadIdx.x; i < denominator_count; i += blockDim.x) {
+        denominator += denominator_partials[i];
+    }
+    volume_shared[threadIdx.x] = volume;
+    denominator_shared[threadIdx.x] = denominator;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            volume_shared[threadIdx.x] += volume_shared[threadIdx.x + stride];
+            denominator_shared[threadIdx.x] += denominator_shared[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        accum[0] = volume_shared[0];
+        accum[1] = denominator_shared[0];
+    }
 }
 
 __global__ void volume_project_kernel(Solver solver, float dt) {
@@ -1328,11 +1614,7 @@ __global__ void self_particle_collision_kernel(Solver solver) {
     }
 }
 
-__global__ void build_self_surface_sample_hash_kernel(Solver solver) {
-    int sample = blockIdx.x * blockDim.x + threadIdx.x;
-    if (sample >= solver.self_sample_count) {
-        return;
-    }
+__device__ void build_self_surface_sample_hash_entry(Solver solver, int sample) {
     int tri_index = self_sample_triangle_index(solver, sample);
     int kind = self_sample_kind(solver, sample, tri_index);
     if (tri_index >= solver.cfg.triangle_count) {
@@ -1353,6 +1635,35 @@ __global__ void build_self_surface_sample_hash_kernel(Solver solver) {
     int cz = cell_coord(p.z, cell_size);
     int hash = hash_cell(cx, cy, cz, solver.self_sample_hash_table_size);
     solver.self_sample_next[sample] = atomicExch(&solver.self_sample_heads[hash], sample);
+}
+
+__global__ void build_self_surface_sample_hash_kernel(Solver solver) {
+    int sample = blockIdx.x * blockDim.x + threadIdx.x;
+    if (sample >= solver.self_sample_count) {
+        return;
+    }
+    build_self_surface_sample_hash_entry(solver, sample);
+}
+
+__global__ void clear_self_surface_sample_hash_if_dirty_kernel(Solver solver) {
+    if (!solver.self_sample_hash_dirty || solver.self_sample_hash_dirty[0] == 0) {
+        return;
+    }
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < solver.self_sample_hash_table_size) {
+        solver.self_sample_heads[index] = -1;
+    }
+}
+
+__global__ void build_self_surface_sample_hash_if_dirty_kernel(Solver solver) {
+    if (!solver.self_sample_hash_dirty || solver.self_sample_hash_dirty[0] == 0) {
+        return;
+    }
+    int sample = blockIdx.x * blockDim.x + threadIdx.x;
+    if (sample >= solver.self_sample_count) {
+        return;
+    }
+    build_self_surface_sample_hash_entry(solver, sample);
 }
 
 __global__ void self_vertex_surface_collision_kernel(Solver solver) {
@@ -1450,6 +1761,9 @@ __global__ void self_vertex_surface_collision_kernel(Solver solver) {
                             float total = wi + sample_weight;
                             if (total > 0.0f) {
                                 Vec3 correction = mul(normal, self_projection_relaxation(solver) * (thickness - d) / total);
+                                if (solver.self_sample_hash_dirty) {
+                                    atomicExch(solver.self_sample_hash_dirty, 1);
+                                }
                                 atomic_add(&solver.pos[i], mul(correction, wi));
                                 atomic_add(&solver.pos[tri.x], mul(correction, -wx * wa));
                                 atomic_add(&solver.pos[tri.y], mul(correction, -wy * wb));
@@ -2167,7 +2481,13 @@ bool restore_step_diagnostics_state(Solver* solver) {
     );
 }
 
-bool run_self_collision_pass(Solver* solver, int v_blocks, bool recovery_mode, bool run_surface_sample_pairs) {
+bool run_self_collision_pass(
+    Solver* solver,
+    int v_blocks,
+    bool recovery_mode,
+    bool run_surface_sample_pairs,
+    std::vector<TimedSegment>* timings
+) {
     if (!solver || !solver->self_vert_heads || !solver->self_vert_next) {
         return true;
     }
@@ -2177,26 +2497,80 @@ bool run_self_collision_pass(Solver* solver, int v_blocks, bool recovery_mode, b
         collision_solver.self_samples_per_triangle = self_fast_surface_sample_count_per_triangle(solver);
         collision_solver.self_sample_count = solver->cfg.triangle_count * collision_solver.self_samples_per_triangle;
     }
+    TimedSegment hash_segment;
+    if (!begin_timed_segment(timings, kTimingSelfHash, &hash_segment, "start self hash timing")) {
+        return false;
+    }
     cudaMemset(solver->self_vert_heads, 0xff, sizeof(int) * solver->self_vert_hash_table_size);
     build_self_vertex_hash_kernel<<<v_blocks, 256>>>(collision_solver);
+    if (!end_timed_segment(timings, &hash_segment, "end self hash timing")) {
+        return false;
+    }
+
+    const int solve_slot = recovery_mode ? kTimingSelfRecovery : kTimingSelfSolve;
+    TimedSegment solve_segment;
+    if (!begin_timed_segment(timings, solve_slot, &solve_segment, "start self solve timing")) {
+        return false;
+    }
     self_particle_collision_kernel<<<v_blocks, 256>>>(collision_solver);
+    if (!end_timed_segment(timings, &solve_segment, "end self solve timing")) {
+        return false;
+    }
     if (solver->self_sample_heads
         && solver->self_sample_next
         && collision_solver.self_sample_count > 0) {
+        if (solver->self_sample_hash_dirty) {
+            cudaMemset(solver->self_sample_hash_dirty, 0, sizeof(int));
+        }
+        if (!begin_timed_segment(timings, kTimingSelfHash, &hash_segment, "start self sample hash timing")) {
+            return false;
+        }
         cudaMemset(solver->self_sample_heads, 0xff, sizeof(int) * solver->self_sample_hash_table_size);
         build_self_surface_sample_hash_kernel<<<block_count(collision_solver.self_sample_count), 256>>>(collision_solver);
+        if (!end_timed_segment(timings, &hash_segment, "end self sample hash timing")) {
+            return false;
+        }
+        if (!begin_timed_segment(timings, solve_slot, &solve_segment, "start self vertex-surface timing")) {
+            return false;
+        }
         self_vertex_surface_collision_kernel<<<v_blocks, 256>>>(collision_solver);
+        if (!end_timed_segment(timings, &solve_segment, "end self vertex-surface timing")) {
+            return false;
+        }
         if (run_surface_sample_pairs) {
-            cudaMemset(solver->self_sample_heads, 0xff, sizeof(int) * solver->self_sample_hash_table_size);
-            build_self_surface_sample_hash_kernel<<<block_count(collision_solver.self_sample_count), 256>>>(collision_solver);
+            if (!begin_timed_segment(timings, kTimingSelfHash, &hash_segment, "start self surface-pair hash timing")) {
+                return false;
+            }
+            clear_self_surface_sample_hash_if_dirty_kernel<<<block_count(solver->self_sample_hash_table_size), 256>>>(collision_solver);
+            build_self_surface_sample_hash_if_dirty_kernel<<<block_count(collision_solver.self_sample_count), 256>>>(collision_solver);
+            if (!end_timed_segment(timings, &hash_segment, "end self surface-pair hash timing")) {
+                return false;
+            }
+            if (!begin_timed_segment(timings, solve_slot, &solve_segment, "start self surface-pair timing")) {
+                return false;
+            }
             self_surface_sample_collision_kernel<<<block_count(collision_solver.self_sample_count), 256>>>(collision_solver);
+            if (!end_timed_segment(timings, &solve_segment, "end self surface-pair timing")) {
+                return false;
+            }
         }
     }
+    if (!begin_timed_segment(timings, solve_slot, &solve_segment, "start self sanitize timing")) {
+        return false;
+    }
     sanitize_positions_kernel<<<v_blocks, 256>>>(collision_solver);
+    if (!end_timed_segment(timings, &solve_segment, "end self sanitize timing")) {
+        return false;
+    }
     return set_cuda_error(cudaGetLastError(), "launch self collision pass");
 }
 
-bool probe_self_collision(Solver* solver, int v_blocks, SsblXpbdDiagnostics* out_diag) {
+bool probe_self_collision(
+    Solver* solver,
+    int v_blocks,
+    SsblXpbdDiagnostics* out_diag,
+    std::vector<TimedSegment>* timings
+) {
     if (!solver || !out_diag) {
         return set_error("invalid self-collision probe");
     }
@@ -2214,6 +2588,10 @@ bool probe_self_collision(Solver* solver, int v_blocks, SsblXpbdDiagnostics* out
     if (!reset_probe_diagnostics(solver)) {
         return false;
     }
+    TimedSegment probe_segment;
+    if (!begin_timed_segment(timings, kTimingSelfProbe, &probe_segment, "start self probe timing")) {
+        return false;
+    }
     cudaMemset(solver->self_vert_heads, 0xff, sizeof(int) * solver->self_vert_hash_table_size);
     build_self_vertex_hash_kernel<<<v_blocks, 256>>>(probe_solver);
     probe_self_particle_collision_kernel<<<v_blocks, 256>>>(probe_solver);
@@ -2223,6 +2601,9 @@ bool probe_self_collision(Solver* solver, int v_blocks, SsblXpbdDiagnostics* out
         cudaMemset(solver->self_sample_heads, 0xff, sizeof(int) * solver->self_sample_hash_table_size);
         build_self_surface_sample_hash_kernel<<<block_count(probe_solver.self_sample_count), 256>>>(probe_solver);
         probe_self_vertex_surface_collision_kernel<<<v_blocks, 256>>>(probe_solver);
+    }
+    if (!end_timed_segment(timings, &probe_segment, "end self probe timing")) {
+        return false;
     }
     if (!set_cuda_error(cudaGetLastError(), "launch self-collision probe")) {
         return false;
@@ -2259,7 +2640,8 @@ bool run_substep(
     int p_blocks,
     long long* recovery_passes_total,
     long long* local_retry_total,
-    bool allow_retry
+    bool allow_retry,
+    std::vector<TimedSegment>* timings
 ) {
     if (!solver) {
         return set_error("invalid solver");
@@ -2270,11 +2652,21 @@ bool run_substep(
         }
     }
 
+    TimedSegment segment;
+    if (!begin_timed_segment(timings, kTimingConstraints, &segment, "start integrate timing")) {
+        return false;
+    }
     integrate_kernel<<<v_blocks, 256>>>(*solver, sub_dt);
     if (solver->pin_count > 0) {
         pin_project_kernel<<<p_blocks, 256>>>(*solver);
     }
+    if (!end_timed_segment(timings, &segment, "end integrate timing")) {
+        return false;
+    }
     for (int it = 0; it < iterations; ++it) {
+        if (!begin_timed_segment(timings, kTimingConstraints, &segment, "start constraint timing")) {
+            return false;
+        }
         if (solver->cfg.edge_count > 0) {
             if (solver->cfg.edge_color_count > 0 && solver->edge_color_offsets_host) {
                 for (int color = 0; color < solver->cfg.edge_color_count; ++color) {
@@ -2304,18 +2696,54 @@ bool run_substep(
         if (solver->cfg.lra_count > 0) {
             lra_project_kernel<<<lra_blocks, 256>>>(*solver, sub_dt);
         }
+        if (!end_timed_segment(timings, &segment, "end constraint timing")) {
+            return false;
+        }
         if (run_volume_pressure && solver->volume_gradient && solver->volume_accum && solver->cfg.triangle_count > 0) {
-            cudaMemset(solver->volume_gradient, 0, sizeof(Vec3) * solver->cfg.vertex_count);
-            cudaMemset(solver->volume_accum, 0, sizeof(float) * 2);
-            volume_accumulate_kernel<<<t_blocks, 256>>>(*solver);
-            volume_denominator_kernel<<<v_blocks, 256>>>(*solver);
+            if (!begin_timed_segment(timings, kTimingVolume, &segment, "start volume timing")) {
+                return false;
+            }
+            if (solver->volume_vertex_offsets
+                && solver->volume_vertex_triangles
+                && solver->volume_partial_values
+                && solver->volume_partial_denominators
+                && solver->volume_partial_capacity >= std::max(t_blocks, v_blocks)) {
+                const size_t shared_floats = sizeof(float) * 256;
+                volume_value_partial_kernel<<<t_blocks, 256, shared_floats>>>(*solver, solver->volume_partial_values);
+                volume_gradient_incident_kernel<<<v_blocks, 256>>>(*solver);
+                volume_denominator_partial_kernel<<<v_blocks, 256, shared_floats>>>(*solver, solver->volume_partial_denominators);
+                volume_reduce_partials_kernel<<<1, 256, sizeof(float) * 512>>>(
+                    solver->volume_partial_values,
+                    t_blocks,
+                    solver->volume_partial_denominators,
+                    v_blocks,
+                    solver->volume_accum
+                );
+            } else {
+                cudaMemset(solver->volume_gradient, 0, sizeof(Vec3) * solver->cfg.vertex_count);
+                cudaMemset(solver->volume_accum, 0, sizeof(float) * 2);
+                volume_accumulate_kernel<<<t_blocks, 256>>>(*solver);
+                volume_denominator_kernel<<<v_blocks, 256>>>(*solver);
+            }
             volume_project_kernel<<<v_blocks, 256>>>(*solver, sub_dt);
+            if (!end_timed_segment(timings, &segment, "end volume timing")) {
+                return false;
+            }
+        }
+        if (!begin_timed_segment(timings, kTimingConstraints, &segment, "start post-constraint timing")) {
+            return false;
         }
         if (solver->pin_count > 0) {
             pin_project_kernel<<<p_blocks, 256>>>(*solver);
         }
         analytic_collision_kernel<<<v_blocks, 256>>>(*solver);
+        if (!end_timed_segment(timings, &segment, "end post-constraint timing")) {
+            return false;
+        }
         if (solver->cfg.static_triangle_count > 0) {
+            if (!begin_timed_segment(timings, kTimingStaticCollision, &segment, "start static collision timing")) {
+                return false;
+            }
             for (int static_pass = 0; static_pass < kStaticCollisionPasses; ++static_pass) {
                 if (solver->cfg.static_triangle_count > kStaticHashTriangleThreshold
                     && solver->static_tri_heads
@@ -2327,8 +2755,14 @@ bool run_substep(
                     static_collision_kernel<<<v_blocks, 256>>>(*solver);
                 }
             }
+            if (!end_timed_segment(timings, &segment, "end static collision timing")) {
+                return false;
+            }
         }
         if (solver->dynamic_triangle_count > 0) {
+            if (!begin_timed_segment(timings, kTimingDynamicCollision, &segment, "start dynamic collision timing")) {
+                return false;
+            }
             for (int dynamic_pass = 0; dynamic_pass < kDynamicCollisionPasses; ++dynamic_pass) {
                 if (solver->dynamic_triangle_count > kStaticHashTriangleThreshold
                     && solver->dynamic_tri_heads
@@ -2340,6 +2774,9 @@ bool run_substep(
                     dynamic_collision_kernel<<<v_blocks, 256>>>(*solver);
                 }
             }
+            if (!end_timed_segment(timings, &segment, "end dynamic collision timing")) {
+                return false;
+            }
         }
         if (run_self_collision && it == iterations - 1) {
             ++solver->self_collision_run_count;
@@ -2347,7 +2784,7 @@ bool run_substep(
             bool run_surface_pairs = (solver->self_collision_run_count % surface_pair_interval) == 0;
             for (int self_pass = 0; self_pass < kSelfCollisionPasses; ++self_pass) {
                 bool run_surface_sample_pairs = run_surface_pairs && (self_pass == kSelfCollisionPasses - 1);
-                if (!run_self_collision_pass(solver, v_blocks, false, run_surface_sample_pairs)) {
+                if (!run_self_collision_pass(solver, v_blocks, false, run_surface_sample_pairs, timings)) {
                     return false;
                 }
             }
@@ -2355,26 +2792,32 @@ bool run_substep(
             int probe_interval = std::max(solver->cfg.self_probe_interval, 1);
             bool run_probe = (solver->self_collision_run_count % probe_interval) == 0;
             if (!run_probe) {
+                if (!begin_timed_segment(timings, kTimingConstraints, &segment, "start sanitize timing")) {
+                    return false;
+                }
                 sanitize_positions_kernel<<<v_blocks, 256>>>(*solver);
+                if (!end_timed_segment(timings, &segment, "end sanitize timing")) {
+                    return false;
+                }
                 continue;
             }
 
             SsblXpbdDiagnostics probe_diag{};
-            if (!probe_self_collision(solver, v_blocks, &probe_diag)) {
+            if (!probe_self_collision(solver, v_blocks, &probe_diag, timings)) {
                 return false;
             }
             float cloth_thickness = std::max(solver->cfg.cloth_thickness, 1.0e-4f);
             int extra_recovery_passes = 0;
             while (extra_recovery_passes < kSelfRecoveryPassLimit
                 && self_probe_triggers_recovery(probe_diag, cloth_thickness)) {
-                if (!run_self_collision_pass(solver, v_blocks, true, true)) {
+                if (!run_self_collision_pass(solver, v_blocks, true, true, timings)) {
                     return false;
                 }
                 ++extra_recovery_passes;
                 if (recovery_passes_total) {
                     ++(*recovery_passes_total);
                 }
-                if (!probe_self_collision(solver, v_blocks, &probe_diag)) {
+                if (!probe_self_collision(solver, v_blocks, &probe_diag, timings)) {
                     return false;
                 }
             }
@@ -2401,7 +2844,8 @@ bool run_substep(
                         p_blocks,
                         recovery_passes_total,
                         local_retry_total,
-                        false)) {
+                        false,
+                        timings)) {
                     return false;
                 }
                 return run_substep(
@@ -2418,13 +2862,26 @@ bool run_substep(
                     p_blocks,
                     recovery_passes_total,
                     local_retry_total,
-                    false
+                    false,
+                    timings
                 );
             }
         }
+        if (!begin_timed_segment(timings, kTimingConstraints, &segment, "start sanitize timing")) {
+            return false;
+        }
         sanitize_positions_kernel<<<v_blocks, 256>>>(*solver);
+        if (!end_timed_segment(timings, &segment, "end sanitize timing")) {
+            return false;
+        }
+    }
+    if (!begin_timed_segment(timings, kTimingConstraints, &segment, "start velocity timing")) {
+        return false;
     }
     update_velocity_kernel<<<v_blocks, 256>>>(*solver, sub_dt);
+    if (!end_timed_segment(timings, &segment, "end velocity timing")) {
+        return false;
+    }
     return set_cuda_error(cudaGetLastError(), "launch substep");
 }
 
@@ -2442,6 +2899,10 @@ void free_solver(Solver* solver) {
     cudaFree(solver->inv_mass);
     cudaFree(solver->volume_gradient);
     cudaFree(solver->volume_accum);
+    cudaFree(solver->volume_vertex_offsets);
+    cudaFree(solver->volume_vertex_triangles);
+    cudaFree(solver->volume_partial_values);
+    cudaFree(solver->volume_partial_denominators);
     cudaFree(solver->edges);
     cudaFree(solver->edge_rest);
     delete[] solver->edge_color_offsets_host;
@@ -2468,6 +2929,7 @@ void free_solver(Solver* solver) {
     cudaFree(solver->self_vert_next);
     cudaFree(solver->self_sample_heads);
     cudaFree(solver->self_sample_next);
+    cudaFree(solver->self_sample_hash_dirty);
     cudaFree(solver->pin_indices);
     cudaFree(solver->pin_targets);
     cudaFreeHost(solver->pinned_download);
@@ -2478,6 +2940,110 @@ void free_solver(Solver* solver) {
     cudaFree(solver->diag_counts_backup);
     cudaFree(solver->diag_min_gap_backup);
     delete solver;
+}
+
+bool update_pin_targets_internal(Solver* solver, const int* indices, const float* positions, int count) {
+    if (!solver) {
+        return set_error("invalid solver handle");
+    }
+    if (count <= 0) {
+        solver->pin_count = 0;
+        return true;
+    }
+    if (!indices || !positions) {
+        return set_error("missing pin targets");
+    }
+    if (count > solver->pin_capacity) {
+        cudaFree(solver->pin_indices);
+        cudaFree(solver->pin_targets);
+        solver->pin_indices = nullptr;
+        solver->pin_targets = nullptr;
+        solver->pin_capacity = count;
+        if (!set_cuda_error(cudaMalloc(reinterpret_cast<void**>(&solver->pin_indices), sizeof(int) * count), "pin index allocation")) {
+            return false;
+        }
+        if (!set_cuda_error(cudaMalloc(reinterpret_cast<void**>(&solver->pin_targets), sizeof(Vec3) * count), "pin target allocation")) {
+            return false;
+        }
+    }
+    solver->pin_count = count;
+    if (!set_cuda_error(cudaMemcpy(solver->pin_indices, indices, sizeof(int) * count, cudaMemcpyHostToDevice), "pin index upload")) {
+        return false;
+    }
+    return set_cuda_error(cudaMemcpy(solver->pin_targets, positions, sizeof(float) * count * 3, cudaMemcpyHostToDevice), "pin target upload");
+}
+
+bool update_runtime_colliders_internal(Solver* solver, const SsblXpbdRuntimeColliders* inputs) {
+    if (!solver || !inputs) {
+        return set_error("invalid runtime collider update");
+    }
+    solver->cfg.use_ground = inputs->use_ground;
+    solver->cfg.ground_height = inputs->ground_height;
+    solver->cfg.use_wall = inputs->use_wall;
+    std::memcpy(solver->cfg.wall_origin, inputs->wall_origin, sizeof(float) * 3);
+    std::memcpy(solver->cfg.wall_normal, inputs->wall_normal, sizeof(float) * 3);
+    solver->cfg.use_sphere = inputs->use_sphere;
+    std::memcpy(solver->cfg.sphere_center, inputs->sphere_center, sizeof(float) * 3);
+    solver->cfg.sphere_radius = inputs->sphere_radius;
+    return true;
+}
+
+bool update_static_triangles_internal(Solver* solver, const float* triangles, int triangle_count) {
+    if (!solver) {
+        return set_error("invalid static collider update");
+    }
+    if (triangle_count != solver->cfg.static_triangle_count) {
+        return set_error("static collider triangle count changed; fixed topology is required");
+    }
+    if (triangle_count <= 0) {
+        return true;
+    }
+    if (!triangles || !solver->static_triangles) {
+        return set_error("missing static collider triangles");
+    }
+    if (!set_cuda_error(
+        cudaMemcpy(solver->static_triangles, triangles, sizeof(float) * triangle_count * 9, cudaMemcpyHostToDevice),
+        "upload static triangles"
+    )) {
+        return false;
+    }
+    if (solver->static_tri_heads
+        && solver->static_tri_entry_next
+        && solver->static_tri_entry_index
+        && solver->static_tri_entry_count) {
+        const auto hash_start = std::chrono::high_resolution_clock::now();
+        cudaMemset(solver->static_tri_heads, 0xff, sizeof(int) * solver->static_hash_table_size);
+        cudaMemset(solver->static_tri_entry_count, 0, sizeof(int));
+        build_static_triangle_hash_kernel<<<block_count(triangle_count), 256>>>(*solver);
+        if (!set_cuda_error(cudaDeviceSynchronize(), "rebuild static collision hash")) {
+            return false;
+        }
+        solver->pending_hash_build_ms += elapsed_ms_since(hash_start);
+    }
+    return true;
+}
+
+bool update_dynamic_triangles_internal(Solver* solver, const float* triangles, int triangle_count) {
+    if (!solver) {
+        return set_error("invalid dynamic collider update");
+    }
+    if (triangle_count <= 0) {
+        solver->dynamic_triangle_count = 0;
+        return true;
+    }
+    if (!triangles) {
+        return set_error("missing dynamic collider triangles");
+    }
+    if (!allocate_dynamic_triangle_collision(solver, triangle_count)) {
+        return false;
+    }
+    if (!set_cuda_error(
+        cudaMemcpy(solver->dynamic_triangles, triangles, sizeof(float) * triangle_count * 9, cudaMemcpyHostToDevice),
+        "upload dynamic triangles"
+    )) {
+        return false;
+    }
+    return rebuild_dynamic_triangle_hash(solver);
 }
 
 }  // namespace
@@ -2544,6 +3110,11 @@ extern "C" SSBL_API void* ssbl_create_solver(const SsblXpbdConfig* config, const
         ok = ok && set_cuda_error(err, "volume gradient allocation");
         err = cudaMalloc(reinterpret_cast<void**>(&solver->volume_accum), sizeof(float) * 2);
         ok = ok && set_cuda_error(err, "volume accumulator allocation");
+        solver->volume_partial_capacity = std::max(1, std::max(block_count(vertex_count), block_count(config->triangle_count)));
+        err = cudaMalloc(reinterpret_cast<void**>(&solver->volume_partial_values), sizeof(float) * solver->volume_partial_capacity);
+        ok = ok && set_cuda_error(err, "volume partial value allocation");
+        err = cudaMalloc(reinterpret_cast<void**>(&solver->volume_partial_denominators), sizeof(float) * solver->volume_partial_capacity);
+        ok = ok && set_cuda_error(err, "volume partial denominator allocation");
     }
     if (ok) {
         solver->pinned_download_floats = vertex_count * 3;
@@ -2564,6 +3135,9 @@ extern "C" SSBL_API void* ssbl_create_solver(const SsblXpbdConfig* config, const
     ok = ok && alloc_and_copy(&solver->lra_rest, mesh->lra_rest_lengths, config->lra_count, "missing LRA rest lengths");
     ok = ok && copy_host_offsets(&solver->lra_color_offsets_host, mesh->lra_color_offsets, config->lra_color_count + 1, "missing LRA color offsets");
     ok = ok && alloc_and_copy(&solver->triangles, reinterpret_cast<const Int3*>(mesh->triangles), config->triangle_count, "missing triangles");
+    if (ok && config->use_volume_pressure) {
+        ok = ok && build_volume_vertex_triangles(solver, config, mesh);
+    }
     ok = ok && alloc_and_copy(&solver->static_triangles, reinterpret_cast<const Vec3*>(mesh->static_triangles), config->static_triangle_count * 3, "missing static triangles");
 
     if (ok && config->static_triangle_count > 0) {
@@ -2606,6 +3180,9 @@ extern "C" SSBL_API void* ssbl_create_solver(const SsblXpbdConfig* config, const
             ok = ok && set_cuda_error(err, "self surface sample hash allocation");
             err = cudaMalloc(reinterpret_cast<void**>(&solver->self_sample_next), sizeof(int) * solver->self_sample_count);
             ok = ok && set_cuda_error(err, "self surface sample link allocation");
+            err = cudaMalloc(reinterpret_cast<void**>(&solver->self_sample_hash_dirty), sizeof(int));
+            ok = ok && set_cuda_error(err, "self surface sample dirty allocation");
+            ok = ok && set_cuda_error(cudaMemset(solver->self_sample_hash_dirty, 0, sizeof(int)), "self surface sample dirty reset");
         }
     }
 
@@ -2640,120 +3217,55 @@ extern "C" SSBL_API int ssbl_reset_solver(void* handle) {
 
 extern "C" SSBL_API int ssbl_update_pin_targets(void* handle, const int* indices, const float* positions, int count) {
     g_last_error.clear();
-    Solver* solver = reinterpret_cast<Solver*>(handle);
-    if (!solver) {
-        return set_error("invalid solver handle") ? 1 : 0;
-    }
-    if (count <= 0) {
-        solver->pin_count = 0;
-        return 1;
-    }
-    if (!indices || !positions) {
-        return set_error("missing pin targets") ? 1 : 0;
-    }
-    if (count > solver->pin_capacity) {
-        cudaFree(solver->pin_indices);
-        cudaFree(solver->pin_targets);
-        solver->pin_indices = nullptr;
-        solver->pin_targets = nullptr;
-        solver->pin_capacity = count;
-        if (!set_cuda_error(cudaMalloc(reinterpret_cast<void**>(&solver->pin_indices), sizeof(int) * count), "pin index allocation")) {
-            return 0;
-        }
-        if (!set_cuda_error(cudaMalloc(reinterpret_cast<void**>(&solver->pin_targets), sizeof(Vec3) * count), "pin target allocation")) {
-            return 0;
-        }
-    }
-    solver->pin_count = count;
-    if (!set_cuda_error(cudaMemcpy(solver->pin_indices, indices, sizeof(int) * count, cudaMemcpyHostToDevice), "pin index upload")) {
-        return 0;
-    }
-    if (!set_cuda_error(cudaMemcpy(solver->pin_targets, positions, sizeof(float) * count * 3, cudaMemcpyHostToDevice), "pin target upload")) {
-        return 0;
-    }
-    return 1;
+    return update_pin_targets_internal(reinterpret_cast<Solver*>(handle), indices, positions, count) ? 1 : 0;
 }
 
 extern "C" SSBL_API int ssbl_update_runtime_colliders(void* handle, const SsblXpbdRuntimeColliders* inputs) {
     g_last_error.clear();
-    Solver* solver = reinterpret_cast<Solver*>(handle);
-    if (!solver || !inputs) {
-        return set_error("invalid runtime collider update") ? 1 : 0;
-    }
-    solver->cfg.use_ground = inputs->use_ground;
-    solver->cfg.ground_height = inputs->ground_height;
-    solver->cfg.use_wall = inputs->use_wall;
-    std::memcpy(solver->cfg.wall_origin, inputs->wall_origin, sizeof(float) * 3);
-    std::memcpy(solver->cfg.wall_normal, inputs->wall_normal, sizeof(float) * 3);
-    solver->cfg.use_sphere = inputs->use_sphere;
-    std::memcpy(solver->cfg.sphere_center, inputs->sphere_center, sizeof(float) * 3);
-    solver->cfg.sphere_radius = inputs->sphere_radius;
-    return 1;
+    return update_runtime_colliders_internal(reinterpret_cast<Solver*>(handle), inputs) ? 1 : 0;
 }
 
 extern "C" SSBL_API int ssbl_update_static_triangles(void* handle, const float* triangles, int triangle_count) {
     g_last_error.clear();
-    Solver* solver = reinterpret_cast<Solver*>(handle);
-    if (!solver) {
-        return set_error("invalid static collider update") ? 1 : 0;
-    }
-    if (triangle_count != solver->cfg.static_triangle_count) {
-        return set_error("static collider triangle count changed; fixed topology is required") ? 1 : 0;
-    }
-    if (triangle_count <= 0) {
-        return 1;
-    }
-    if (!triangles || !solver->static_triangles) {
-        return set_error("missing static collider triangles") ? 1 : 0;
-    }
-    if (!set_cuda_error(
-        cudaMemcpy(solver->static_triangles, triangles, sizeof(float) * triangle_count * 9, cudaMemcpyHostToDevice),
-        "upload static triangles"
-    )) {
-        return 0;
-    }
-    if (solver->static_tri_heads
-        && solver->static_tri_entry_next
-        && solver->static_tri_entry_index
-        && solver->static_tri_entry_count) {
-        const auto hash_start = std::chrono::high_resolution_clock::now();
-        cudaMemset(solver->static_tri_heads, 0xff, sizeof(int) * solver->static_hash_table_size);
-        cudaMemset(solver->static_tri_entry_count, 0, sizeof(int));
-        build_static_triangle_hash_kernel<<<block_count(triangle_count), 256>>>(*solver);
-        if (!set_cuda_error(cudaDeviceSynchronize(), "rebuild static collision hash")) {
-            return 0;
-        }
-        solver->pending_hash_build_ms += elapsed_ms_since(hash_start);
-    }
-    return 1;
+    return update_static_triangles_internal(reinterpret_cast<Solver*>(handle), triangles, triangle_count) ? 1 : 0;
 }
 
 extern "C" SSBL_API int ssbl_update_dynamic_triangles(void* handle, const float* triangles, int triangle_count) {
     g_last_error.clear();
-    Solver* solver = reinterpret_cast<Solver*>(handle);
-    if (!solver) {
-        return set_error("invalid dynamic collider update") ? 1 : 0;
-    }
-    if (triangle_count <= 0) {
-        solver->dynamic_triangle_count = 0;
-        return 1;
-    }
-    if (!triangles) {
-        return set_error("missing dynamic collider triangles") ? 1 : 0;
-    }
-    if (!allocate_dynamic_triangle_collision(solver, triangle_count)) {
-        return 0;
-    }
-    if (!set_cuda_error(
-        cudaMemcpy(solver->dynamic_triangles, triangles, sizeof(float) * triangle_count * 9, cudaMemcpyHostToDevice),
-        "upload dynamic triangles"
-    )) {
-        return 0;
-    }
-    return rebuild_dynamic_triangle_hash(solver) ? 1 : 0;
+    return update_dynamic_triangles_internal(reinterpret_cast<Solver*>(handle), triangles, triangle_count) ? 1 : 0;
 }
 
-extern "C" SSBL_API int ssbl_step_solver(void* handle, int substeps, int iterations) {
+extern "C" SSBL_API int ssbl_update_frame_inputs(void* handle, const SsblXpbdFrameInputs* inputs) {
+    g_last_error.clear();
+    Solver* solver = reinterpret_cast<Solver*>(handle);
+    if (!solver || !inputs) {
+        return set_error("invalid frame input update") ? 1 : 0;
+    }
+    if (inputs->update_runtime_colliders && !update_runtime_colliders_internal(solver, &inputs->runtime_colliders)) {
+        return 0;
+    }
+    if (inputs->update_pin_targets
+        && !update_pin_targets_internal(solver, inputs->pin_indices, inputs->pin_positions, inputs->pin_count)) {
+        return 0;
+    }
+    if (inputs->update_static_triangles
+        && !update_static_triangles_internal(solver, inputs->static_triangles, inputs->static_triangle_count)) {
+        return 0;
+    }
+    if (inputs->update_dynamic_triangles
+        && !update_dynamic_triangles_internal(solver, inputs->dynamic_triangles, inputs->dynamic_triangle_count)) {
+        return 0;
+    }
+    return 1;
+}
+
+extern "C" SSBL_API int ssbl_step_solver_ex(
+    void* handle,
+    int substeps,
+    int iterations,
+    int fetch_diagnostics,
+    int force_sync
+) {
     g_last_error.clear();
     Solver* solver = reinterpret_cast<Solver*>(handle);
     if (!solver) {
@@ -2776,6 +3288,9 @@ extern "C" SSBL_API int ssbl_step_solver(void* handle, int substeps, int iterati
     int p_blocks = block_count(solver->pin_count);
     long long recovery_passes_total = 0;
     long long local_retry_total = 0;
+    const bool needs_sync = force_sync != 0 || fetch_diagnostics != 0;
+    std::vector<TimedSegment> timings;
+    std::vector<TimedSegment>* timing_ptr = needs_sync ? &timings : nullptr;
 
     for (int s = 0; s < substeps; ++s) {
         int interval = std::max(solver->cfg.self_collision_interval, 1);
@@ -2798,22 +3313,44 @@ extern "C" SSBL_API int ssbl_step_solver(void* handle, int substeps, int iterati
                 p_blocks,
                 &recovery_passes_total,
                 &local_retry_total,
-                true)) {
+                true,
+                timing_ptr)) {
+            destroy_timing_records(timing_ptr);
             return 0;
         }
     }
 
-    if (!set_cuda_error(cudaDeviceSynchronize(), "solver step")) {
-        return 0;
+    if (needs_sync) {
+        const auto sync_start = std::chrono::high_resolution_clock::now();
+        if (!set_cuda_error(cudaDeviceSynchronize(), "solver step")) {
+            destroy_timing_records(timing_ptr);
+            return 0;
+        }
+        solver->diag.sync_ms = elapsed_ms_since(sync_start);
+        if (!collect_timing_records(solver, timing_ptr)) {
+            return 0;
+        }
+    } else {
+        if (!set_cuda_error(cudaGetLastError(), "launch solver step")) {
+            return 0;
+        }
     }
     solver->diag.step_ms = elapsed_ms_since(step_start);
     solver->diag.hash_build_ms = pending_hash_build_ms;
-    if (!fetch_step_diagnostics(solver)) {
-        return 0;
+    if (fetch_diagnostics != 0) {
+        const auto diagnostics_start = std::chrono::high_resolution_clock::now();
+        if (!fetch_step_diagnostics(solver)) {
+            return 0;
+        }
+        solver->diag.diagnostics_fetch_ms = elapsed_ms_since(diagnostics_start);
     }
     solver->diag.recovery_passes = recovery_passes_total;
     solver->diag.local_retry_count = local_retry_total;
     return 1;
+}
+
+extern "C" SSBL_API int ssbl_step_solver(void* handle, int substeps, int iterations) {
+    return ssbl_step_solver_ex(handle, substeps, iterations, 1, 1);
 }
 
 extern "C" SSBL_API int ssbl_download_positions(void* handle, float* out_positions, int max_floats) {

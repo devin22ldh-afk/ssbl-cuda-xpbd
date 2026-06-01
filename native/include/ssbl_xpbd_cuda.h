@@ -53,6 +53,16 @@ typedef struct SsblXpbdConfig {
 typedef struct SsblXpbdDiagnostics {
     float step_ms;
     float hash_build_ms;
+    float constraints_ms;
+    float volume_ms;
+    float static_collision_ms;
+    float dynamic_collision_ms;
+    float self_hash_ms;
+    float self_solve_ms;
+    float self_probe_ms;
+    float self_recovery_ms;
+    float sync_ms;
+    float diagnostics_fetch_ms;
     long long candidate_count;
     long long resolved_contacts;
     float min_gap;
@@ -89,6 +99,21 @@ typedef struct SsblXpbdRuntimeColliders {
     float sphere_radius;
 } SsblXpbdRuntimeColliders;
 
+typedef struct SsblXpbdFrameInputs {
+    int update_pin_targets;
+    const int* pin_indices;
+    const float* pin_positions;
+    int pin_count;
+    int update_runtime_colliders;
+    SsblXpbdRuntimeColliders runtime_colliders;
+    int update_static_triangles;
+    const float* static_triangles;
+    int static_triangle_count;
+    int update_dynamic_triangles;
+    const float* dynamic_triangles;
+    int dynamic_triangle_count;
+} SsblXpbdFrameInputs;
+
 SSBL_API void* ssbl_create_solver(const SsblXpbdConfig* config, const SsblXpbdMesh* mesh);
 SSBL_API int ssbl_destroy_solver(void* handle);
 SSBL_API int ssbl_reset_solver(void* handle);
@@ -96,7 +121,9 @@ SSBL_API int ssbl_update_pin_targets(void* handle, const int* indices, const flo
 SSBL_API int ssbl_update_runtime_colliders(void* handle, const SsblXpbdRuntimeColliders* inputs);
 SSBL_API int ssbl_update_static_triangles(void* handle, const float* triangles, int triangle_count);
 SSBL_API int ssbl_update_dynamic_triangles(void* handle, const float* triangles, int triangle_count);
+SSBL_API int ssbl_update_frame_inputs(void* handle, const SsblXpbdFrameInputs* inputs);
 SSBL_API int ssbl_step_solver(void* handle, int substeps, int iterations);
+SSBL_API int ssbl_step_solver_ex(void* handle, int substeps, int iterations, int fetch_diagnostics, int force_sync);
 SSBL_API int ssbl_download_positions(void* handle, float* out_positions, int max_floats);
 SSBL_API int ssbl_get_diagnostics(void* handle, SsblXpbdDiagnostics* out_diag);
 SSBL_API const char* ssbl_last_error(void);

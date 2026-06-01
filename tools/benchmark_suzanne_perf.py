@@ -72,10 +72,22 @@ def _configure(settings, *, self_collision: bool, volume: bool, optimized: bool)
     settings.use_wall = False
     settings.use_sphere = False
     settings.self_collision_mode = "fast" if self_collision else "off"
-    settings.self_collision_interval = 4 if self_collision else 1
+    settings.self_collision_interval = (
+        _int_env("SSBL_SUZANNE_SELF_COLLISION_INTERVAL", 4 if optimized and self_collision else 1)
+        if self_collision
+        else 1
+    )
     settings.max_self_collision_neighbors = 256 if self_collision else 32
-    settings.self_probe_interval = 2 if optimized and self_collision else 1
-    settings.self_surface_pair_interval = 2 if optimized and self_collision else 1
+    settings.self_probe_interval = (
+        _int_env("SSBL_SUZANNE_SELF_PROBE_INTERVAL", 16 if optimized and self_collision else 1)
+        if self_collision
+        else 1
+    )
+    settings.self_surface_pair_interval = (
+        _int_env("SSBL_SUZANNE_SELF_SURFACE_PAIR_INTERVAL", 4 if optimized and self_collision else 1)
+        if self_collision
+        else 1
+    )
     settings.use_volume_pressure = bool(volume)
     settings.volume_solve_interval = 2 if optimized and volume else 1
     settings.volume_compliance = 1.0e-6
@@ -84,7 +96,10 @@ def _configure(settings, *, self_collision: bool, volume: bool, optimized: bool)
     settings.collision_margin = 0.005
     settings.substeps = 8
     settings.iterations = 1
-    settings.preview_writeback_interval = 2 if optimized else 1
+    settings.preview_writeback_interval = _int_env(
+        "SSBL_SUZANNE_WRITEBACK_INTERVAL",
+        4 if optimized else 1,
+    )
     settings.frame_count = max(_int_env("SSBL_SUZANNE_STEPS", 8), 1)
 
 
@@ -97,13 +112,42 @@ def _run_case(obj: bpy.types.Object, label: str, *, self_collision: bool, volume
     warmup = min(max(_int_env("SSBL_SUZANNE_WARMUP", 1), 0), max(steps - 1, 0))
     started = time.perf_counter()
     measured_steps = 0
+    measured_frame_ms_total = 0.0
+    writeback_frame_count = 0
+    writeback_frame_ms_total = 0.0
+    non_writeback_frame_count = 0
+    non_writeback_frame_ms_total = 0.0
+    first_non_writeback_frame_ms = None
+    first_writeback_frame_ms = None
+    first_writeback_diag = None
     for index in range(steps):
-        finished = ssbl.solver.step_preview(bpy.context, obj.name)
         if index == warmup:
             started = time.perf_counter()
             measured_steps = 0
+            measured_frame_ms_total = 0.0
+            writeback_frame_count = 0
+            writeback_frame_ms_total = 0.0
+            non_writeback_frame_count = 0
+            non_writeback_frame_ms_total = 0.0
+        frame_started = time.perf_counter()
+        finished = ssbl.solver.step_preview(bpy.context, obj.name)
+        frame_elapsed_ms = (time.perf_counter() - frame_started) * 1000.0
+        current_diag = ssbl.solver.session_diagnostics(obj)
         if index >= warmup:
             measured_steps += 1
+            measured_frame_ms_total += frame_elapsed_ms
+            if current_diag.writeback_performed:
+                writeback_frame_count += 1
+                writeback_frame_ms_total += frame_elapsed_ms
+                if first_writeback_frame_ms is None:
+                    first_writeback_frame_ms = frame_elapsed_ms
+                if first_writeback_diag is None:
+                    first_writeback_diag = current_diag
+            else:
+                non_writeback_frame_count += 1
+                non_writeback_frame_ms_total += frame_elapsed_ms
+                if first_non_writeback_frame_ms is None:
+                    first_non_writeback_frame_ms = frame_elapsed_ms
         if finished:
             break
     elapsed = max(time.perf_counter() - started, 1.0e-6)
@@ -115,15 +159,49 @@ def _run_case(obj: bpy.types.Object, label: str, *, self_collision: bool, volume
         "tris": len(session.cloth.triangles),
         "measured_steps": measured_steps,
         "fps": round(max(measured_steps, 1) / elapsed, 2),
+        "avg_frame_ms": round(measured_frame_ms_total / max(measured_steps, 1), 2),
+        "writeback_frame_count": writeback_frame_count,
+        "avg_writeback_frame_ms": (
+            round(writeback_frame_ms_total / writeback_frame_count, 2) if writeback_frame_count > 0 else None
+        ),
+        "non_writeback_frame_count": non_writeback_frame_count,
+        "avg_non_writeback_frame_ms": (
+            round(non_writeback_frame_ms_total / non_writeback_frame_count, 2) if non_writeback_frame_count > 0 else None
+        ),
         "finite": bool(diag.finite),
         "restore_delta": _max_source_delta(obj, before),
         "step_ms": round(float(diag.step_ms), 2),
+        "constraints_ms": round(float(diag.constraints_ms), 2),
+        "volume_ms": round(float(diag.volume_ms), 2),
+        "static_collision_ms": round(float(diag.static_collision_ms), 2),
+        "dynamic_collision_ms": round(float(diag.dynamic_collision_ms), 2),
+        "self_hash_ms": round(float(diag.self_hash_ms), 2),
+        "self_solve_ms": round(float(diag.self_solve_ms), 2),
+        "self_probe_ms": round(float(diag.self_probe_ms), 2),
+        "self_recovery_ms": round(float(diag.self_recovery_ms), 2),
+        "sync_ms": round(float(diag.sync_ms), 2),
+        "native_diag_fetch_ms": round(float(diag.diagnostics_fetch_ms), 2),
         "frame_ms": round(float(diag.frame_ms), 2),
         "input_ms": round(float(diag.input_refresh_ms), 2),
+        "frame_input_upload_ms": round(float(diag.frame_input_upload_ms), 2),
         "download_ms": round(float(diag.download_ms), 2),
         "writeback_ms": round(float(diag.writeback_ms), 2),
+        "writeback_frame": bool(diag.writeback_performed),
+        "sampled_non_writeback_frame_ms": (
+            round(float(first_non_writeback_frame_ms), 2) if first_non_writeback_frame_ms is not None else None
+        ),
+        "sampled_non_writeback_step_ms": None,
+        "sampled_writeback_frame_ms": (
+            round(float(first_writeback_frame_ms), 2) if first_writeback_frame_ms is not None else None
+        ),
+        "sampled_writeback_step_ms": (
+            round(float(first_writeback_diag.step_ms), 2) if first_writeback_diag is not None else None
+        ),
         "candidates": int(diag.candidate_count),
         "resolved": int(diag.resolved_contacts),
+        "ccd_clamp_count": int(diag.ccd_clamp_count),
+        "recovery_passes": int(diag.recovery_passes),
+        "local_retry_count": int(diag.local_retry_count),
     }
 
 
@@ -138,12 +216,22 @@ def main() -> None:
         bpy.context.view_layer.objects.active = obj
         obj.select_set(True)
         _ensure_pin_group(obj, "ssbl_pin")
+        case_specs = [
+            ("base_no_self_no_volume", False, False, False),
+            ("volume_only", False, True, False),
+            ("self_only", True, False, False),
+            ("self_and_volume", True, True, False),
+            ("optimized_self_and_volume", True, True, True),
+        ]
+        requested_cases = {
+            item.strip()
+            for item in os.environ.get("SSBL_SUZANNE_CASES", "").split(",")
+            if item.strip()
+        }
         results = [
-            _run_case(obj, "base_no_self_no_volume", self_collision=False, volume=False, optimized=False),
-            _run_case(obj, "volume_only", self_collision=False, volume=True, optimized=False),
-            _run_case(obj, "self_only", self_collision=True, volume=False, optimized=False),
-            _run_case(obj, "self_and_volume", self_collision=True, volume=True, optimized=False),
-            _run_case(obj, "optimized_self_and_volume", self_collision=True, volume=True, optimized=True),
+            _run_case(obj, label, self_collision=self_collision, volume=volume, optimized=optimized)
+            for label, self_collision, volume, optimized in case_specs
+            if not requested_cases or label in requested_cases
         ]
         print("SSBL_SUZANNE_BENCH", json.dumps(results, sort_keys=True))
     finally:

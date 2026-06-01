@@ -90,10 +90,37 @@ class _NativeRuntimeColliders(ctypes.Structure):
     ]
 
 
+class _NativeFrameInputs(ctypes.Structure):
+    _fields_ = [
+        ("update_pin_targets", ctypes.c_int),
+        ("pin_indices", ctypes.POINTER(ctypes.c_int)),
+        ("pin_positions", ctypes.POINTER(ctypes.c_float)),
+        ("pin_count", ctypes.c_int),
+        ("update_runtime_colliders", ctypes.c_int),
+        ("runtime_colliders", _NativeRuntimeColliders),
+        ("update_static_triangles", ctypes.c_int),
+        ("static_triangles", ctypes.POINTER(ctypes.c_float)),
+        ("static_triangle_count", ctypes.c_int),
+        ("update_dynamic_triangles", ctypes.c_int),
+        ("dynamic_triangles", ctypes.POINTER(ctypes.c_float)),
+        ("dynamic_triangle_count", ctypes.c_int),
+    ]
+
+
 class _NativeDiagnostics(ctypes.Structure):
     _fields_ = [
         ("step_ms", ctypes.c_float),
         ("hash_build_ms", ctypes.c_float),
+        ("constraints_ms", ctypes.c_float),
+        ("volume_ms", ctypes.c_float),
+        ("static_collision_ms", ctypes.c_float),
+        ("dynamic_collision_ms", ctypes.c_float),
+        ("self_hash_ms", ctypes.c_float),
+        ("self_solve_ms", ctypes.c_float),
+        ("self_probe_ms", ctypes.c_float),
+        ("self_recovery_ms", ctypes.c_float),
+        ("sync_ms", ctypes.c_float),
+        ("diagnostics_fetch_ms", ctypes.c_float),
         ("candidate_count", ctypes.c_longlong),
         ("resolved_contacts", ctypes.c_longlong),
         ("min_gap", ctypes.c_float),
@@ -115,6 +142,16 @@ class NativeStatus:
 class NativeStepDiagnostics:
     step_ms: float = 0.0
     hash_build_ms: float = 0.0
+    constraints_ms: float = 0.0
+    volume_ms: float = 0.0
+    static_collision_ms: float = 0.0
+    dynamic_collision_ms: float = 0.0
+    self_hash_ms: float = 0.0
+    self_solve_ms: float = 0.0
+    self_probe_ms: float = 0.0
+    self_recovery_ms: float = 0.0
+    sync_ms: float = 0.0
+    diagnostics_fetch_ms: float = 0.0
     candidate_count: int = 0
     resolved_contacts: int = 0
     min_gap: float | None = None
@@ -132,6 +169,8 @@ class NativeStepDiagnostics:
     cuda_step_call_ms: float = 0.0
     download_ms: float = 0.0
     writeback_ms: float = 0.0
+    frame_input_upload_ms: float = 0.0
+    writeback_performed: bool = False
     diagnostics_ms: float = 0.0
     viewport_tag_ms: float = 0.0
 
@@ -148,7 +187,7 @@ _LOAD_ERROR = ""
 
 def dll_path() -> str:
     root = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(root, "native", "bin", "ssbl_xpbd_cuda_abi22.dll")
+    return os.path.join(root, "native", "bin", "ssbl_xpbd_cuda_abi24.dll")
 
 
 def status() -> NativeStatus:
@@ -200,8 +239,19 @@ def _load_library():
     lib.ssbl_update_static_triangles.restype = ctypes.c_int
     lib.ssbl_update_dynamic_triangles.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int]
     lib.ssbl_update_dynamic_triangles.restype = ctypes.c_int
+    if hasattr(lib, "ssbl_update_frame_inputs"):
+        lib.ssbl_update_frame_inputs.argtypes = [ctypes.c_void_p, ctypes.POINTER(_NativeFrameInputs)]
+        lib.ssbl_update_frame_inputs.restype = ctypes.c_int
     lib.ssbl_step_solver.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
     lib.ssbl_step_solver.restype = ctypes.c_int
+    lib.ssbl_step_solver_ex.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
+    lib.ssbl_step_solver_ex.restype = ctypes.c_int
     lib.ssbl_download_positions.argtypes = [
         ctypes.c_void_p,
         ctypes.POINTER(ctypes.c_float),
@@ -384,10 +434,90 @@ class NativeXpbdSolver:
         ):
             raise NativeSolverError(_last_error(self._lib))
 
-    def step(self, substeps: int, iterations: int) -> None:
-        if not self._lib.ssbl_step_solver(self._handle, int(substeps), int(iterations)):
+    def update_frame_inputs(
+        self,
+        *,
+        pin_indices: np.ndarray | None,
+        pin_positions: np.ndarray | None,
+        update_pin: bool,
+        options: SolverOptions | None,
+        update_runtime: bool,
+        static_triangles: np.ndarray | None,
+        update_static: bool,
+        dynamic_triangles: np.ndarray | None,
+        update_dynamic: bool,
+    ) -> None:
+        if not hasattr(self._lib, "ssbl_update_frame_inputs"):
+            if update_pin:
+                self.update_pin_targets(
+                    np.asarray(pin_indices if pin_indices is not None else [], dtype=np.int32),
+                    np.asarray(pin_positions if pin_positions is not None else np.empty((0, 3), dtype=np.float32), dtype=np.float32),
+                )
+            if update_runtime and options is not None:
+                self.update_runtime_colliders(options)
+            if update_static and static_triangles is not None:
+                self.update_static_triangles(static_triangles)
+            if update_dynamic:
+                dyn = dynamic_triangles if dynamic_triangles is not None else np.empty((0, 3, 3), dtype=np.float32)
+                self.update_dynamic_triangles(dyn)
+            return
+
+        pin_indices_arr = np.ascontiguousarray(pin_indices if pin_indices is not None else np.empty(0, dtype=np.int32), dtype=np.int32)
+        pin_positions_arr = np.ascontiguousarray(
+            pin_positions if pin_positions is not None else np.empty((0, 3), dtype=np.float32),
+            dtype=np.float32,
+        )
+        static_triangle_count = int(len(static_triangles)) if static_triangles is not None else 0
+        dynamic_triangle_count = int(len(dynamic_triangles)) if dynamic_triangles is not None else 0
+        if update_dynamic and dynamic_triangle_count > 0:
+            if self._dynamic_triangle_count is None:
+                self._dynamic_triangle_count = dynamic_triangle_count
+            elif self._dynamic_triangle_count != dynamic_triangle_count:
+                raise NativeSolverError(
+                    f"鍔ㄦ€佸竷鏂欑鎾炰綋鎷撴墤鍙戠敓鍙樺寲锛氫笁瑙掑舰鏁伴噺浠?{self._dynamic_triangle_count} 鍙樹负 {dynamic_triangle_count}銆?"
+                )
+        static_arr = np.ascontiguousarray(
+            static_triangles.reshape((-1, 3)) if static_triangles is not None else np.empty((0, 3), dtype=np.float32),
+            dtype=np.float32,
+        )
+        dynamic_arr = np.ascontiguousarray(
+            dynamic_triangles.reshape((-1, 3)) if dynamic_triangles is not None else np.empty((0, 3), dtype=np.float32),
+            dtype=np.float32,
+        )
+        runtime_inputs = _runtime_colliders_from_options(options) if options is not None else self._runtime_colliders
+        frame_inputs = _NativeFrameInputs(
+            update_pin_targets=int(update_pin),
+            pin_indices=_as_int_ptr(pin_indices_arr),
+            pin_positions=_as_float_ptr(pin_positions_arr),
+            pin_count=int(len(pin_indices_arr)),
+            update_runtime_colliders=int(update_runtime),
+            runtime_colliders=runtime_inputs,
+            update_static_triangles=int(update_static),
+            static_triangles=_as_float_ptr(static_arr),
+            static_triangle_count=static_triangle_count,
+            update_dynamic_triangles=int(update_dynamic),
+            dynamic_triangles=_as_float_ptr(dynamic_arr),
+            dynamic_triangle_count=dynamic_triangle_count,
+        )
+        ok = self._lib.ssbl_update_frame_inputs(self._handle, ctypes.byref(frame_inputs))
+        if not ok:
             raise NativeSolverError(_last_error(self._lib))
-        self._last_diagnostics = self.diagnostics()
+        if update_runtime:
+            self._runtime_colliders = runtime_inputs
+
+    def step(self, substeps: int, iterations: int, diagnostics: bool = True, synchronize: bool = True) -> None:
+        fetch_diagnostics = 1 if diagnostics else 0
+        force_sync = 1 if (synchronize or diagnostics) else 0
+        if not self._lib.ssbl_step_solver_ex(
+            self._handle,
+            int(substeps),
+            int(iterations),
+            fetch_diagnostics,
+            force_sync,
+        ):
+            raise NativeSolverError(_last_error(self._lib))
+        if diagnostics:
+            self._last_diagnostics = self.diagnostics()
 
     def cached_diagnostics(self) -> NativeStepDiagnostics:
         return self._last_diagnostics
@@ -415,6 +545,16 @@ class NativeXpbdSolver:
         diag = NativeStepDiagnostics(
             step_ms=float(raw.step_ms),
             hash_build_ms=float(raw.hash_build_ms),
+            constraints_ms=float(raw.constraints_ms),
+            volume_ms=float(raw.volume_ms),
+            static_collision_ms=float(raw.static_collision_ms),
+            dynamic_collision_ms=float(raw.dynamic_collision_ms),
+            self_hash_ms=float(raw.self_hash_ms),
+            self_solve_ms=float(raw.self_solve_ms),
+            self_probe_ms=float(raw.self_probe_ms),
+            self_recovery_ms=float(raw.self_recovery_ms),
+            sync_ms=float(raw.sync_ms),
+            diagnostics_fetch_ms=float(raw.diagnostics_fetch_ms),
             candidate_count=int(raw.candidate_count),
             resolved_contacts=int(raw.resolved_contacts),
             min_gap=min_gap,
