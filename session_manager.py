@@ -100,6 +100,7 @@ class SceneSession:
     actual_fps: float
     last_diagnostics: NativeStepDiagnostics = field(default_factory=NativeStepDiagnostics)
     stop_requested: bool = False
+    closed: bool = False
 
     @property
     def cloth(self) -> ClothBuildData:
@@ -160,6 +161,8 @@ def record_viewport_tag_ms(object_name: str, elapsed_ms: float) -> None:
         self_recovery_ms=diag.self_recovery_ms,
         sync_ms=diag.sync_ms,
         diagnostics_fetch_ms=diag.diagnostics_fetch_ms,
+        self_vs_pair_build_ms=diag.self_vs_pair_build_ms,
+        self_vs_pair_project_ms=diag.self_vs_pair_project_ms,
         candidate_count=diag.candidate_count,
         resolved_contacts=diag.resolved_contacts,
         min_gap=diag.min_gap,
@@ -174,6 +177,10 @@ def record_viewport_tag_ms(object_name: str, elapsed_ms: float) -> None:
         self_suspect_regions=diag.self_suspect_regions,
         self_compaction_used=diag.self_compaction_used,
         self_full_recovery_fallbacks=diag.self_full_recovery_fallbacks,
+        self_vs_pair_count=diag.self_vs_pair_count,
+        self_vs_pair_capacity=diag.self_vs_pair_capacity,
+        self_vs_pair_overflow=diag.self_vs_pair_overflow,
+        self_vs_pair_compaction_used=diag.self_vs_pair_compaction_used,
         finite=diag.finite,
         frame_ms=diag.frame_ms,
         frame_set_ms=diag.frame_set_ms,
@@ -426,6 +433,41 @@ def _scene_key(scene: bpy.types.Scene) -> str:
 
 def _elapsed_ms(started: float) -> float:
     return (time.perf_counter() - started) * 1000.0
+
+
+def _rna_alive(value) -> bool:
+    if value is None:
+        return False
+    try:
+        value.as_pointer()
+        _ = value.name
+    except (ReferenceError, RuntimeError, AttributeError):
+        return False
+    return True
+
+
+def _same_mesh(a: bpy.types.Mesh | None, b: bpy.types.Mesh | None) -> bool:
+    if not _rna_alive(a) or not _rna_alive(b):
+        return False
+    try:
+        return int(a.as_pointer()) == int(b.as_pointer())
+    except (ReferenceError, RuntimeError, AttributeError):
+        return False
+
+
+def _safe_remove_mesh(mesh: bpy.types.Mesh | None) -> None:
+    if not _rna_alive(mesh):
+        return
+    try:
+        if int(mesh.users) != 0:
+            return
+        name = mesh.name
+        current = bpy.data.meshes.get(name)
+        if not _same_mesh(current, mesh):
+            return
+        bpy.data.meshes.remove(mesh)
+    except (ReferenceError, RuntimeError, AttributeError):
+        return
 
 
 def _array_equal(a: np.ndarray, b: np.ndarray) -> bool:
@@ -892,22 +934,36 @@ def _mesh_is_probably_closed(mesh: bpy.types.Mesh) -> bool:
 
 
 def _finish_session(session: SceneSession, status: str) -> None:
+    if session.closed:
+        return
+    session.closed = True
+    _SCENE_SESSIONS.pop(session.scene_name, None)
+    for slot_name in list(session.slots.keys()):
+        _OBJECT_TO_SCENE_SESSION.pop(slot_name, None)
+
     for slot in list(session.slots.values()):
         _LAST_DIAGNOSTICS[slot.object_name] = session.last_diagnostics
         obj = bpy.data.objects.get(slot.object_name)
-        if obj is not None and obj.type == "MESH" and obj.data == slot.preview_mesh:
-            obj.data = slot.original_mesh
-        if obj is not None:
+        if obj is not None and obj.type == "MESH" and _rna_alive(obj):
+            try:
+                if _same_mesh(obj.data, slot.preview_mesh) and _rna_alive(slot.original_mesh):
+                    obj.data = slot.original_mesh
+            except (ReferenceError, RuntimeError, AttributeError):
+                pass
             _restore_preview_modifiers(obj, slot.suspended_modifiers)
-        slot.native.close()
-        if slot.preview_mesh.users == 0:
-            bpy.data.meshes.remove(slot.preview_mesh)
-        _OBJECT_TO_SCENE_SESSION.pop(slot.object_name, None)
+        try:
+            slot.native.close()
+        except Exception:
+            pass
+        finally:
+            _safe_remove_mesh(slot.preview_mesh)
         _STATUS[slot.object_name] = status
     scene = bpy.data.scenes.get(session.scene_name)
     if scene is not None:
-        scene.frame_set(session.start_frame)
-    _SCENE_SESSIONS.pop(_scene_key(scene) if scene is not None else session.scene_name, None)
+        try:
+            scene.frame_set(session.start_frame)
+        except Exception:
+            pass
 
 
 def _suspend_preview_modifiers(obj: bpy.types.Object, suspend_all: bool = False) -> list[tuple[str, bool, bool]]:
@@ -951,14 +1007,20 @@ def _temporary_setting(settings, name: str, value):
 
 @contextmanager
 def _with_preview_source_state(slot: ClothSlot, obj: bpy.types.Object):
+    if not _rna_alive(obj) or not _rna_alive(slot.original_mesh):
+        raise ValueError(f"Missing preview source mesh: {slot.object_name}")
     if slot.use_evaluated_mesh:
         _restore_preview_modifiers(obj, slot.suspended_modifiers)
     obj.data = slot.original_mesh
     try:
         yield
     finally:
-        obj.data = slot.preview_mesh
-        _disable_suspended_modifiers(obj, slot.suspended_modifiers)
+        if _rna_alive(obj):
+            if _rna_alive(slot.preview_mesh):
+                obj.data = slot.preview_mesh
+                _disable_suspended_modifiers(obj, slot.suspended_modifiers)
+            elif _rna_alive(slot.original_mesh):
+                obj.data = slot.original_mesh
 
 
 @contextmanager
@@ -969,6 +1031,8 @@ def _with_session_source_state(session: SceneSession):
             obj = bpy.data.objects.get(slot.object_name)
             if obj is None or obj.type != "MESH":
                 raise ValueError(f"Missing preview object: {slot.object_name}")
+            if not _rna_alive(obj) or not _rna_alive(slot.original_mesh):
+                raise ValueError(f"Missing preview source mesh: {slot.object_name}")
             if slot.use_evaluated_mesh:
                 _restore_preview_modifiers(obj, slot.suspended_modifiers)
             obj.data = slot.original_mesh
@@ -976,8 +1040,13 @@ def _with_session_source_state(session: SceneSession):
         yield
     finally:
         for slot, obj in owned:
-            obj.data = slot.preview_mesh
-            _disable_suspended_modifiers(obj, slot.suspended_modifiers)
+            if not _rna_alive(obj):
+                continue
+            if not session.closed and _rna_alive(slot.preview_mesh):
+                obj.data = slot.preview_mesh
+                _disable_suspended_modifiers(obj, slot.suspended_modifiers)
+            elif _rna_alive(slot.original_mesh):
+                obj.data = slot.original_mesh
 
 
 def _apply_world_positions(
@@ -987,6 +1056,13 @@ def _apply_world_positions(
     local_buffer: np.ndarray | None = None,
     perf: FramePerf | None = None,
 ) -> None:
+    try:
+        mesh = obj.data if obj is not None and obj.type == "MESH" else None
+    except (ReferenceError, RuntimeError, AttributeError):
+        mesh = None
+    if not _rna_alive(mesh):
+        raise ValueError("Preview mesh is no longer valid; restart preview.")
+
     started = time.perf_counter()
     world = np.asarray(world_positions, dtype=np.float32)
     matrix_inv = np.asarray(matrix_world_inv, dtype=np.float32)
@@ -1003,12 +1079,12 @@ def _apply_world_positions(
 
     flat = local.reshape(-1)
     started = time.perf_counter()
-    obj.data.vertices.foreach_set("co", flat)
+    mesh.vertices.foreach_set("co", flat)
     if perf is not None:
         perf.writeback_foreach_set_ms += _elapsed_ms(started)
 
     started = time.perf_counter()
-    obj.data.update()
+    mesh.update()
     if perf is not None:
         perf.writeback_mesh_update_ms += _elapsed_ms(started)
 
@@ -1041,6 +1117,8 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
     self_recovery_ms = 0.0
     sync_ms = 0.0
     diagnostics_fetch_ms = 0.0
+    self_vs_pair_build_ms = 0.0
+    self_vs_pair_project_ms = 0.0
     frame_input_upload_ms = 0.0
     candidate_count = 0
     resolved_contacts = 0
@@ -1056,6 +1134,10 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
     self_suspect_regions = 0
     self_compaction_used = 0
     self_full_recovery_fallbacks = 0
+    self_vs_pair_count = 0
+    self_vs_pair_capacity = 0
+    self_vs_pair_overflow = 0
+    self_vs_pair_compaction_used = 0
     finite = True
     writeback_performed = False
     diag_started = time.perf_counter()
@@ -1073,6 +1155,8 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
         self_recovery_ms += float(diag.self_recovery_ms)
         sync_ms += float(diag.sync_ms)
         diagnostics_fetch_ms += float(diag.diagnostics_fetch_ms)
+        self_vs_pair_build_ms += float(diag.self_vs_pair_build_ms)
+        self_vs_pair_project_ms += float(diag.self_vs_pair_project_ms)
         frame_input_upload_ms += float(diag.frame_input_upload_ms)
         candidate_count += int(diag.candidate_count)
         resolved_contacts += int(diag.resolved_contacts)
@@ -1087,6 +1171,10 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
         self_suspect_regions += int(diag.self_suspect_regions)
         self_compaction_used += int(diag.self_compaction_used)
         self_full_recovery_fallbacks += int(diag.self_full_recovery_fallbacks)
+        self_vs_pair_count += int(diag.self_vs_pair_count)
+        self_vs_pair_capacity += int(diag.self_vs_pair_capacity)
+        self_vs_pair_overflow += int(diag.self_vs_pair_overflow)
+        self_vs_pair_compaction_used += int(diag.self_vs_pair_compaction_used)
         finite = finite and bool(diag.finite)
         writeback_performed = writeback_performed or bool(diag.writeback_performed)
         if diag.min_gap is not None:
@@ -1106,6 +1194,8 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
         self_recovery_ms=self_recovery_ms,
         sync_ms=sync_ms,
         diagnostics_fetch_ms=diagnostics_fetch_ms,
+        self_vs_pair_build_ms=self_vs_pair_build_ms,
+        self_vs_pair_project_ms=self_vs_pair_project_ms,
         frame_input_upload_ms=perf.frame_input_upload_ms if perf is not None else frame_input_upload_ms,
         candidate_count=candidate_count,
         resolved_contacts=resolved_contacts,
@@ -1121,6 +1211,10 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
         self_suspect_regions=self_suspect_regions,
         self_compaction_used=self_compaction_used,
         self_full_recovery_fallbacks=self_full_recovery_fallbacks,
+        self_vs_pair_count=self_vs_pair_count,
+        self_vs_pair_capacity=self_vs_pair_capacity,
+        self_vs_pair_overflow=self_vs_pair_overflow,
+        self_vs_pair_compaction_used=self_vs_pair_compaction_used,
         finite=finite,
         frame_ms=perf.frame_ms if perf is not None else 0.0,
         frame_set_ms=perf.frame_set_ms if perf is not None else 0.0,

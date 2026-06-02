@@ -99,6 +99,8 @@ class SSBL_PT_preview_panel(bpy.types.Panel):
             diag_box.label(text=f"self_solve_ms: {diagnostics.self_solve_ms:.2f}")
             diag_box.label(text=f"self_probe_ms: {diagnostics.self_probe_ms:.2f}")
             diag_box.label(text=f"self_recovery_ms: {diagnostics.self_recovery_ms:.2f}")
+            diag_box.label(text=f"vs_pair_build_ms: {diagnostics.self_vs_pair_build_ms:.2f}")
+            diag_box.label(text=f"vs_pair_project_ms: {diagnostics.self_vs_pair_project_ms:.2f}")
             diag_box.label(text=f"sync_ms: {diagnostics.sync_ms:.2f}")
             diag_box.label(text=f"native_diag_fetch_ms: {diagnostics.diagnostics_fetch_ms:.2f}")
             diag_box.label(text=f"frame_input_upload_ms: {diagnostics.frame_input_upload_ms:.2f}")
@@ -130,6 +132,9 @@ class SSBL_PT_preview_panel(bpy.types.Panel):
             diag_box.label(text=f"suspect_regions：{diagnostics.self_suspect_regions}")
             diag_box.label(text=f"compaction_used：{diagnostics.self_compaction_used}")
             diag_box.label(text=f"full_recovery_fallbacks：{diagnostics.self_full_recovery_fallbacks}")
+            diag_box.label(text=f"vs_pair_count：{diagnostics.self_vs_pair_count}/{diagnostics.self_vs_pair_capacity}")
+            diag_box.label(text=f"vs_pair_overflow：{diagnostics.self_vs_pair_overflow}")
+            diag_box.label(text=f"vs_pair_used：{diagnostics.self_vs_pair_compaction_used}")
             diag_box.label(text=f"finite_flag：{1 if diagnostics.finite else 0}")
 
             tuning_box = advanced_box.box()
@@ -144,11 +149,10 @@ class SSBL_PT_preview_panel(bpy.types.Panel):
                 tuning_box.prop(settings, "max_self_collision_neighbors")
                 tuning_box.prop(settings, "self_probe_interval")
                 tuning_box.prop(settings, "self_surface_pair_interval")
-                if settings.self_collision_mode == "fast":
-                    tuning_box.prop(settings, "self_sleep_enabled")
-                    if settings.self_sleep_enabled:
-                        tuning_box.prop(settings, "self_sleep_still_frames")
-                        tuning_box.prop(settings, "self_sleep_full_scan_interval")
+                tuning_box.prop(settings, "self_sleep_enabled")
+                if settings.self_sleep_enabled:
+                    tuning_box.prop(settings, "self_sleep_still_frames")
+                    tuning_box.prop(settings, "self_sleep_full_scan_interval")
             if settings.use_volume_pressure:
                 tuning_box.prop(settings, "volume_compliance")
                 tuning_box.prop(settings, "volume_solve_interval")

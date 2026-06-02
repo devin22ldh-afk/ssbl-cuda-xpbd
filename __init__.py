@@ -28,19 +28,21 @@ from .xpbd_core import DEFAULT_HARDNESS, sync_hardness_settings
 
 def _apply_self_collision_mode(settings, _context):
     mode = settings.self_collision_mode
-    if mode == "fast":
+    if mode != "off":
         settings.self_collision_interval = 2
         settings.max_self_collision_neighbors = 16
         settings.self_probe_interval = 8
         settings.self_surface_pair_interval = 8
         settings.self_sleep_enabled = True
-        settings.self_sleep_still_frames = 5
+        settings.self_sleep_still_frames = 10
         settings.self_sleep_full_scan_interval = 30
         settings.self_compaction_enabled = True
+        settings.self_pair_compaction_enabled = True
         settings.self_sleep_motion_scale = 1.0
         settings.self_compaction_active_fraction_threshold = 0.75
     else:
         settings.self_sleep_enabled = False
+        settings.self_pair_compaction_enabled = False
 
 
 def _apply_hardness(settings, _context):
@@ -334,7 +336,7 @@ class SSBL_PreviewSettings(PropertyGroup):
     )
     self_sleep_still_frames: IntProperty(
         name="静止帧数",
-        default=5,
+        default=10,
         min=1,
         max=60,
         description="局部区域连续多少个 solver frame 低运动量后进入自碰撞休眠",
@@ -367,6 +369,12 @@ class SSBL_PreviewSettings(PropertyGroup):
         max=1.0,
         options={"HIDDEN"},
         description="Internal active source fraction below which compacted self-collision lists are used",
+    )
+    self_pair_compaction_enabled: BoolProperty(
+        name="Vertex-surface pair compaction",
+        default=True,
+        options={"HIDDEN"},
+        description="Internal preview vertex-surface pair compaction for self-collision solve/probe/recovery",
     )
     use_ground: BoolProperty(
         name="地面平面",

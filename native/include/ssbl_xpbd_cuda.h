@@ -54,6 +54,7 @@ typedef struct SsblXpbdConfig {
     int self_compaction_enabled;
     float self_sleep_motion_scale;
     float self_compaction_active_fraction_threshold;
+    int self_pair_compaction_enabled;
 } SsblXpbdConfig;
 
 typedef struct SsblXpbdDiagnostics {
@@ -69,6 +70,8 @@ typedef struct SsblXpbdDiagnostics {
     float self_recovery_ms;
     float sync_ms;
     float diagnostics_fetch_ms;
+    float self_vs_pair_build_ms;
+    float self_vs_pair_project_ms;
     long long candidate_count;
     long long resolved_contacts;
     float min_gap;
@@ -83,6 +86,10 @@ typedef struct SsblXpbdDiagnostics {
     long long self_suspect_regions;
     long long self_compaction_used;
     long long self_full_recovery_fallbacks;
+    long long self_vs_pair_count;
+    long long self_vs_pair_capacity;
+    long long self_vs_pair_overflow;
+    long long self_vs_pair_compaction_used;
     int finite_flag;
 } SsblXpbdDiagnostics;
 

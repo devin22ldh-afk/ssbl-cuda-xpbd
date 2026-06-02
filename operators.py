@@ -108,7 +108,9 @@ class SSBL_OT_start_preview(bpy.types.Operator):
 
         viewport_started = time.perf_counter()
         _tag_viewports(context)
-        solver.record_viewport_tag_ms(self._object_name, (time.perf_counter() - viewport_started) * 1000.0)
+        obj = bpy.data.objects.get(self._object_name)
+        if solver.has_session(obj):
+            solver.record_viewport_tag_ms(self._object_name, (time.perf_counter() - viewport_started) * 1000.0)
         if not finished:
             return {"RUNNING_MODAL"}
 
@@ -116,7 +118,6 @@ class SSBL_OT_start_preview(bpy.types.Operator):
             context.window_manager.event_timer_remove(self._timer)
             self._timer = None
         _remove_fps_overlay(self._object_name)
-        obj = bpy.data.objects.get(self._object_name)
         self.report({"INFO"}, solver.session_status(obj))
         return {"FINISHED"}
 

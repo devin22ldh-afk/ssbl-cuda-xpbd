@@ -62,6 +62,7 @@ class _NativeConfig(ctypes.Structure):
         ("self_compaction_enabled", ctypes.c_int),
         ("self_sleep_motion_scale", ctypes.c_float),
         ("self_compaction_active_fraction_threshold", ctypes.c_float),
+        ("self_pair_compaction_enabled", ctypes.c_int),
     ]
 
 
@@ -127,6 +128,8 @@ class _NativeDiagnostics(ctypes.Structure):
         ("self_recovery_ms", ctypes.c_float),
         ("sync_ms", ctypes.c_float),
         ("diagnostics_fetch_ms", ctypes.c_float),
+        ("self_vs_pair_build_ms", ctypes.c_float),
+        ("self_vs_pair_project_ms", ctypes.c_float),
         ("candidate_count", ctypes.c_longlong),
         ("resolved_contacts", ctypes.c_longlong),
         ("min_gap", ctypes.c_float),
@@ -141,6 +144,10 @@ class _NativeDiagnostics(ctypes.Structure):
         ("self_suspect_regions", ctypes.c_longlong),
         ("self_compaction_used", ctypes.c_longlong),
         ("self_full_recovery_fallbacks", ctypes.c_longlong),
+        ("self_vs_pair_count", ctypes.c_longlong),
+        ("self_vs_pair_capacity", ctypes.c_longlong),
+        ("self_vs_pair_overflow", ctypes.c_longlong),
+        ("self_vs_pair_compaction_used", ctypes.c_longlong),
         ("finite_flag", ctypes.c_int),
     ]
 
@@ -166,6 +173,8 @@ class NativeStepDiagnostics:
     self_recovery_ms: float = 0.0
     sync_ms: float = 0.0
     diagnostics_fetch_ms: float = 0.0
+    self_vs_pair_build_ms: float = 0.0
+    self_vs_pair_project_ms: float = 0.0
     candidate_count: int = 0
     resolved_contacts: int = 0
     min_gap: float | None = None
@@ -180,6 +189,10 @@ class NativeStepDiagnostics:
     self_suspect_regions: int = 0
     self_compaction_used: int = 0
     self_full_recovery_fallbacks: int = 0
+    self_vs_pair_count: int = 0
+    self_vs_pair_capacity: int = 0
+    self_vs_pair_overflow: int = 0
+    self_vs_pair_compaction_used: int = 0
     finite: bool = True
     frame_ms: float = 0.0
     frame_set_ms: float = 0.0
@@ -212,7 +225,7 @@ _LOAD_ERROR = ""
 
 def dll_path() -> str:
     root = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(root, "native", "bin", "ssbl_xpbd_cuda_abi28.dll")
+    return os.path.join(root, "native", "bin", "ssbl_xpbd_cuda_abi29.dll")
 
 
 def status() -> NativeStatus:
@@ -359,6 +372,7 @@ def _config_from_options(
     cfg.self_compaction_enabled = int(options.self_compaction_enabled)
     cfg.self_sleep_motion_scale = float(options.self_sleep_motion_scale)
     cfg.self_compaction_active_fraction_threshold = float(options.self_compaction_active_fraction_threshold)
+    cfg.self_pair_compaction_enabled = int(options.self_pair_compaction_enabled)
     return cfg
 
 
@@ -586,6 +600,8 @@ class NativeXpbdSolver:
             self_recovery_ms=float(raw.self_recovery_ms),
             sync_ms=float(raw.sync_ms),
             diagnostics_fetch_ms=float(raw.diagnostics_fetch_ms),
+            self_vs_pair_build_ms=float(raw.self_vs_pair_build_ms),
+            self_vs_pair_project_ms=float(raw.self_vs_pair_project_ms),
             candidate_count=int(raw.candidate_count),
             resolved_contacts=int(raw.resolved_contacts),
             min_gap=min_gap,
@@ -600,6 +616,10 @@ class NativeXpbdSolver:
             self_suspect_regions=int(raw.self_suspect_regions),
             self_compaction_used=int(raw.self_compaction_used),
             self_full_recovery_fallbacks=int(raw.self_full_recovery_fallbacks),
+            self_vs_pair_count=int(raw.self_vs_pair_count),
+            self_vs_pair_capacity=int(raw.self_vs_pair_capacity),
+            self_vs_pair_overflow=int(raw.self_vs_pair_overflow),
+            self_vs_pair_compaction_used=int(raw.self_vs_pair_compaction_used),
             finite=bool(raw.finite_flag),
         )
         self._last_diagnostics = diag

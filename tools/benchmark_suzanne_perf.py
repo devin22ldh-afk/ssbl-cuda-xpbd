@@ -111,12 +111,15 @@ def _configure(settings, *, self_collision: bool, volume: bool, optimized: bool)
         else 1
     )
     settings.self_sleep_enabled = bool(
-        _int_env("SSBL_SUZANNE_SELF_SLEEP_ENABLED", 1 if optimized and self_collision else 0)
+        _int_env("SSBL_SUZANNE_SELF_SLEEP_ENABLED", 1 if self_collision else 0)
     )
     settings.self_sleep_still_frames = _int_env("SSBL_SUZANNE_SELF_SLEEP_STILL_FRAMES", 10)
     settings.self_sleep_full_scan_interval = _int_env("SSBL_SUZANNE_SELF_SLEEP_FULL_SCAN_INTERVAL", 30)
     settings.self_compaction_enabled = bool(
-        _int_env("SSBL_SUZANNE_SELF_COMPACTION_ENABLED", 1 if optimized and self_collision else 0)
+        _int_env("SSBL_SUZANNE_SELF_COMPACTION_ENABLED", 1 if self_collision else 0)
+    )
+    settings.self_pair_compaction_enabled = bool(
+        _int_env("SSBL_SUZANNE_SELF_PAIR_COMPACTION_ENABLED", 1 if self_collision else 0)
     )
     settings.self_sleep_motion_scale = _float_env("SSBL_SUZANNE_SELF_SLEEP_MOTION_SCALE", 1.0)
     settings.self_compaction_active_fraction_threshold = _float_env(
@@ -232,6 +235,8 @@ def _run_case(obj: bpy.types.Object, label: str, *, self_collision: bool, volume
         "self_solve_ms": round(float(diag.self_solve_ms), 2),
         "self_probe_ms": round(float(diag.self_probe_ms), 2),
         "self_recovery_ms": round(float(diag.self_recovery_ms), 2),
+        "self_vs_pair_build_ms": round(float(diag.self_vs_pair_build_ms), 2),
+        "self_vs_pair_project_ms": round(float(diag.self_vs_pair_project_ms), 2),
         "sync_ms": round(float(diag.sync_ms), 2),
         "native_diag_fetch_ms": round(float(diag.diagnostics_fetch_ms), 2),
         "frame_ms": round(float(diag.frame_ms), 2),
@@ -267,6 +272,10 @@ def _run_case(obj: bpy.types.Object, label: str, *, self_collision: bool, volume
         "self_suspect_regions": int(diag.self_suspect_regions),
         "self_compaction_used": int(diag.self_compaction_used),
         "self_full_recovery_fallbacks": int(diag.self_full_recovery_fallbacks),
+        "self_vs_pair_count": int(diag.self_vs_pair_count),
+        "self_vs_pair_capacity": int(diag.self_vs_pair_capacity),
+        "self_vs_pair_overflow": int(diag.self_vs_pair_overflow),
+        "self_vs_pair_compaction_used": int(diag.self_vs_pair_compaction_used),
     }
 
 

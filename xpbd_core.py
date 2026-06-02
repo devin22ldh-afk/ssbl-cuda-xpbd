@@ -60,6 +60,7 @@ class SolverOptions:
     self_compaction_enabled: bool
     self_sleep_motion_scale: float
     self_compaction_active_fraction_threshold: float
+    self_pair_compaction_enabled: bool
 
 
 @dataclass
@@ -503,13 +504,17 @@ def settings_to_options(settings) -> SolverOptions:
         mode_name = "fast"
     mode_value = {"off": SELF_COLLISION_OFF, "fast": SELF_COLLISION_FAST}.get(mode_name, SELF_COLLISION_OFF)
 
-    run_mode = str(getattr(settings, "run_mode", "preview")).lower()
+    run_mode = str(getattr(settings, "runtime_mode", getattr(settings, "run_mode", "preview"))).lower()
     self_sleep_enabled = (
         run_mode == "preview"
-        and mode_value == SELF_COLLISION_FAST
+        and mode_value > SELF_COLLISION_OFF
         and bool(getattr(settings, "self_sleep_enabled", False))
     )
     self_compaction_enabled = self_sleep_enabled and bool(getattr(settings, "self_compaction_enabled", True))
+    self_pair_compaction_enabled = (
+        self_compaction_enabled
+        and bool(getattr(settings, "self_pair_compaction_enabled", True))
+    )
 
     return SolverOptions(
         dt=float(settings.dt),
@@ -547,4 +552,5 @@ def settings_to_options(settings) -> SolverOptions:
         self_compaction_active_fraction_threshold=float(
             getattr(settings, "self_compaction_active_fraction_threshold", 0.75)
         ),
+        self_pair_compaction_enabled=self_pair_compaction_enabled,
     )
