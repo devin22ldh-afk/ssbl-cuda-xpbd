@@ -18,7 +18,7 @@ target_include_directories(ssbl_xpbd_cuda
 )
 
 set_target_properties(ssbl_xpbd_cuda PROPERTIES
-    OUTPUT_NAME ssbl_xpbd_cuda_abi25
+    OUTPUT_NAME ssbl_xpbd_cuda_abi28
     CUDA_ARCHITECTURES 89
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RUNTIME_LIBRARY Static

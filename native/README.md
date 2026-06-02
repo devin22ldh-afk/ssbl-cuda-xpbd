@@ -1,7 +1,7 @@
 # SSBL Native CUDA XPBD Backend
 
 This directory contains the native CUDA solver used by the Blender add-on.
-The add-on loads `native/bin/ssbl_xpbd_cuda_abi25.dll` through `ctypes`.
+The add-on loads `native/bin/ssbl_xpbd_cuda_abi28.dll` through `ctypes`.
 
 ## Windows prerequisites
 
@@ -20,7 +20,7 @@ Open a Visual Studio 2022 Developer PowerShell, then run:
 The expected output DLL is:
 
 ```text
-native/bin/ssbl_xpbd_cuda_abi25.dll
+native/bin/ssbl_xpbd_cuda_abi28.dll
 ```
 
 If Blender reports that the CUDA solver DLL is missing, build this native backend first.

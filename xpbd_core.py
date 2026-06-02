@@ -54,6 +54,12 @@ class SolverOptions:
     volume_solve_interval: int
     self_probe_interval: int
     self_surface_pair_interval: int
+    self_sleep_enabled: bool
+    self_sleep_still_frames: int
+    self_sleep_full_scan_interval: int
+    self_compaction_enabled: bool
+    self_sleep_motion_scale: float
+    self_compaction_active_fraction_threshold: float
 
 
 @dataclass
@@ -497,6 +503,14 @@ def settings_to_options(settings) -> SolverOptions:
         mode_name = "fast"
     mode_value = {"off": SELF_COLLISION_OFF, "fast": SELF_COLLISION_FAST}.get(mode_name, SELF_COLLISION_OFF)
 
+    run_mode = str(getattr(settings, "run_mode", "preview")).lower()
+    self_sleep_enabled = (
+        run_mode == "preview"
+        and mode_value == SELF_COLLISION_FAST
+        and bool(getattr(settings, "self_sleep_enabled", False))
+    )
+    self_compaction_enabled = self_sleep_enabled and bool(getattr(settings, "self_compaction_enabled", True))
+
     return SolverOptions(
         dt=float(settings.dt),
         damping=float(settings.damping),
@@ -525,4 +539,12 @@ def settings_to_options(settings) -> SolverOptions:
         volume_solve_interval=max(int(getattr(settings, "volume_solve_interval", 1)), 1),
         self_probe_interval=max(int(getattr(settings, "self_probe_interval", 1)), 1),
         self_surface_pair_interval=max(int(getattr(settings, "self_surface_pair_interval", 1)), 1),
+        self_sleep_enabled=self_sleep_enabled,
+        self_sleep_still_frames=max(int(getattr(settings, "self_sleep_still_frames", 10)), 1),
+        self_sleep_full_scan_interval=max(int(getattr(settings, "self_sleep_full_scan_interval", 30)), 1),
+        self_compaction_enabled=self_compaction_enabled,
+        self_sleep_motion_scale=float(getattr(settings, "self_sleep_motion_scale", 1.0 if self_sleep_enabled else 0.25)),
+        self_compaction_active_fraction_threshold=float(
+            getattr(settings, "self_compaction_active_fraction_threshold", 0.75)
+        ),
     )

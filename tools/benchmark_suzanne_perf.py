@@ -25,6 +25,16 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
+def _float_env(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
 def _p95(values: list[float]) -> float | None:
     if not values:
         return None
@@ -99,6 +109,19 @@ def _configure(settings, *, self_collision: bool, volume: bool, optimized: bool)
         _int_env("SSBL_SUZANNE_SELF_SURFACE_PAIR_INTERVAL", 4 if optimized and self_collision else 1)
         if self_collision
         else 1
+    )
+    settings.self_sleep_enabled = bool(
+        _int_env("SSBL_SUZANNE_SELF_SLEEP_ENABLED", 1 if optimized and self_collision else 0)
+    )
+    settings.self_sleep_still_frames = _int_env("SSBL_SUZANNE_SELF_SLEEP_STILL_FRAMES", 10)
+    settings.self_sleep_full_scan_interval = _int_env("SSBL_SUZANNE_SELF_SLEEP_FULL_SCAN_INTERVAL", 30)
+    settings.self_compaction_enabled = bool(
+        _int_env("SSBL_SUZANNE_SELF_COMPACTION_ENABLED", 1 if optimized and self_collision else 0)
+    )
+    settings.self_sleep_motion_scale = _float_env("SSBL_SUZANNE_SELF_SLEEP_MOTION_SCALE", 1.0)
+    settings.self_compaction_active_fraction_threshold = _float_env(
+        "SSBL_SUZANNE_COMPACTION_ACTIVE_FRACTION",
+        0.75,
     )
     settings.use_volume_pressure = bool(volume)
     settings.volume_solve_interval = 2 if optimized and volume else 1
@@ -236,6 +259,14 @@ def _run_case(obj: bpy.types.Object, label: str, *, self_collision: bool, volume
         "ccd_clamp_count": int(diag.ccd_clamp_count),
         "recovery_passes": int(diag.recovery_passes),
         "local_retry_count": int(diag.local_retry_count),
+        "self_active_regions": int(diag.self_active_regions),
+        "self_sleeping_regions": int(diag.self_sleeping_regions),
+        "self_skipped_sources": int(diag.self_skipped_sources),
+        "self_active_vertices": int(diag.self_active_vertices),
+        "self_active_samples": int(diag.self_active_samples),
+        "self_suspect_regions": int(diag.self_suspect_regions),
+        "self_compaction_used": int(diag.self_compaction_used),
+        "self_full_recovery_fallbacks": int(diag.self_full_recovery_fallbacks),
     }
 
 

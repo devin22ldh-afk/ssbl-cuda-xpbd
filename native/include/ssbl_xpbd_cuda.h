@@ -48,6 +48,12 @@ typedef struct SsblXpbdConfig {
     int volume_solve_interval;
     int self_probe_interval;
     int self_surface_pair_interval;
+    int self_sleep_enabled;
+    int self_sleep_still_frames;
+    int self_sleep_full_scan_interval;
+    int self_compaction_enabled;
+    float self_sleep_motion_scale;
+    float self_compaction_active_fraction_threshold;
 } SsblXpbdConfig;
 
 typedef struct SsblXpbdDiagnostics {
@@ -69,6 +75,14 @@ typedef struct SsblXpbdDiagnostics {
     long long ccd_clamp_count;
     long long recovery_passes;
     long long local_retry_count;
+    long long self_active_regions;
+    long long self_sleeping_regions;
+    long long self_skipped_sources;
+    long long self_active_vertices;
+    long long self_active_samples;
+    long long self_suspect_regions;
+    long long self_compaction_used;
+    long long self_full_recovery_fallbacks;
     int finite_flag;
 } SsblXpbdDiagnostics;
 

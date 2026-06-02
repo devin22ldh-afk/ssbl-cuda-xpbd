@@ -56,6 +56,12 @@ class _NativeConfig(ctypes.Structure):
         ("volume_solve_interval", ctypes.c_int),
         ("self_probe_interval", ctypes.c_int),
         ("self_surface_pair_interval", ctypes.c_int),
+        ("self_sleep_enabled", ctypes.c_int),
+        ("self_sleep_still_frames", ctypes.c_int),
+        ("self_sleep_full_scan_interval", ctypes.c_int),
+        ("self_compaction_enabled", ctypes.c_int),
+        ("self_sleep_motion_scale", ctypes.c_float),
+        ("self_compaction_active_fraction_threshold", ctypes.c_float),
     ]
 
 
@@ -127,6 +133,14 @@ class _NativeDiagnostics(ctypes.Structure):
         ("ccd_clamp_count", ctypes.c_longlong),
         ("recovery_passes", ctypes.c_longlong),
         ("local_retry_count", ctypes.c_longlong),
+        ("self_active_regions", ctypes.c_longlong),
+        ("self_sleeping_regions", ctypes.c_longlong),
+        ("self_skipped_sources", ctypes.c_longlong),
+        ("self_active_vertices", ctypes.c_longlong),
+        ("self_active_samples", ctypes.c_longlong),
+        ("self_suspect_regions", ctypes.c_longlong),
+        ("self_compaction_used", ctypes.c_longlong),
+        ("self_full_recovery_fallbacks", ctypes.c_longlong),
         ("finite_flag", ctypes.c_int),
     ]
 
@@ -158,6 +172,14 @@ class NativeStepDiagnostics:
     ccd_clamp_count: int = 0
     recovery_passes: int = 0
     local_retry_count: int = 0
+    self_active_regions: int = 0
+    self_sleeping_regions: int = 0
+    self_skipped_sources: int = 0
+    self_active_vertices: int = 0
+    self_active_samples: int = 0
+    self_suspect_regions: int = 0
+    self_compaction_used: int = 0
+    self_full_recovery_fallbacks: int = 0
     finite: bool = True
     frame_ms: float = 0.0
     frame_set_ms: float = 0.0
@@ -190,7 +212,7 @@ _LOAD_ERROR = ""
 
 def dll_path() -> str:
     root = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(root, "native", "bin", "ssbl_xpbd_cuda_abi25.dll")
+    return os.path.join(root, "native", "bin", "ssbl_xpbd_cuda_abi28.dll")
 
 
 def status() -> NativeStatus:
@@ -331,6 +353,12 @@ def _config_from_options(
     cfg.volume_solve_interval = int(options.volume_solve_interval)
     cfg.self_probe_interval = int(options.self_probe_interval)
     cfg.self_surface_pair_interval = int(options.self_surface_pair_interval)
+    cfg.self_sleep_enabled = int(options.self_sleep_enabled)
+    cfg.self_sleep_still_frames = int(options.self_sleep_still_frames)
+    cfg.self_sleep_full_scan_interval = int(options.self_sleep_full_scan_interval)
+    cfg.self_compaction_enabled = int(options.self_compaction_enabled)
+    cfg.self_sleep_motion_scale = float(options.self_sleep_motion_scale)
+    cfg.self_compaction_active_fraction_threshold = float(options.self_compaction_active_fraction_threshold)
     return cfg
 
 
@@ -564,6 +592,14 @@ class NativeXpbdSolver:
             ccd_clamp_count=int(raw.ccd_clamp_count),
             recovery_passes=int(raw.recovery_passes),
             local_retry_count=int(raw.local_retry_count),
+            self_active_regions=int(raw.self_active_regions),
+            self_sleeping_regions=int(raw.self_sleeping_regions),
+            self_skipped_sources=int(raw.self_skipped_sources),
+            self_active_vertices=int(raw.self_active_vertices),
+            self_active_samples=int(raw.self_active_samples),
+            self_suspect_regions=int(raw.self_suspect_regions),
+            self_compaction_used=int(raw.self_compaction_used),
+            self_full_recovery_fallbacks=int(raw.self_full_recovery_fallbacks),
             finite=bool(raw.finite_flag),
         )
         self._last_diagnostics = diag

@@ -29,32 +29,18 @@ from .xpbd_core import DEFAULT_HARDNESS, sync_hardness_settings
 def _apply_self_collision_mode(settings, _context):
     mode = settings.self_collision_mode
     if mode == "fast":
-        settings.self_collision_interval = 4
-        settings.max_self_collision_neighbors = 32
-        settings.self_probe_interval = 16
-        settings.self_surface_pair_interval = 4
-
-
-def _apply_solver_preset(settings, _context):
-    preset = settings.solver_preset
-    if preset == "fast":
-        settings.substeps = 8
-        settings.iterations = 1
-        settings.preview_writeback_interval = 4
-        settings.volume_solve_interval = 2
-        settings.self_collision_interval = 4
-        settings.self_probe_interval = 16
-        settings.self_surface_pair_interval = 4
-    elif preset == "stable":
-        settings.substeps = 16
-        settings.iterations = 2
-        settings.preview_writeback_interval = 1
-        settings.volume_solve_interval = 1
+        settings.self_collision_interval = 2
+        settings.max_self_collision_neighbors = 16
+        settings.self_probe_interval = 8
+        settings.self_surface_pair_interval = 8
+        settings.self_sleep_enabled = True
+        settings.self_sleep_still_frames = 5
+        settings.self_sleep_full_scan_interval = 30
+        settings.self_compaction_enabled = True
+        settings.self_sleep_motion_scale = 1.0
+        settings.self_compaction_active_fraction_threshold = 0.75
     else:
-        settings.substeps = 12
-        settings.iterations = 1
-        settings.preview_writeback_interval = 1
-        settings.volume_solve_interval = 1
+        settings.self_sleep_enabled = False
 
 
 def _apply_hardness(settings, _context):
@@ -85,17 +71,6 @@ class SSBL_PreviewSettings(PropertyGroup):
         ],
         default="preview",
         description="选择实时预览或 PC2 缓存烘焙模式",
-    )
-    solver_preset: EnumProperty(
-        name="解算质量预设",
-        items=[
-            ("fast", "快速预览", "为较轻网格优化的小步预览配置"),
-            ("balanced", "平衡", "默认的小步 XPBD 布料设置"),
-            ("stable", "稳定布料", "为更复杂布料和碰撞场景提供更多子步"),
-        ],
-        default="balanced",
-        update=_apply_solver_preset,
-        description="应用推荐的解算质量配置，只调整稳定性和性能相关参数",
     )
     hardness: FloatProperty(
         name="硬度",
@@ -171,7 +146,7 @@ class SSBL_PreviewSettings(PropertyGroup):
     )
     dt: FloatProperty(
         name="时间步长",
-        default=1.0 / 60.0,
+        default=0.02,
         min=1e-4,
         soft_max=0.1,
         subtype="TIME",
@@ -179,21 +154,21 @@ class SSBL_PreviewSettings(PropertyGroup):
     )
     substeps: IntProperty(
         name="子步数",
-        default=12,
+        default=14,
         min=1,
         soft_max=32,
         description="每帧的 XPBD 子步数量",
     )
     iterations: IntProperty(
         name="迭代次数",
-        default=1,
+        default=2,
         min=1,
         soft_max=128,
         description="每个子步的约束投影迭代次数",
     )
     damping: FloatProperty(
         name="速度阻尼",
-        default=0.995,
+        default=1.0,
         min=0.0,
         max=1.0,
         description="每个子步施加的速度阻尼",
@@ -312,7 +287,7 @@ class SSBL_PreviewSettings(PropertyGroup):
             ("off", "关闭", "关闭布料自碰撞"),
             ("fast", "快速", "使用受限顶点空间哈希自碰撞"),
         ],
-        default="off",
+        default="fast",
         update=_apply_self_collision_mode,
         description="面向大规模布料网格调优的自碰撞模式",
     )
@@ -326,31 +301,72 @@ class SSBL_PreviewSettings(PropertyGroup):
     )
     self_collision_interval: IntProperty(
         name="自碰撞间隔",
-        default=1,
+        default=2,
         min=1,
         soft_max=8,
         description="每 N 个子步运行一次自碰撞；快速模式通常用 2 即可",
     )
     max_self_collision_neighbors: IntProperty(
         name="最大自碰撞邻居数",
-        default=128,
+        default=16,
         min=4,
         soft_max=256,
         description="每个顶点或边在自碰撞中允许处理的最大邻居候选数",
     )
     self_probe_interval: IntProperty(
         name="Self probe interval",
-        default=1,
+        default=8,
         min=1,
         soft_max=8,
         description="Run expensive self-collision probe/recovery every N self-collision passes; 1 preserves the original behavior",
     )
     self_surface_pair_interval: IntProperty(
         name="Surface pair interval",
-        default=1,
+        default=8,
         min=1,
         soft_max=8,
         description="Run sample-sample self-collision every N self-collision passes; 1 preserves the original behavior",
+    )
+    self_sleep_enabled: BoolProperty(
+        name="局部休眠",
+        default=True,
+        description="快速预览中让连续静止的局部区域跳过主动自碰撞查询",
+    )
+    self_sleep_still_frames: IntProperty(
+        name="静止帧数",
+        default=5,
+        min=1,
+        max=60,
+        description="局部区域连续多少个 solver frame 低运动量后进入自碰撞休眠",
+    )
+    self_sleep_full_scan_interval: IntProperty(
+        name="强制复查间隔",
+        default=30,
+        min=1,
+        max=240,
+        description="每隔多少个 solver frame 强制唤醒并完整复查一次局部自碰撞",
+    )
+    self_compaction_enabled: BoolProperty(
+        name="Active compaction",
+        default=True,
+        options={"HIDDEN"},
+        description="Internal fast-preview source-list compaction for sleeping self-collision regions",
+    )
+    self_sleep_motion_scale: FloatProperty(
+        name="Self sleep motion scale",
+        default=1.0,
+        min=0.05,
+        max=4.0,
+        options={"HIDDEN"},
+        description="Internal multiplier for cloth-thickness-based local self-sleep motion threshold",
+    )
+    self_compaction_active_fraction_threshold: FloatProperty(
+        name="Self compaction active fraction",
+        default=0.75,
+        min=0.01,
+        max=1.0,
+        options={"HIDDEN"},
+        description="Internal active source fraction below which compacted self-collision lists are used",
     )
     use_ground: BoolProperty(
         name="地面平面",

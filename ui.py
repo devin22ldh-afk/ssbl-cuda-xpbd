@@ -34,7 +34,6 @@ class SSBL_PT_preview_panel(bpy.types.Panel):
         runtime_box = layout.box()
         runtime_box.label(text="运行")
         runtime_box.prop(settings, "runtime_mode")
-        runtime_box.prop(settings, "solver_preset")
         runtime_box.prop(settings, "preview_target_fps")
         runtime_box.prop(settings, "preview_writeback_interval")
         runtime_box.prop(settings, "use_evaluated_mesh")
@@ -124,6 +123,13 @@ class SSBL_PT_preview_panel(bpy.types.Panel):
             diag_box.label(text=f"ccd_clamp_count：{diagnostics.ccd_clamp_count}")
             diag_box.label(text=f"recovery_passes：{diagnostics.recovery_passes}")
             diag_box.label(text=f"local_retry_count：{diagnostics.local_retry_count}")
+            diag_box.label(text=f"sleep_regions：{diagnostics.self_sleeping_regions}/{diagnostics.self_active_regions + diagnostics.self_sleeping_regions}")
+            diag_box.label(text=f"skipped_self_sources：{diagnostics.self_skipped_sources}")
+            diag_box.label(text=f"active_vertices：{diagnostics.self_active_vertices}")
+            diag_box.label(text=f"active_samples：{diagnostics.self_active_samples}")
+            diag_box.label(text=f"suspect_regions：{diagnostics.self_suspect_regions}")
+            diag_box.label(text=f"compaction_used：{diagnostics.self_compaction_used}")
+            diag_box.label(text=f"full_recovery_fallbacks：{diagnostics.self_full_recovery_fallbacks}")
             diag_box.label(text=f"finite_flag：{1 if diagnostics.finite else 0}")
 
             tuning_box = advanced_box.box()
@@ -138,6 +144,11 @@ class SSBL_PT_preview_panel(bpy.types.Panel):
                 tuning_box.prop(settings, "max_self_collision_neighbors")
                 tuning_box.prop(settings, "self_probe_interval")
                 tuning_box.prop(settings, "self_surface_pair_interval")
+                if settings.self_collision_mode == "fast":
+                    tuning_box.prop(settings, "self_sleep_enabled")
+                    if settings.self_sleep_enabled:
+                        tuning_box.prop(settings, "self_sleep_still_frames")
+                        tuning_box.prop(settings, "self_sleep_full_scan_interval")
             if settings.use_volume_pressure:
                 tuning_box.prop(settings, "volume_compliance")
                 tuning_box.prop(settings, "volume_solve_interval")
