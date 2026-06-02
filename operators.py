@@ -3,11 +3,81 @@ from __future__ import annotations
 import bpy
 import blf
 import time
+from bpy.app.handlers import persistent
 
 from . import solver
 
 
 _FPS_OVERLAY_HANDLERS: dict[str, object] = {}
+_LEGACY_PREVIEW_TIMER_INTERVAL = 1.0 / 60.0
+
+
+def _scene_from_handler_args(args) -> bpy.types.Scene | None:
+    if args and isinstance(args[0], bpy.types.Scene):
+        return args[0]
+    return bpy.context.scene
+
+
+def _is_animation_playing() -> bool:
+    screen = getattr(bpy.context, "screen", None)
+    return bool(screen is not None and getattr(screen, "is_animation_playing", False))
+
+
+@persistent
+def _ssbl_animation_playback_pre(*args):
+    scene = _scene_from_handler_args(args)
+    if scene is None:
+        return
+    try:
+        solver.start_timeline_preview(bpy.context, scene)
+        _tag_viewports(bpy.context)
+    except Exception:
+        pass
+
+
+@persistent
+def _ssbl_frame_change_post(*args):
+    if not _is_animation_playing():
+        return
+    scene = _scene_from_handler_args(args)
+    if scene is None:
+        return
+    try:
+        solver.step_timeline_preview(bpy.context, scene)
+        _tag_viewports(bpy.context)
+    except Exception:
+        pass
+
+
+@persistent
+def _ssbl_animation_playback_post(*args):
+    scene = _scene_from_handler_args(args)
+    if scene is None:
+        return
+    try:
+        solver.pause_timeline_preview(scene)
+        _tag_viewports(bpy.context)
+    except Exception:
+        pass
+
+
+def register_playback_handlers() -> None:
+    if _ssbl_animation_playback_pre not in bpy.app.handlers.animation_playback_pre:
+        bpy.app.handlers.animation_playback_pre.append(_ssbl_animation_playback_pre)
+    if _ssbl_frame_change_post not in bpy.app.handlers.frame_change_post:
+        bpy.app.handlers.frame_change_post.append(_ssbl_frame_change_post)
+    if _ssbl_animation_playback_post not in bpy.app.handlers.animation_playback_post:
+        bpy.app.handlers.animation_playback_post.append(_ssbl_animation_playback_post)
+
+
+def unregister_playback_handlers() -> None:
+    for handlers, handler in (
+        (bpy.app.handlers.animation_playback_pre, _ssbl_animation_playback_pre),
+        (bpy.app.handlers.frame_change_post, _ssbl_frame_change_post),
+        (bpy.app.handlers.animation_playback_post, _ssbl_animation_playback_post),
+    ):
+        if handler in handlers:
+            handlers.remove(handler)
 
 
 def _draw_preview_fps(object_name: str) -> None:
@@ -81,10 +151,8 @@ class SSBL_OT_start_preview(bpy.types.Operator):
             return {"CANCELLED"}
 
         wm = context.window_manager
-        interval = 1.0 / max(float(context.scene.ssbl_preview.preview_target_fps), 1.0)
-        self._timer = wm.event_timer_add(interval, window=context.window)
+        self._timer = wm.event_timer_add(_LEGACY_PREVIEW_TIMER_INTERVAL, window=context.window)
         self._object_name = session.object_name
-        _add_fps_overlay(self._object_name)
         wm.modal_handler_add(self)
         for warning in warnings[:3]:
             self.report({"WARNING"}, warning)
@@ -117,7 +185,6 @@ class SSBL_OT_start_preview(bpy.types.Operator):
         if self._timer is not None:
             context.window_manager.event_timer_remove(self._timer)
             self._timer = None
-        _remove_fps_overlay(self._object_name)
         self.report({"INFO"}, solver.session_status(obj))
         return {"FINISHED"}
 

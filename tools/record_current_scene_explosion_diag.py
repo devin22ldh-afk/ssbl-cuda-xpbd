@@ -188,6 +188,9 @@ def _metrics(
         "self_sleeping_regions": int(diag.self_sleeping_regions),
         "self_compaction_used": int(diag.self_compaction_used),
         "self_vs_pair_used": int(diag.self_vs_pair_compaction_used),
+        "jitter_stabilized_vertices": int(diag.jitter_stabilized_vertices),
+        "jitter_rejected_vertices": int(diag.jitter_rejected_vertices),
+        "jitter_max_correction": float(diag.jitter_max_correction),
     }
 
 

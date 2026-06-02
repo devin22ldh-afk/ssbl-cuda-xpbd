@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass
 import hashlib
+import os
 
 import bmesh
 import bpy
@@ -12,7 +13,7 @@ import numpy as np
 _EPS = 1.0e-8
 SELF_COLLISION_OFF = 0
 SELF_COLLISION_FAST = 1
-DEFAULT_HARDNESS = 0.6
+DEFAULT_HARDNESS = 0.4
 _SOFT_STRETCH_COMPLIANCE = 8.0e-6
 _HARD_STRETCH_COMPLIANCE = 1.0e-9
 _SOFT_BEND_COMPLIANCE = 2.0e-3
@@ -64,6 +65,7 @@ class SolverOptions:
     self_sleep_motion_scale: float
     self_compaction_active_fraction_threshold: float
     self_pair_compaction_enabled: bool
+    jitter_stabilizer_enabled: bool
 
 
 @dataclass
@@ -114,6 +116,13 @@ _TOPOLOGY_CACHE_STATS = {
     "misses": 0,
     "last_hit": False,
 }
+
+
+def _env_bool(name: str, default: bool = True) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    return value.strip().lower() not in {"", "0", "false", "no", "off"}
 
 
 def clear_cloth_topology_cache() -> None:
@@ -667,6 +676,43 @@ def hidden_tether_constraints(
     if len(pin_indices) == 0 or len(dynamic_indices) == 0:
         return np.empty((0, 2), dtype=np.int32), np.empty(0, dtype=np.float32)
 
+    if len(pin_indices) == 1:
+        nearest_pin = np.full(len(dynamic_indices), int(pin_indices[0]), dtype=np.int32)
+        delta = rest_world[dynamic_indices].astype(np.float64, copy=False) - rest_world[int(pin_indices[0])].astype(
+            np.float64,
+            copy=False,
+        )
+        nearest_distance = np.linalg.norm(delta, axis=1)
+        pairs = np.column_stack((nearest_pin, dynamic_indices)).astype(np.int32, copy=False)
+        rest = np.maximum(nearest_distance * max(float(slack), 0.5), _EPS).astype(np.float32)
+        return pairs, rest
+
+    if _env_bool("SSBL_LRA_KDTREE_ENABLED", True):
+        try:
+            from mathutils import kdtree
+
+            tree = kdtree.KDTree(len(pin_indices))
+            pin_positions = rest_world[pin_indices].astype(np.float64, copy=False)
+            for local_index, position in enumerate(pin_positions):
+                tree.insert((float(position[0]), float(position[1]), float(position[2])), local_index)
+            tree.balance()
+
+            nearest_pin = np.empty(len(dynamic_indices), dtype=np.int32)
+            nearest_distance = np.empty(len(dynamic_indices), dtype=np.float64)
+            dynamic_positions = rest_world[dynamic_indices].astype(np.float64, copy=False)
+            for local_index, position in enumerate(dynamic_positions):
+                _co, pin_local_index, distance = tree.find(
+                    (float(position[0]), float(position[1]), float(position[2]))
+                )
+                nearest_pin[local_index] = pin_indices[int(pin_local_index)]
+                nearest_distance[local_index] = float(distance)
+
+            pairs = np.column_stack((nearest_pin, dynamic_indices)).astype(np.int32, copy=False)
+            rest = np.maximum(nearest_distance * max(float(slack), 0.5), _EPS).astype(np.float32)
+            return pairs, rest
+        except Exception:
+            pass
+
     pin_positions = rest_world[pin_indices].astype(np.float64, copy=False)
     dynamic_positions = rest_world[dynamic_indices].astype(np.float64, copy=False)
     nearest_pin = np.empty(len(dynamic_indices), dtype=np.int32)
@@ -741,7 +787,7 @@ def vertex_inverse_mass(
     return inv_mass
 
 
-def settings_to_options(settings) -> SolverOptions:
+def settings_to_options(settings, runtime_mode_override: str | None = None) -> SolverOptions:
     derived = sync_hardness_settings(settings)
     sphere_center = np.zeros(3, dtype=np.float32)
     sphere_radius = 0.0
@@ -766,7 +812,11 @@ def settings_to_options(settings) -> SolverOptions:
         mode_name = "fast"
     mode_value = {"off": SELF_COLLISION_OFF, "fast": SELF_COLLISION_FAST}.get(mode_name, SELF_COLLISION_OFF)
 
-    run_mode = str(getattr(settings, "runtime_mode", getattr(settings, "run_mode", "preview"))).lower()
+    run_mode = (
+        str(runtime_mode_override).lower()
+        if runtime_mode_override is not None
+        else str(getattr(settings, "runtime_mode", getattr(settings, "run_mode", "preview"))).lower()
+    )
     self_sleep_enabled = (
         run_mode == "preview"
         and mode_value > SELF_COLLISION_OFF
@@ -777,6 +827,15 @@ def settings_to_options(settings) -> SolverOptions:
         self_compaction_enabled
         and bool(getattr(settings, "self_pair_compaction_enabled", True))
     )
+    jitter_env = os.environ.get("SSBL_JITTER_STABILIZER_ENABLED")
+    jitter_enabled = (
+        run_mode == "preview"
+        and mode_value == SELF_COLLISION_FAST
+        and bool(getattr(settings, "jitter_stabilizer_enabled", True))
+    )
+    if jitter_env is not None:
+        jitter_enabled = jitter_env.strip().lower() not in {"", "0", "false", "no", "off"}
+        jitter_enabled = jitter_enabled and run_mode == "preview" and mode_value == SELF_COLLISION_FAST
 
     return SolverOptions(
         dt=float(settings.dt),
@@ -815,4 +874,5 @@ def settings_to_options(settings) -> SolverOptions:
             getattr(settings, "self_compaction_active_fraction_threshold", 0.75)
         ),
         self_pair_compaction_enabled=self_pair_compaction_enabled,
+        jitter_stabilizer_enabled=jitter_enabled,
     )

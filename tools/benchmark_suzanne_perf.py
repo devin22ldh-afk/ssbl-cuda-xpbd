@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import time
+from contextlib import contextmanager
 
 import bpy
 
@@ -33,6 +34,31 @@ def _float_env(name: str, default: float) -> float:
         return float(value)
     except ValueError:
         return default
+
+
+def _bool_env(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    return value.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+@contextmanager
+def _temporary_env(overrides: dict[str, str | None]):
+    previous = {name: os.environ.get(name) for name in overrides}
+    try:
+        for name, value in overrides.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 def _p95(values: list[float]) -> float | None:
@@ -144,6 +170,10 @@ def _configure(settings, *, self_collision: bool, volume: bool, optimized: bool)
 def _run_case(obj: bpy.types.Object, label: str, *, self_collision: bool, volume: bool, optimized: bool) -> dict[str, object]:
     settings = bpy.context.scene.ssbl_preview
     _configure(settings, self_collision=self_collision, volume=volume, optimized=optimized)
+    configured_writeback_interval = max(int(getattr(settings, "preview_writeback_interval", 1)), 1)
+    configured_sleep_enabled = bool(getattr(settings, "self_sleep_enabled", False))
+    configured_compaction_enabled = bool(getattr(settings, "self_compaction_enabled", False))
+    configured_pair_compaction_enabled = bool(getattr(settings, "self_pair_compaction_enabled", False))
     before = _source_snapshot(obj)
     session = ssbl.solver.start_preview(bpy.context, obj)
     steps = int(settings.frame_count)
@@ -207,6 +237,10 @@ def _run_case(obj: bpy.types.Object, label: str, *, self_collision: bool, volume
         "case": label,
         "verts": len(session.cloth.positions_world),
         "tris": len(session.cloth.triangles),
+        "writeback_interval": configured_writeback_interval,
+        "sleep_enabled": configured_sleep_enabled,
+        "compaction_enabled": configured_compaction_enabled,
+        "pair_compaction_enabled": configured_pair_compaction_enabled,
         "measured_steps": measured_steps,
         "fps": round(max(measured_steps, 1) / elapsed, 2),
         "avg_frame_ms": round(measured_frame_ms_total / max(measured_steps, 1), 2),
@@ -276,7 +310,68 @@ def _run_case(obj: bpy.types.Object, label: str, *, self_collision: bool, volume
         "self_vs_pair_capacity": int(diag.self_vs_pair_capacity),
         "self_vs_pair_overflow": int(diag.self_vs_pair_overflow),
         "self_vs_pair_compaction_used": int(diag.self_vs_pair_compaction_used),
+        "jitter_stabilized_vertices": int(diag.jitter_stabilized_vertices),
+        "jitter_rejected_vertices": int(diag.jitter_rejected_vertices),
+        "jitter_max_correction": round(float(diag.jitter_max_correction), 6),
     }
+
+
+def _run_case_with_env(
+    obj: bpy.types.Object,
+    label: str,
+    *,
+    self_collision: bool,
+    volume: bool,
+    optimized: bool,
+    env: dict[str, str | None],
+) -> dict[str, object]:
+    with _temporary_env(env):
+        return _run_case(obj, label, self_collision=self_collision, volume=volume, optimized=optimized)
+
+
+def _append_compare_cases(results: list[dict[str, object]], obj: bpy.types.Object, requested_cases: set[str]) -> None:
+    compare_requested = not requested_cases or "optimized_self_and_volume" in requested_cases
+    if not compare_requested:
+        return
+
+    if _bool_env("SSBL_SUZANNE_COMPARE_WRITEBACK", False):
+        for interval in (1, 2, 4, 8):
+            results.append(
+                _run_case_with_env(
+                    obj,
+                    f"optimized_self_and_volume_wb{interval}",
+                    self_collision=True,
+                    volume=True,
+                    optimized=True,
+                    env={"SSBL_SUZANNE_WRITEBACK_INTERVAL": str(interval)},
+                )
+            )
+
+    if _bool_env("SSBL_SUZANNE_COMPARE_PAIR", False):
+        for enabled in (0, 1):
+            results.append(
+                _run_case_with_env(
+                    obj,
+                    f"optimized_self_and_volume_pair_{'on' if enabled else 'off'}",
+                    self_collision=True,
+                    volume=True,
+                    optimized=True,
+                    env={"SSBL_SUZANNE_SELF_PAIR_COMPACTION_ENABLED": str(enabled)},
+                )
+            )
+
+    if _bool_env("SSBL_SUZANNE_COMPARE_SLEEP", False):
+        for enabled in (0, 1):
+            results.append(
+                _run_case_with_env(
+                    obj,
+                    f"optimized_self_and_volume_sleep_{'on' if enabled else 'off'}",
+                    self_collision=True,
+                    volume=True,
+                    optimized=True,
+                    env={"SSBL_SUZANNE_SELF_SLEEP_ENABLED": str(enabled)},
+                )
+            )
 
 
 def main() -> None:
@@ -307,6 +402,7 @@ def main() -> None:
             for label, self_collision, volume, optimized in case_specs
             if not requested_cases or label in requested_cases
         ]
+        _append_compare_cases(results, obj, requested_cases)
         print("SSBL_SUZANNE_BENCH", json.dumps(results, sort_keys=True))
     finally:
         ssbl.unregister()

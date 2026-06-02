@@ -63,6 +63,7 @@ class _NativeConfig(ctypes.Structure):
         ("self_sleep_motion_scale", ctypes.c_float),
         ("self_compaction_active_fraction_threshold", ctypes.c_float),
         ("self_pair_compaction_enabled", ctypes.c_int),
+        ("jitter_stabilizer_enabled", ctypes.c_int),
     ]
 
 
@@ -148,6 +149,9 @@ class _NativeDiagnostics(ctypes.Structure):
         ("self_vs_pair_capacity", ctypes.c_longlong),
         ("self_vs_pair_overflow", ctypes.c_longlong),
         ("self_vs_pair_compaction_used", ctypes.c_longlong),
+        ("jitter_stabilized_vertices", ctypes.c_longlong),
+        ("jitter_rejected_vertices", ctypes.c_longlong),
+        ("jitter_max_correction", ctypes.c_float),
         ("finite_flag", ctypes.c_int),
     ]
 
@@ -193,6 +197,9 @@ class NativeStepDiagnostics:
     self_vs_pair_capacity: int = 0
     self_vs_pair_overflow: int = 0
     self_vs_pair_compaction_used: int = 0
+    jitter_stabilized_vertices: int = 0
+    jitter_rejected_vertices: int = 0
+    jitter_max_correction: float = 0.0
     finite: bool = True
     frame_ms: float = 0.0
     frame_set_ms: float = 0.0
@@ -225,7 +232,7 @@ _LOAD_ERROR = ""
 
 def dll_path() -> str:
     root = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(root, "native", "bin", "ssbl_xpbd_cuda_abi29.dll")
+    return os.path.join(root, "native", "bin", "ssbl_xpbd_cuda_abi31.dll")
 
 
 def status() -> NativeStatus:
@@ -373,6 +380,7 @@ def _config_from_options(
     cfg.self_sleep_motion_scale = float(options.self_sleep_motion_scale)
     cfg.self_compaction_active_fraction_threshold = float(options.self_compaction_active_fraction_threshold)
     cfg.self_pair_compaction_enabled = int(options.self_pair_compaction_enabled)
+    cfg.jitter_stabilizer_enabled = int(options.jitter_stabilizer_enabled)
     return cfg
 
 
@@ -620,6 +628,9 @@ class NativeXpbdSolver:
             self_vs_pair_capacity=int(raw.self_vs_pair_capacity),
             self_vs_pair_overflow=int(raw.self_vs_pair_overflow),
             self_vs_pair_compaction_used=int(raw.self_vs_pair_compaction_used),
+            jitter_stabilized_vertices=int(raw.jitter_stabilized_vertices),
+            jitter_rejected_vertices=int(raw.jitter_rejected_vertices),
+            jitter_max_correction=float(raw.jitter_max_correction),
             finite=bool(raw.finite_flag),
         )
         self._last_diagnostics = diag

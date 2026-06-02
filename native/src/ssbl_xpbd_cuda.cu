@@ -48,6 +48,17 @@ constexpr int kSelfVsPairCount = 0;
 constexpr int kSelfVsPairOverflow = 1;
 constexpr int kSelfVsPairCapacityMin = 262144;
 constexpr int kSelfVsPairCapacityMax = 8388608;
+constexpr int kJitterCountSlots = 2;
+constexpr int kJitterStabilizedCount = 0;
+constexpr int kJitterRejectedCount = 1;
+constexpr int kJitterScoreThreshold = 2;
+constexpr float kJitterDeltaThresholdScale = 0.35f;
+constexpr float kJitterCorrectionScale = 0.25f;
+constexpr float kJitterCorrectionLimitScale = 0.20f;
+constexpr float kJitterStretchResidualTolerance = 1.005f;
+constexpr float kJitterAreaResidualTolerance = 1.005f;
+constexpr float kJitterAreaPeakTolerance = 1.0005f;
+constexpr float kJitterRecoveryOpposeLimit = -0.25f;
 constexpr int kMaxStaticTriangleHashCells = 256;
 constexpr int kMaxStaticVertexQueryCells = 256;
 constexpr int kMaxStaticVertexCandidates = 256;
@@ -182,6 +193,11 @@ struct Solver {
     int self_recovery_mode = 0;
     long long self_collision_run_count = 0;
     float self_contact_distance_value = 0.0f;
+    Vec3* jitter_frame_start_pos = nullptr;
+    Vec3* jitter_prev_delta = nullptr;
+    int* jitter_score = nullptr;
+    unsigned long long* jitter_counts = nullptr;
+    float* jitter_max_correction = nullptr;
     int* pin_indices = nullptr;
     Vec3* pin_targets = nullptr;
     int pin_count = 0;
@@ -1167,6 +1183,21 @@ __global__ void build_self_compaction_vertices_kernel(Solver solver) {
     }
 }
 
+__device__ void atomic_max_float(float* address, float value) {
+    if (!address || !isfinite(value) || value < 0.0f) {
+        return;
+    }
+    int* address_as_int = reinterpret_cast<int*>(address);
+    int old_bits = *address_as_int;
+    while (__int_as_float(old_bits) < value) {
+        int assumed = old_bits;
+        old_bits = atomicCAS(address_as_int, assumed, __float_as_int(value));
+        if (old_bits == assumed) {
+            break;
+        }
+    }
+}
+
 __global__ void build_self_compaction_samples_kernel(Solver solver) {
     int sample = blockIdx.x * blockDim.x + threadIdx.x;
     if (sample >= solver.self_sample_count || !solver.self_compaction_counts) {
@@ -1409,8 +1440,12 @@ __global__ void lra_project_kernel(Solver solver, float dt) {
     float alpha = solver.cfg.lra_compliance / fmaxf(dt * dt, kEps);
     float dlambda = -c / (weight + alpha);
     Vec3 corr = mul(delta, kProjectionRelaxation * dlambda / len);
-    atomic_add(&solver.pos[i], mul(corr, -wi));
-    atomic_add(&solver.pos[j], mul(corr, wj));
+    if (wi > 0.0f) {
+        atomic_add(&solver.pos[i], mul(corr, -wi));
+    }
+    if (wj > 0.0f) {
+        atomic_add(&solver.pos[j], mul(corr, wj));
+    }
 }
 
 __global__ void pin_project_kernel(Solver solver) {
@@ -3082,7 +3117,219 @@ __global__ void damp_self_recovery_velocity_kernel(Solver solver) {
     Vec3 recovery_delta = solver.self_recovery_delta
         ? solver.self_recovery_delta[i]
         : sub(solver.pos[i], solver.prev[i]);
-    solver.prev[i] = add(solver.prev[i], mul(recovery_delta, kSelfRecoveryVelocityDamping));
+    Vec3 adjusted_prev = add(solver.prev[i], mul(recovery_delta, kSelfRecoveryVelocityDamping));
+    float recovery_len = norm(recovery_delta);
+    if (recovery_len > kEps) {
+        Vec3 dir = mul(recovery_delta, 1.0f / recovery_len);
+        Vec3 step = sub(solver.pos[i], adjusted_prev);
+        float returning = dot(step, dir);
+        if (returning < 0.0f) {
+            step = sub(step, mul(dir, returning));
+            adjusted_prev = sub(solver.pos[i], step);
+        }
+    }
+    solver.prev[i] = adjusted_prev;
+}
+
+__device__ float one_ring_stretch_residual(Solver solver, int vertex, Vec3 candidate) {
+    if (!solver.vertex_neighbor_offsets || !solver.vertex_neighbors || !solver.rest) {
+        return -1.0f;
+    }
+    int start = solver.vertex_neighbor_offsets[vertex];
+    int end = solver.vertex_neighbor_offsets[vertex + 1];
+    if (end <= start) {
+        return -1.0f;
+    }
+    float residual = 0.0f;
+    for (int idx = start; idx < end; ++idx) {
+        int neighbor = solver.vertex_neighbors[idx];
+        if (neighbor < 0 || neighbor >= solver.cfg.vertex_count) {
+            continue;
+        }
+        float rest_len = norm(sub(solver.rest[vertex], solver.rest[neighbor]));
+        float len = norm(sub(candidate, solver.pos[neighbor]));
+        residual += fabsf(len - rest_len);
+    }
+    return residual;
+}
+
+__device__ float triangle_area_value(Vec3 a, Vec3 b, Vec3 c) {
+    Vec3 n = cross(sub(b, a), sub(c, a));
+    return 0.5f * sqrtf(fmaxf(dot(n, n), 0.0f));
+}
+
+__device__ float one_ring_area_residual(Solver solver, int vertex, Vec3 candidate) {
+    if (!solver.volume_vertex_offsets || !solver.volume_vertex_triangles || !solver.triangles || !solver.rest) {
+        return -1.0f;
+    }
+    int start = solver.volume_vertex_offsets[vertex];
+    int end = solver.volume_vertex_offsets[vertex + 1];
+    if (end <= start) {
+        return -1.0f;
+    }
+    float residual = 0.0f;
+    for (int cursor = start; cursor < end; ++cursor) {
+        int t = solver.volume_vertex_triangles[cursor];
+        if (t < 0 || t >= solver.cfg.triangle_count) {
+            continue;
+        }
+        Int3 tri = solver.triangles[t];
+        if (tri.x < 0 || tri.x >= solver.cfg.vertex_count
+            || tri.y < 0 || tri.y >= solver.cfg.vertex_count
+            || tri.z < 0 || tri.z >= solver.cfg.vertex_count) {
+            continue;
+        }
+        Vec3 a = (tri.x == vertex) ? candidate : solver.pos[tri.x];
+        Vec3 b = (tri.y == vertex) ? candidate : solver.pos[tri.y];
+        Vec3 c = (tri.z == vertex) ? candidate : solver.pos[tri.z];
+        Vec3 ra = solver.rest[tri.x];
+        Vec3 rb = solver.rest[tri.y];
+        Vec3 rc = solver.rest[tri.z];
+        float rest_area = triangle_area_value(ra, rb, rc);
+        float area = triangle_area_value(a, b, c);
+        residual += fabsf(area - rest_area) / fmaxf(rest_area, 1.0e-6f);
+    }
+    return residual;
+}
+
+__device__ float one_ring_area_peak_ratio(Solver solver, int vertex, Vec3 candidate) {
+    if (!solver.volume_vertex_offsets || !solver.volume_vertex_triangles || !solver.triangles || !solver.rest) {
+        return -1.0f;
+    }
+    int start = solver.volume_vertex_offsets[vertex];
+    int end = solver.volume_vertex_offsets[vertex + 1];
+    if (end <= start) {
+        return -1.0f;
+    }
+    float peak = 0.0f;
+    for (int cursor = start; cursor < end; ++cursor) {
+        int t = solver.volume_vertex_triangles[cursor];
+        if (t < 0 || t >= solver.cfg.triangle_count) {
+            continue;
+        }
+        Int3 tri = solver.triangles[t];
+        if (tri.x < 0 || tri.x >= solver.cfg.vertex_count
+            || tri.y < 0 || tri.y >= solver.cfg.vertex_count
+            || tri.z < 0 || tri.z >= solver.cfg.vertex_count) {
+            continue;
+        }
+        Vec3 a = (tri.x == vertex) ? candidate : solver.pos[tri.x];
+        Vec3 b = (tri.y == vertex) ? candidate : solver.pos[tri.y];
+        Vec3 c = (tri.z == vertex) ? candidate : solver.pos[tri.z];
+        float rest_area = triangle_area_value(solver.rest[tri.x], solver.rest[tri.y], solver.rest[tri.z]);
+        if (rest_area <= 1.0e-10f) {
+            continue;
+        }
+        float area = triangle_area_value(a, b, c);
+        peak = fmaxf(peak, area / rest_area);
+    }
+    return peak;
+}
+
+__global__ void jitter_stabilizer_kernel(Solver solver, float threshold, float correction_limit) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= solver.cfg.vertex_count
+        || !solver.jitter_frame_start_pos
+        || !solver.jitter_prev_delta
+        || !solver.jitter_score
+        || solver.inv_mass[i] <= 0.0f) {
+        return;
+    }
+    Vec3 p = solver.pos[i];
+    Vec3 start = solver.jitter_frame_start_pos[i];
+    if (!finite_vec(p) || !finite_vec(start)) {
+        solver.jitter_prev_delta[i] = {0.0f, 0.0f, 0.0f};
+        solver.jitter_score[i] = 0;
+        return;
+    }
+    Vec3 delta = sub(p, start);
+    Vec3 previous_delta = solver.jitter_prev_delta[i];
+    Vec3 high_freq = sub(delta, previous_delta);
+    bool oscillating = dot(delta, previous_delta) < 0.0f && norm(high_freq) > threshold;
+    int score = solver.jitter_score[i];
+    score = oscillating ? min(score + 1, 4) : max(score - 1, 0);
+    solver.jitter_score[i] = score;
+    solver.jitter_prev_delta[i] = delta;
+    if (score < kJitterScoreThreshold) {
+        return;
+    }
+
+    Vec3 correction = mul(high_freq, -kJitterCorrectionScale);
+    float correction_len = norm(correction);
+    if (correction_len <= kEps) {
+        return;
+    }
+    if (correction_len > correction_limit) {
+        correction = mul(correction, correction_limit / correction_len);
+        correction_len = correction_limit;
+    }
+
+    if (solver.self_recovery_touched
+        && solver.self_recovery_delta
+        && solver.self_recovery_touched[i] != 0) {
+        Vec3 recovery_delta = solver.self_recovery_delta[i];
+        float recovery_len = norm(recovery_delta);
+        if (recovery_len > kEps
+            && dot(correction, recovery_delta) < kJitterRecoveryOpposeLimit * correction_len * recovery_len) {
+            if (solver.jitter_counts) {
+                atomicAdd(&solver.jitter_counts[kJitterRejectedCount], 1ull);
+            }
+            return;
+        }
+    }
+
+    Vec3 candidate = add(p, correction);
+    float current_residual = one_ring_stretch_residual(solver, i, p);
+    float candidate_residual = one_ring_stretch_residual(solver, i, candidate);
+    if (current_residual < 0.0f
+        || candidate_residual < 0.0f
+        || candidate_residual > current_residual * kJitterStretchResidualTolerance + 1.0e-6f) {
+        if (solver.jitter_counts) {
+            atomicAdd(&solver.jitter_counts[kJitterRejectedCount], 1ull);
+        }
+        return;
+    }
+
+    float current_area_residual = one_ring_area_residual(solver, i, p);
+    float candidate_area_residual = one_ring_area_residual(solver, i, candidate);
+    if (current_area_residual >= 0.0f
+        && candidate_area_residual >= 0.0f
+        && candidate_area_residual > current_area_residual * kJitterAreaResidualTolerance + 1.0e-6f) {
+        if (solver.jitter_counts) {
+            atomicAdd(&solver.jitter_counts[kJitterRejectedCount], 1ull);
+        }
+        return;
+    }
+    float current_area_peak = one_ring_area_peak_ratio(solver, i, p);
+    float candidate_area_peak = one_ring_area_peak_ratio(solver, i, candidate);
+    if (current_area_peak >= 0.0f
+        && candidate_area_peak >= 0.0f
+        && candidate_area_peak > current_area_peak * kJitterAreaPeakTolerance + 1.0e-6f) {
+        if (solver.jitter_counts) {
+            atomicAdd(&solver.jitter_counts[kJitterRejectedCount], 1ull);
+        }
+        return;
+    }
+
+    solver.pos[i] = candidate;
+    solver.jitter_prev_delta[i] = sub(candidate, start);
+    if (solver.self_sample_hash_dirty) {
+        atomicExch(solver.self_sample_hash_dirty, 1);
+    }
+    if (solver.jitter_counts) {
+        atomicAdd(&solver.jitter_counts[kJitterStabilizedCount], 1ull);
+    }
+    if (solver.jitter_max_correction) {
+        atomic_max_float(solver.jitter_max_correction, correction_len);
+    }
+
+    Vec3 step = sub(candidate, solver.prev[i]);
+    Vec3 dir = mul(correction, 1.0f / fmaxf(correction_len, kEps));
+    float returning = dot(step, dir);
+    if (returning < 0.0f) {
+        step = sub(step, mul(dir, returning));
+        solver.prev[i] = sub(candidate, step);
+    }
 }
 
 __global__ void clamp_self_recovery_displacement_kernel(Solver solver, float max_delta) {
@@ -3374,13 +3621,54 @@ bool fetch_step_diagnostics(Solver* solver) {
     if (!solver) {
         return set_error("invalid solver");
     }
-    return fetch_diagnostics_buffers(
+    if (!fetch_diagnostics_buffers(
         solver->diag_counts,
         solver->diag_min_gap,
         &solver->diag,
         "download diagnostic counts",
         "download diagnostic min gap"
-    );
+    )) {
+        return false;
+    }
+    if (solver->jitter_counts) {
+        unsigned long long counts[kJitterCountSlots] = {};
+        if (!set_cuda_error(
+                cudaMemcpy(counts, solver->jitter_counts, sizeof(counts), cudaMemcpyDeviceToHost),
+                "download jitter stabilizer counts")) {
+            return false;
+        }
+        solver->diag.jitter_stabilized_vertices = static_cast<long long>(counts[kJitterStabilizedCount]);
+        solver->diag.jitter_rejected_vertices = static_cast<long long>(counts[kJitterRejectedCount]);
+    }
+    if (solver->jitter_max_correction) {
+        float max_correction = 0.0f;
+        if (!set_cuda_error(
+                cudaMemcpy(&max_correction, solver->jitter_max_correction, sizeof(float), cudaMemcpyDeviceToHost),
+                "download jitter stabilizer max correction")) {
+            return false;
+        }
+        solver->diag.jitter_max_correction = std::isfinite(max_correction) ? max_correction : 0.0f;
+    }
+    return true;
+}
+
+bool reset_jitter_diagnostics(Solver* solver) {
+    if (!solver || !solver->cfg.jitter_stabilizer_enabled) {
+        return true;
+    }
+    if (solver->jitter_counts
+        && !set_cuda_error(
+            cudaMemset(solver->jitter_counts, 0, sizeof(unsigned long long) * kJitterCountSlots),
+            "reset jitter stabilizer counts")) {
+        return false;
+    }
+    if (solver->jitter_max_correction
+        && !set_cuda_error(
+            cudaMemset(solver->jitter_max_correction, 0, sizeof(float)),
+            "reset jitter stabilizer max correction")) {
+        return false;
+    }
+    return true;
 }
 
 bool reset_probe_diagnostics(Solver* solver) {
@@ -4070,6 +4358,22 @@ bool self_probe_triggers_retry(const SsblXpbdDiagnostics& diag, float cloth_thic
     return valid_min_gap(diag.min_gap) && diag.min_gap < retry_gap;
 }
 
+bool run_jitter_stabilizer(Solver* solver, int v_blocks) {
+    if (!solver || !solver->cfg.jitter_stabilizer_enabled) {
+        return true;
+    }
+    if (!solver->jitter_frame_start_pos
+        || !solver->jitter_prev_delta
+        || !solver->jitter_score) {
+        return set_error("jitter stabilizer buffers are not allocated");
+    }
+    const float cloth_thickness = std::max(solver->cfg.cloth_thickness, 1.0e-4f);
+    const float threshold = std::max(1.0e-4f, cloth_thickness * kJitterDeltaThresholdScale);
+    const float correction_limit = std::max(1.0e-4f, cloth_thickness * kJitterCorrectionLimitScale);
+    jitter_stabilizer_kernel<<<v_blocks, 256>>>(*solver, threshold, correction_limit);
+    return set_cuda_error(cudaGetLastError(), "launch jitter stabilizer");
+}
+
 bool run_substep(
     Solver* solver,
     float sub_dt,
@@ -4085,6 +4389,7 @@ bool run_substep(
     long long* recovery_passes_total,
     long long* local_retry_total,
     bool allow_retry,
+    bool run_jitter_filter,
     std::vector<TimedSegment>* timings
 ) {
     if (!solver) {
@@ -4339,6 +4644,7 @@ bool run_substep(
                         recovery_passes_total,
                         local_retry_total,
                         false,
+                        false,
                         timings)) {
                     return false;
                 }
@@ -4357,6 +4663,7 @@ bool run_substep(
                     recovery_passes_total,
                     local_retry_total,
                     false,
+                    false,
                     timings
                 );
             }
@@ -4366,6 +4673,11 @@ bool run_substep(
         }
         sanitize_positions_kernel<<<v_blocks, 256>>>(*solver);
         if (!end_timed_segment(timings, &segment, "end sanitize timing")) {
+            return false;
+        }
+    }
+    if (run_jitter_filter) {
+        if (!run_jitter_stabilizer(solver, v_blocks)) {
             return false;
         }
     }
@@ -4442,6 +4754,11 @@ void free_solver(Solver* solver) {
     cudaFree(solver->self_compaction_counts);
     cudaFree(solver->self_vs_pairs);
     cudaFree(solver->self_vs_pair_counts);
+    cudaFree(solver->jitter_frame_start_pos);
+    cudaFree(solver->jitter_prev_delta);
+    cudaFree(solver->jitter_score);
+    cudaFree(solver->jitter_counts);
+    cudaFree(solver->jitter_max_correction);
     cudaFree(solver->pin_indices);
     cudaFree(solver->pin_targets);
     cudaFreeHost(solver->pinned_download);
@@ -4599,6 +4916,11 @@ extern "C" SSBL_API void* ssbl_create_solver(const SsblXpbdConfig* config, const
         1.0f
     );
     solver->cfg.self_pair_compaction_enabled = (solver->cfg.self_collision && solver->cfg.self_pair_compaction_enabled) ? 1 : 0;
+    solver->cfg.jitter_stabilizer_enabled = (
+        solver->cfg.self_collision
+        && solver->cfg.self_collision_mode > 0
+        && solver->cfg.jitter_stabilizer_enabled
+    ) ? 1 : 0;
 
     const int vertex_count = solver->cfg.vertex_count;
     std::vector<Vec3> host_pos(vertex_count);
@@ -4618,6 +4940,40 @@ extern "C" SSBL_API void* ssbl_create_solver(const SsblXpbdConfig* config, const
         ok = ok && set_cuda_error(err, "previous-position backup allocation");
         err = cudaMalloc(reinterpret_cast<void**>(&solver->vel_backup), sizeof(Vec3) * vertex_count);
         ok = ok && set_cuda_error(err, "velocity backup allocation");
+    }
+    if (ok && solver->cfg.jitter_stabilizer_enabled) {
+        cudaError_t err = cudaMalloc(reinterpret_cast<void**>(&solver->jitter_frame_start_pos), sizeof(Vec3) * vertex_count);
+        ok = ok && set_cuda_error(err, "jitter frame-start allocation");
+        err = cudaMalloc(reinterpret_cast<void**>(&solver->jitter_prev_delta), sizeof(Vec3) * vertex_count);
+        ok = ok && set_cuda_error(err, "jitter previous-delta allocation");
+        err = cudaMalloc(reinterpret_cast<void**>(&solver->jitter_score), sizeof(int) * vertex_count);
+        ok = ok && set_cuda_error(err, "jitter score allocation");
+        err = cudaMalloc(reinterpret_cast<void**>(&solver->jitter_counts), sizeof(unsigned long long) * kJitterCountSlots);
+        ok = ok && set_cuda_error(err, "jitter count allocation");
+        err = cudaMalloc(reinterpret_cast<void**>(&solver->jitter_max_correction), sizeof(float));
+        ok = ok && set_cuda_error(err, "jitter max-correction allocation");
+        if (ok) {
+            ok = ok && set_cuda_error(
+                cudaMemcpy(solver->jitter_frame_start_pos, solver->pos, sizeof(Vec3) * vertex_count, cudaMemcpyDeviceToDevice),
+                "jitter frame-start initialization"
+            );
+            ok = ok && set_cuda_error(
+                cudaMemset(solver->jitter_prev_delta, 0, sizeof(Vec3) * vertex_count),
+                "jitter previous-delta reset"
+            );
+            ok = ok && set_cuda_error(
+                cudaMemset(solver->jitter_score, 0, sizeof(int) * vertex_count),
+                "jitter score reset"
+            );
+            ok = ok && set_cuda_error(
+                cudaMemset(solver->jitter_counts, 0, sizeof(unsigned long long) * kJitterCountSlots),
+                "jitter count reset"
+            );
+            ok = ok && set_cuda_error(
+                cudaMemset(solver->jitter_max_correction, 0, sizeof(float)),
+                "jitter max-correction reset"
+            );
+        }
     }
     if (ok) {
         cudaError_t err = cudaMalloc(reinterpret_cast<void**>(&solver->diag_counts), sizeof(unsigned long long) * kDiagCountSlots);
@@ -4667,7 +5023,7 @@ extern "C" SSBL_API void* ssbl_create_solver(const SsblXpbdConfig* config, const
     ok = ok && alloc_and_copy(&solver->lra_rest, mesh->lra_rest_lengths, config->lra_count, "missing LRA rest lengths");
     ok = ok && copy_host_offsets(&solver->lra_color_offsets_host, mesh->lra_color_offsets, config->lra_color_count + 1, "missing LRA color offsets");
     ok = ok && alloc_and_copy(&solver->triangles, reinterpret_cast<const Int3*>(mesh->triangles), config->triangle_count, "missing triangles");
-    if (ok && config->use_volume_pressure) {
+    if (ok && (config->use_volume_pressure || solver->cfg.jitter_stabilizer_enabled)) {
         ok = ok && build_volume_vertex_triangles(solver, config, mesh);
     }
     ok = ok && alloc_and_copy(&solver->static_triangles, reinterpret_cast<const Vec3*>(mesh->static_triangles), config->static_triangle_count * 3, "missing static triangles");
@@ -4842,6 +5198,23 @@ extern "C" SSBL_API int ssbl_reset_solver(void* handle) {
         solver->self_sleep_frame_count = 0;
         solver->self_sleep_force_active = 0;
     }
+    if (solver->jitter_frame_start_pos
+        && !set_cuda_error(
+            cudaMemcpy(solver->jitter_frame_start_pos, solver->rest, sizeof(Vec3) * n, cudaMemcpyDeviceToDevice),
+            "reset jitter frame-start positions")) {
+        return 0;
+    }
+    if (solver->jitter_prev_delta
+        && !set_cuda_error(cudaMemset(solver->jitter_prev_delta, 0, sizeof(Vec3) * n), "reset jitter previous deltas")) {
+        return 0;
+    }
+    if (solver->jitter_score
+        && !set_cuda_error(cudaMemset(solver->jitter_score, 0, sizeof(int) * n), "reset jitter scores")) {
+        return 0;
+    }
+    if (!reset_jitter_diagnostics(solver)) {
+        return 0;
+    }
     reset_self_compaction_state(solver);
     return 1;
 }
@@ -4905,6 +5278,9 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
     if (!reset_step_diagnostics(solver)) {
         return 0;
     }
+    if (!reset_jitter_diagnostics(solver)) {
+        return 0;
+    }
     reset_self_compaction_state(solver);
     substeps = std::max(substeps, 1);
     iterations = std::max(iterations, 1);
@@ -4926,6 +5302,19 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
     const bool use_self_sleep = solver->cfg.self_sleep_enabled
         && solver->cfg.self_collision
         && solver->self_sleep_region_count > 0;
+    if (solver->cfg.jitter_stabilizer_enabled && solver->jitter_frame_start_pos) {
+        if (!set_cuda_error(
+                cudaMemcpy(
+                    solver->jitter_frame_start_pos,
+                    solver->pos,
+                    sizeof(Vec3) * solver->cfg.vertex_count,
+                    cudaMemcpyDeviceToDevice
+                ),
+                "save jitter stabilizer frame start positions")) {
+            destroy_timing_records(timing_ptr);
+            return 0;
+        }
+    }
     solver->self_sleep_force_active = 0;
     if (use_self_sleep) {
         clear_self_sleep_frame_flags_kernel<<<block_count(solver->self_sleep_region_count), 256>>>(*solver);
@@ -4953,6 +5342,7 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
         int volume_interval = std::max(solver->cfg.volume_solve_interval, 1);
         bool run_volume_pressure = solver->cfg.use_volume_pressure
             && (((s + 1) % volume_interval) == 0 || s == substeps - 1);
+        bool run_jitter_filter = solver->cfg.jitter_stabilizer_enabled && s == substeps - 1;
         if (!run_substep(
                 solver,
                 sub_dt,
@@ -4968,6 +5358,7 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
                 &recovery_passes_total,
                 &local_retry_total,
                 true,
+                run_jitter_filter,
                 timing_ptr)) {
             destroy_timing_records(timing_ptr);
             return 0;

@@ -55,6 +55,7 @@ typedef struct SsblXpbdConfig {
     float self_sleep_motion_scale;
     float self_compaction_active_fraction_threshold;
     int self_pair_compaction_enabled;
+    int jitter_stabilizer_enabled;
 } SsblXpbdConfig;
 
 typedef struct SsblXpbdDiagnostics {
@@ -90,6 +91,9 @@ typedef struct SsblXpbdDiagnostics {
     long long self_vs_pair_capacity;
     long long self_vs_pair_overflow;
     long long self_vs_pair_compaction_used;
+    long long jitter_stabilized_vertices;
+    long long jitter_rejected_vertices;
+    float jitter_max_correction;
     int finite_flag;
 } SsblXpbdDiagnostics;
 

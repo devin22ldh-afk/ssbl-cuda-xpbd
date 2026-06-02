@@ -36,6 +36,7 @@ _OBJECT_CROSS_COLLISION_PROP = "ssbl_enable_cross_cloth_collision"
 _IDENTITY_4X4 = np.eye(4, dtype=np.float32)
 STATUS_IDLE = "Idle"
 STATUS_PREVIEW_RUNNING = "Preview Running"
+STATUS_PREVIEW_PAUSED = "Preview Paused"
 STATUS_PREVIEW_STOPPED = "Preview Stopped"
 STATUS_BAKING = "Baking"
 STATUS_FINISHED = "Finished"
@@ -81,6 +82,12 @@ class ClothSlot:
     cross_cloth_collision: bool
     current_positions_world: np.ndarray
     writeback_local_buffer: np.ndarray
+    writeback_flat_buffer: np.ndarray
+    substeps: int
+    iterations: int
+    writeback_interval: int
+    frame_count: int
+    use_object_settings: bool
 
 
 @dataclass
@@ -102,6 +109,9 @@ class SceneSession:
     last_diagnostics: NativeStepDiagnostics = field(default_factory=NativeStepDiagnostics)
     stop_requested: bool = False
     closed: bool = False
+    playback_driven: bool = False
+    paused: bool = False
+    last_scene_frame: int = 0
 
     @property
     def cloth(self) -> ClothBuildData:
@@ -122,6 +132,8 @@ def session_status(obj: Optional[bpy.types.Object]) -> str:
         return STATUS_IDLE
     session = _session_for_object_name(obj.name)
     if session is not None:
+        if bool(getattr(session, "paused", False)):
+            return STATUS_PREVIEW_PAUSED
         return STATUS_PREVIEW_RUNNING
     return _STATUS.get(obj.name, STATUS_IDLE)
 
@@ -182,6 +194,9 @@ def record_viewport_tag_ms(object_name: str, elapsed_ms: float) -> None:
         self_vs_pair_capacity=diag.self_vs_pair_capacity,
         self_vs_pair_overflow=diag.self_vs_pair_overflow,
         self_vs_pair_compaction_used=diag.self_vs_pair_compaction_used,
+        jitter_stabilized_vertices=diag.jitter_stabilized_vertices,
+        jitter_rejected_vertices=diag.jitter_rejected_vertices,
+        jitter_max_correction=diag.jitter_max_correction,
         finite=diag.finite,
         frame_ms=diag.frame_ms,
         frame_set_ms=diag.frame_set_ms,
@@ -257,11 +272,57 @@ def clear_startup_build_caches() -> None:
     clear_static_collision_cache()
 
 
+def _object_cloth_settings(obj: bpy.types.Object | None):
+    if obj is None or not hasattr(obj, "ssbl_cloth"):
+        return None
+    settings = obj.ssbl_cloth
+    if bool(getattr(settings, "enabled", False)):
+        return settings
+    return None
+
+
+def _settings_for_object(
+    context: bpy.types.Context,
+    obj: bpy.types.Object | None,
+    fallback=None,
+    require_enabled: bool = False,
+):
+    object_settings = _object_cloth_settings(obj)
+    if object_settings is not None:
+        return object_settings
+    if require_enabled:
+        return None
+    return fallback if fallback is not None else context.scene.ssbl_preview
+
+
+def _settings_for_slot(context: bpy.types.Context, slot: ClothSlot):
+    obj = bpy.data.objects.get(slot.object_name)
+    if bool(slot.use_object_settings):
+        object_settings = _object_cloth_settings(obj)
+        if object_settings is not None:
+            return object_settings
+    return context.scene.ssbl_preview
+
+
+def _enabled_playback_cloth_objects(scene: bpy.types.Scene) -> list[bpy.types.Object]:
+    objects: list[bpy.types.Object] = []
+    for obj in scene.objects:
+        if obj is None or obj.type != "MESH":
+            continue
+        settings = _object_cloth_settings(obj)
+        if settings is None:
+            continue
+        if _declared_input_type(obj) in _UNSUPPORTED_INPUT_TYPES:
+            continue
+        objects.append(obj)
+    return sorted(objects, key=lambda item: (int(getattr(item, _OBJECT_COLLISION_LAYER_PROP, item.get(_OBJECT_COLLISION_LAYER_PROP, 1))), item.name.casefold()))
+
+
 def start_preview(context: bpy.types.Context, obj: bpy.types.Object) -> SceneSession:
     try:
         if context.mode != "OBJECT":
             raise ValueError("Preview must be started in Object mode.")
-        settings = context.scene.ssbl_preview
+        settings = _settings_for_object(context, obj, context.scene.ssbl_preview)
         cloth_objects = _preview_cloth_objects(context, obj, settings)
         for cloth_obj in cloth_objects:
             _ensure_supported_cloth_object(cloth_obj)
@@ -276,7 +337,8 @@ def start_preview(context: bpy.types.Context, obj: bpy.types.Object) -> SceneSes
         slots: dict[str, ClothSlot] = {}
         depsgraph = context.evaluated_depsgraph_get()
         for cloth_obj in cloth_objects:
-            slot = _create_cloth_slot(context, cloth_obj, settings, depsgraph)
+            slot_settings = _settings_for_object(context, cloth_obj, settings)
+            slot = _create_cloth_slot(context, cloth_obj, slot_settings, depsgraph)
             slots[slot.object_name] = slot
 
         solve_order = sorted(
@@ -299,6 +361,7 @@ def start_preview(context: bpy.types.Context, obj: bpy.types.Object) -> SceneSes
             last_fps_time=time.perf_counter(),
             fps_sample_frames=0,
             actual_fps=0.0,
+            last_scene_frame=int(context.scene.frame_current),
         )
         _SCENE_SESSIONS[scene_key] = session
         for name, slot in slots.items():
@@ -309,12 +372,168 @@ def start_preview(context: bpy.types.Context, obj: bpy.types.Object) -> SceneSes
                 slot.current_positions_world,
                 slot.cloth.matrix_world_inv,
                 local_buffer=slot.writeback_local_buffer,
+                flat_buffer=slot.writeback_flat_buffer,
             )
         return session
     except Exception:
         if obj is not None:
             _STATUS[obj.name] = STATUS_ERROR
         raise
+
+
+def start_timeline_preview(context: bpy.types.Context, scene: bpy.types.Scene | None = None) -> SceneSession | None:
+    scene = scene or context.scene
+    cloth_objects = _enabled_playback_cloth_objects(scene)
+    if not cloth_objects:
+        return None
+
+    scene_key = _scene_key(scene)
+    existing = _SCENE_SESSIONS.get(scene_key)
+    enabled_names = {obj.name for obj in cloth_objects}
+    if existing is not None and bool(existing.playback_driven) and set(existing.solve_order) == enabled_names:
+        current_frame = int(scene.frame_current)
+        if existing.frame_index == 0 or current_frame >= int(existing.last_scene_frame):
+            existing.paused = False
+            for name in existing.solve_order:
+                _STATUS[name] = STATUS_PREVIEW_RUNNING
+            return existing
+        _finish_session(existing, STATUS_IDLE)
+    elif existing is not None:
+        _finish_session(existing, STATUS_IDLE)
+
+    slots: dict[str, ClothSlot] = {}
+    depsgraph = context.evaluated_depsgraph_get()
+    for cloth_obj in cloth_objects:
+        _ensure_supported_cloth_object(cloth_obj)
+        settings = _settings_for_object(context, cloth_obj, require_enabled=True)
+        if settings is None:
+            continue
+        slot = _create_cloth_slot(context, cloth_obj, settings, depsgraph)
+        slots[slot.object_name] = slot
+    if not slots:
+        return None
+
+    solve_order = sorted(
+        slots.keys(),
+        key=lambda name: (slots[name].collision_layer, name.casefold()),
+    )
+    active_name = solve_order[0]
+    session = SceneSession(
+        scene_name=scene.name,
+        object_name=active_name,
+        slots=slots,
+        solve_order=solve_order,
+        frame_index=0,
+        frame_count=max(int(scene.frame_end) - int(scene.frame_current) + 1, 1),
+        start_frame=int(scene.frame_current),
+        substeps=max(slot.substeps for slot in slots.values()),
+        iterations=max(slot.iterations for slot in slots.values()),
+        writeback_interval=max(min(slot.writeback_interval for slot in slots.values()), 1),
+        cross_cloth_mode=str(getattr(scene.ssbl_preview, "cross_cloth_collision", "lower_layers")),
+        last_fps_time=time.perf_counter(),
+        fps_sample_frames=0,
+        actual_fps=0.0,
+        playback_driven=True,
+        paused=False,
+        last_scene_frame=int(scene.frame_current),
+    )
+    _SCENE_SESSIONS[scene_key] = session
+    for name, slot in slots.items():
+        _OBJECT_TO_SCENE_SESSION[name] = scene_key
+        _STATUS[name] = STATUS_PREVIEW_RUNNING
+        _apply_world_positions(
+            bpy.data.objects[name],
+            slot.current_positions_world,
+            slot.cloth.matrix_world_inv,
+            local_buffer=slot.writeback_local_buffer,
+            flat_buffer=slot.writeback_flat_buffer,
+        )
+    return session
+
+
+def pause_timeline_preview(scene: bpy.types.Scene | None = None) -> None:
+    scene = scene or bpy.context.scene
+    session = _SCENE_SESSIONS.get(_scene_key(scene))
+    if session is None or not bool(session.playback_driven):
+        return
+    session.paused = True
+    for name in session.solve_order:
+        _STATUS[name] = STATUS_PREVIEW_PAUSED
+
+
+def _writeback_decisions(session: SceneSession, next_frame: int, scene_end: int) -> dict[str, bool]:
+    cross_cloth_enabled = len(session.slots) > 1 and str(session.cross_cloth_mode or "off").lower() != "off"
+    decisions: dict[str, bool] = {}
+    for slot_name, slot in session.slots.items():
+        decisions[slot_name] = bool(
+            session.frame_index == 0
+            or ((session.frame_index + 1) % max(slot.writeback_interval, 1)) == 0
+            or next_frame >= scene_end
+            or cross_cloth_enabled
+        )
+    return decisions
+
+
+def step_timeline_preview(context: bpy.types.Context, scene: bpy.types.Scene | None = None) -> bool:
+    scene = scene or context.scene
+    session = _SCENE_SESSIONS.get(_scene_key(scene))
+    enabled_names = {obj.name for obj in _enabled_playback_cloth_objects(scene)}
+    if not enabled_names:
+        if session is not None and bool(session.playback_driven):
+            _finish_session(session, STATUS_IDLE)
+        return True
+    if session is None or not bool(session.playback_driven) or set(session.solve_order) != enabled_names:
+        session = start_timeline_preview(context, scene)
+        if session is None:
+            return True
+
+    current_frame = int(scene.frame_current)
+    if session.frame_index > 0 and (current_frame <= int(session.last_scene_frame) or current_frame - int(session.last_scene_frame) > 1):
+        _finish_session(session, STATUS_IDLE)
+        session = start_timeline_preview(context, scene)
+        if session is None:
+            return True
+        return False
+
+    step_started = time.perf_counter()
+    perf = FramePerf()
+    writeback_by_slot = _writeback_decisions(session, current_frame, scene_end=int(scene.frame_end))
+    perf.writeback_performed = any(writeback_by_slot.values())
+    try:
+        _refresh_session_runtime_inputs(context, session, perf)
+        _step_session_slots(session, writeback_by_slot, perf)
+        if perf.writeback_performed:
+            started = time.perf_counter()
+            for slot_name, should_writeback in writeback_by_slot.items():
+                if not should_writeback:
+                    continue
+                slot = session.slots[slot_name]
+                obj = bpy.data.objects.get(slot.object_name)
+                if obj is None or obj.type != "MESH":
+                    raise ValueError(f"Missing preview object during timeline writeback: {slot.object_name}")
+                _apply_world_positions(
+                    obj,
+                    slot.current_positions_world,
+                    slot.cloth.matrix_world_inv,
+                    local_buffer=slot.writeback_local_buffer,
+                    flat_buffer=slot.writeback_flat_buffer,
+                    perf=perf,
+                )
+            perf.writeback_ms += _elapsed_ms(started)
+    except Exception:
+        _finish_session(session, STATUS_ERROR)
+        raise
+
+    session.paused = False
+    session.frame_index += 1
+    session.last_scene_frame = current_frame
+    perf.frame_ms = _elapsed_ms(step_started)
+    session.last_diagnostics = _aggregate_session_diagnostics(session, perf)
+    for slot_name in session.solve_order:
+        _LAST_DIAGNOSTICS[slot_name] = session.last_diagnostics
+        _STATUS[slot_name] = STATUS_PREVIEW_RUNNING
+    _update_session_fps(session, step_started)
+    return False
 
 
 def step_preview(context: bpy.types.Context, object_name: str) -> bool:
@@ -360,6 +579,7 @@ def step_preview(context: bpy.types.Context, object_name: str) -> bool:
                     slot.current_positions_world,
                     slot.cloth.matrix_world_inv,
                     local_buffer=slot.writeback_local_buffer,
+                    flat_buffer=slot.writeback_flat_buffer,
                     perf=perf,
                 )
             perf.writeback_ms += _elapsed_ms(started)
@@ -379,7 +599,7 @@ def step_preview(context: bpy.types.Context, object_name: str) -> bool:
 def bake_xpbd_cache(context: bpy.types.Context, obj: bpy.types.Object) -> str:
     _ensure_supported_cloth_object(obj)
 
-    settings = context.scene.ssbl_preview
+    settings = _settings_for_object(context, obj, context.scene.ssbl_preview)
     start = int(settings.bake_start)
     end = int(settings.bake_end)
     if end < start:
@@ -390,7 +610,12 @@ def bake_xpbd_cache(context: bpy.types.Context, obj: bpy.types.Object) -> str:
     original_frame = int(context.scene.frame_current)
     try:
         context.scene.frame_set(start)
-        cloth, native, static_signature, _static_tris = _create_native_solver(context, obj, settings)
+        cloth, native, static_signature, _static_tris = _create_native_solver(
+            context,
+            obj,
+            settings,
+            runtime_mode_override="bake",
+        )
         path = _cache_path_for_object(obj)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         sample_count = end - start + 1
@@ -399,7 +624,7 @@ def bake_xpbd_cache(context: bpy.types.Context, obj: bpy.types.Object) -> str:
             _write_pc2_header(handle, len(cloth.positions_world), start, sample_count)
             _write_pc2_sample(handle, cloth.positions_world, cloth.matrix_world_inv)
             for frame in range(start + 1, end + 1):
-                _refresh_bake_runtime_inputs(context, obj, cloth, native, frame, static_signature)
+                _refresh_bake_runtime_inputs(context, obj, cloth, native, frame, static_signature, settings)
                 native.step(max(int(settings.substeps), 1), max(int(settings.iterations), 1))
                 world_positions = native.download_positions()
                 _write_pc2_sample(handle, world_positions, cloth.matrix_world_inv)
@@ -612,11 +837,14 @@ def _create_cloth_slot(
         settings,
         depsgraph=depsgraph,
         use_evaluated_mesh_override=use_evaluated_mesh,
+        runtime_mode_override="preview",
     )
     suspended_modifiers = _suspend_preview_modifiers(obj, suspend_all=use_evaluated_mesh)
     preview_mesh = original_mesh.copy()
     preview_mesh.name = f"{original_mesh.name}_SSBL_XPBD_Preview"
     obj.data = preview_mesh
+    writeback_flat_buffer = np.empty(cloth.positions_world.size, dtype=np.float32)
+    writeback_local_buffer = writeback_flat_buffer.reshape(cloth.positions_world.shape)
     return ClothSlot(
         object_name=obj.name,
         cloth=cloth,
@@ -634,11 +862,19 @@ def _create_cloth_slot(
             use_evaluated_mesh,
         ),
         pin_targets_world=np.array(cloth.pin_targets_world, dtype=np.float32, copy=True),
-        runtime_options_signature=_runtime_options_signature(settings_to_options(settings)),
+        runtime_options_signature=_runtime_options_signature(
+            settings_to_options(settings, runtime_mode_override="preview")
+        ),
         collision_layer=_object_collision_layer(obj),
         cross_cloth_collision=_object_cross_collision_enabled(obj),
         current_positions_world=np.array(cloth.positions_world, dtype=np.float32, copy=True),
-        writeback_local_buffer=np.empty_like(cloth.positions_world, dtype=np.float32),
+        writeback_local_buffer=writeback_local_buffer,
+        writeback_flat_buffer=writeback_flat_buffer,
+        substeps=max(int(getattr(settings, "substeps", 1)), 1),
+        iterations=max(int(getattr(settings, "iterations", 1)), 1),
+        writeback_interval=max(int(getattr(settings, "preview_writeback_interval", 1)), 1),
+        frame_count=max(int(getattr(settings, "frame_count", 1)), 1),
+        use_object_settings=bool(_object_cloth_settings(obj) is not None),
     )
 
 
@@ -648,6 +884,7 @@ def _create_native_solver(
     settings,
     depsgraph: bpy.types.Depsgraph | None = None,
     use_evaluated_mesh_override: bool | None = None,
+    runtime_mode_override: str | None = None,
 ) -> tuple[ClothBuildData, NativeXpbdSolver, tuple[tuple[str, int, int], ...], np.ndarray]:
     try:
         depsgraph = depsgraph or context.evaluated_depsgraph_get()
@@ -658,7 +895,7 @@ def _create_native_solver(
         )
         with _temporary_setting(settings, "use_evaluated_mesh", use_evaluated_mesh):
             cloth = build_cloth_data(obj, settings, depsgraph=depsgraph)
-        options = settings_to_options(settings)
+        options = settings_to_options(settings, runtime_mode_override=runtime_mode_override)
         static_tris, static_signature = collect_static_triangles(
             settings.static_collider_collection,
             obj,
@@ -675,14 +912,11 @@ def _create_native_solver(
 
 def _refresh_session_runtime_inputs(context: bpy.types.Context, session: SceneSession, perf: FramePerf | None = None) -> None:
     refresh_started = time.perf_counter()
-    settings = context.scene.ssbl_preview
-    options = settings_to_options(settings)
-    runtime_signature = _runtime_options_signature(options)
-    static_collection = settings.static_collider_collection
-    has_static_collection = static_collection is not None
-    needs_depsgraph = has_static_collection or any(
-        slot.use_evaluated_mesh and len(slot.cloth.pin_indices) > 0
-        for slot in session.slots.values()
+    slot_settings = {name: _settings_for_slot(context, slot) for name, slot in session.slots.items()}
+    needs_depsgraph = any(
+        getattr(slot_settings[name], "static_collider_collection", None) is not None
+        or (slot.use_evaluated_mesh and len(slot.cloth.pin_indices) > 0)
+        for name, slot in session.slots.items()
     )
     with _with_session_source_state(session):
         context.view_layer.update()
@@ -691,6 +925,11 @@ def _refresh_session_runtime_inputs(context: bpy.types.Context, session: SceneSe
             obj = bpy.data.objects.get(slot.object_name)
             if obj is None or obj.type != "MESH":
                 raise ValueError(f"Missing preview object during input refresh: {slot.object_name}")
+            settings = slot_settings[slot.object_name]
+            options = settings_to_options(settings, runtime_mode_override="preview")
+            runtime_signature = _runtime_options_signature(options)
+            static_collection = settings.static_collider_collection
+            has_static_collection = static_collection is not None
             if len(slot.cloth.pin_indices) > 0:
                 pin_targets, matrix_world = _pin_targets_from_object(
                     obj,
@@ -736,10 +975,17 @@ def _refresh_session_runtime_inputs(context: bpy.types.Context, session: SceneSe
         perf.input_refresh_ms += _elapsed_ms(refresh_started)
 
 
-def _step_session_slots(session: SceneSession, download_positions: bool, perf: FramePerf | None = None) -> None:
+def _slot_should_download(download_positions, slot_name: str) -> bool:
+    if isinstance(download_positions, dict):
+        return bool(download_positions.get(slot_name, False))
+    return bool(download_positions)
+
+
+def _step_session_slots(session: SceneSession, download_positions, perf: FramePerf | None = None) -> None:
     cross_cloth_enabled = len(session.slots) > 1 and str(session.cross_cloth_mode or "off").lower() != "off"
     for slot_name in session.solve_order:
         slot = session.slots[slot_name]
+        should_download = _slot_should_download(download_positions, slot_name)
         if cross_cloth_enabled:
             started = time.perf_counter()
             dynamic_triangles = _collect_cross_cloth_triangles(session, slot)
@@ -759,16 +1005,16 @@ def _step_session_slots(session: SceneSession, download_positions: bool, perf: F
                 perf.dynamic_upload_ms += elapsed
                 perf.frame_input_upload_ms += elapsed
         started = time.perf_counter()
-        sample_diagnostics = bool(download_positions or cross_cloth_enabled)
+        sample_diagnostics = bool(should_download or cross_cloth_enabled)
         slot.native.step(
-            session.substeps,
-            session.iterations,
+            slot.substeps,
+            slot.iterations,
             diagnostics=sample_diagnostics,
             synchronize=sample_diagnostics,
         )
         if perf is not None:
             perf.cuda_step_call_ms += _elapsed_ms(started)
-        if download_positions or cross_cloth_enabled:
+        if should_download or cross_cloth_enabled:
             started = time.perf_counter()
             slot.current_positions_world = np.array(slot.native.download_positions(), dtype=np.float32, copy=True)
             if perf is not None:
@@ -801,10 +1047,11 @@ def _refresh_bake_runtime_inputs(
     native: NativeXpbdSolver,
     frame: int,
     expected_static_signature: tuple[tuple[str, int, int], ...],
+    settings,
 ) -> None:
     context.scene.frame_set(frame)
     depsgraph = context.evaluated_depsgraph_get()
-    use_evaluated_mesh = _effective_use_evaluated_mesh(obj, context.scene.ssbl_preview)
+    use_evaluated_mesh = _effective_use_evaluated_mesh(obj, settings)
     world_positions, matrix_world = world_positions_from_object(
         obj,
         use_evaluated_mesh,
@@ -812,7 +1059,7 @@ def _refresh_bake_runtime_inputs(
         expected_vertex_count=len(cloth.positions_world),
     )
     static_tris, static_signature = collect_static_triangles(
-        context.scene.ssbl_preview.static_collider_collection,
+        settings.static_collider_collection,
         obj,
         depsgraph=depsgraph,
         use_evaluated_mesh=use_evaluated_mesh,
@@ -825,7 +1072,7 @@ def _refresh_bake_runtime_inputs(
         pin_indices=cloth.pin_indices,
         pin_positions=pin_targets,
         update_pin=True,
-        options=settings_to_options(context.scene.ssbl_preview),
+        options=settings_to_options(settings, runtime_mode_override="bake"),
         update_runtime=True,
         static_triangles=static_tris,
         update_static=True,
@@ -965,7 +1212,7 @@ def _finish_session(session: SceneSession, status: str) -> None:
             _safe_remove_mesh(slot.preview_mesh)
         _STATUS[slot.object_name] = status
     scene = bpy.data.scenes.get(session.scene_name)
-    if scene is not None:
+    if scene is not None and not bool(session.playback_driven):
         try:
             scene.frame_set(session.start_frame)
         except Exception:
@@ -1060,6 +1307,7 @@ def _apply_world_positions(
     world_positions: np.ndarray,
     matrix_world_inv: np.ndarray,
     local_buffer: np.ndarray | None = None,
+    flat_buffer: np.ndarray | None = None,
     perf: FramePerf | None = None,
 ) -> None:
     try:
@@ -1072,18 +1320,29 @@ def _apply_world_positions(
     started = time.perf_counter()
     world = np.asarray(world_positions, dtype=np.float32)
     matrix_inv = np.asarray(matrix_world_inv, dtype=np.float32)
+    flat = None
+    if flat_buffer is not None and flat_buffer.size == world.size:
+        candidate = np.asarray(flat_buffer, dtype=np.float32)
+        if candidate.ndim == 1 and candidate.flags.c_contiguous:
+            flat = candidate
     local = local_buffer if local_buffer is not None and local_buffer.shape == world.shape else None
     if local is None:
-        local = np.empty_like(world, dtype=np.float32)
+        if flat is not None:
+            local = flat.reshape(world.shape)
+        else:
+            local = np.empty_like(world, dtype=np.float32)
     if matrix_inv.shape == (4, 4) and np.allclose(matrix_inv, _IDENTITY_4X4, rtol=0.0, atol=1.0e-7):
         np.copyto(local, world, casting="unsafe")
     else:
         np.matmul(world, matrix_inv[:3, :3].T, out=local)
         local += matrix_inv[:3, 3]
+    if flat is None:
+        flat = np.ravel(local)
+    elif not np.shares_memory(flat, local):
+        np.copyto(flat, np.ravel(local), casting="unsafe")
     if perf is not None:
         perf.writeback_to_local_ms += _elapsed_ms(started)
 
-    flat = local.reshape(-1)
     started = time.perf_counter()
     mesh.vertices.foreach_set("co", flat)
     if perf is not None:
@@ -1144,6 +1403,9 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
     self_vs_pair_capacity = 0
     self_vs_pair_overflow = 0
     self_vs_pair_compaction_used = 0
+    jitter_stabilized_vertices = 0
+    jitter_rejected_vertices = 0
+    jitter_max_correction = 0.0
     finite = True
     writeback_performed = False
     diag_started = time.perf_counter()
@@ -1181,6 +1443,9 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
         self_vs_pair_capacity += int(diag.self_vs_pair_capacity)
         self_vs_pair_overflow += int(diag.self_vs_pair_overflow)
         self_vs_pair_compaction_used += int(diag.self_vs_pair_compaction_used)
+        jitter_stabilized_vertices += int(diag.jitter_stabilized_vertices)
+        jitter_rejected_vertices += int(diag.jitter_rejected_vertices)
+        jitter_max_correction = max(jitter_max_correction, float(diag.jitter_max_correction))
         finite = finite and bool(diag.finite)
         writeback_performed = writeback_performed or bool(diag.writeback_performed)
         if diag.min_gap is not None:
@@ -1221,6 +1486,9 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
         self_vs_pair_capacity=self_vs_pair_capacity,
         self_vs_pair_overflow=self_vs_pair_overflow,
         self_vs_pair_compaction_used=self_vs_pair_compaction_used,
+        jitter_stabilized_vertices=jitter_stabilized_vertices,
+        jitter_rejected_vertices=jitter_rejected_vertices,
+        jitter_max_correction=jitter_max_correction,
         finite=finite,
         frame_ms=perf.frame_ms if perf is not None else 0.0,
         frame_set_ms=perf.frame_set_ms if perf is not None else 0.0,

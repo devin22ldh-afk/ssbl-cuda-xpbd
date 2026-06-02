@@ -5,6 +5,7 @@ from .session_manager import (
     STATUS_ERROR,
     STATUS_FINISHED,
     STATUS_IDLE,
+    STATUS_PREVIEW_PAUSED,
     STATUS_PREVIEW_RUNNING,
     STATUS_PREVIEW_STOPPED,
     SceneSession,
@@ -21,8 +22,11 @@ from .session_manager import (
     session_diagnostics,
     session_fps,
     session_status,
+    pause_timeline_preview,
     start_preview,
+    start_timeline_preview,
     step_preview,
+    step_timeline_preview,
 )
 
 PreviewSession = SceneSession

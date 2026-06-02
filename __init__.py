@@ -50,6 +50,45 @@ def _apply_hardness(settings, _context):
     sync_hardness_settings(settings)
 
 
+_OBJECT_SETTING_COPY_SKIP = {
+    "rna_type",
+    "enabled",
+    "object_settings_initialized",
+}
+
+
+def _copy_scene_defaults_to_object_settings(settings, context) -> None:
+    if context is None or not hasattr(context.scene, "ssbl_preview"):
+        return
+    source = context.scene.ssbl_preview
+    if source is settings:
+        return
+    for prop in source.bl_rna.properties:
+        identifier = prop.identifier
+        if identifier in _OBJECT_SETTING_COPY_SKIP or prop.is_readonly:
+            continue
+        try:
+            setattr(settings, identifier, getattr(source, identifier))
+        except Exception:
+            pass
+
+
+def _apply_enabled(settings, context):
+    owner = getattr(settings, "id_data", None)
+    if owner is None or not isinstance(owner, bpy.types.Object):
+        return
+    if bool(settings.enabled):
+        if not bool(getattr(settings, "object_settings_initialized", False)):
+            _copy_scene_defaults_to_object_settings(settings, context)
+            settings.object_settings_initialized = True
+            sync_hardness_settings(settings)
+        return
+    try:
+        solver.reset_preview_object(owner)
+    except Exception:
+        pass
+
+
 @persistent
 def _initialize_hardness_for_scenes(_dummy=None):
     if not hasattr(bpy.types.Scene, "ssbl_preview"):
@@ -61,10 +100,28 @@ def _initialize_hardness_for_scenes(_dummy=None):
             sync_hardness_settings(scene.ssbl_preview)
         except Exception:
             pass
+    if hasattr(bpy.types.Object, "ssbl_cloth"):
+        for obj in bpy.data.objects:
+            try:
+                sync_hardness_settings(obj.ssbl_cloth)
+            except Exception:
+                pass
     return None
 
 
 class SSBL_PreviewSettings(PropertyGroup):
+    enabled: BoolProperty(
+        name="启用 SSBL 布料",
+        default=False,
+        update=_apply_enabled,
+        description="启用后，按空格播放时间轴即可运行 SSBL CUDA XPBD 布料预览",
+    )
+    object_settings_initialized: BoolProperty(
+        name="SSBL 对象设置已初始化",
+        default=False,
+        options={"HIDDEN"},
+        description="内部标记：对象首次启用时从场景默认设置复制一次",
+    )
     runtime_mode: EnumProperty(
         name="运行模式",
         items=[
@@ -72,6 +129,7 @@ class SSBL_PreviewSettings(PropertyGroup):
             ("bake", "烘焙", "烘焙为 PC2 缓存"),
         ],
         default="preview",
+        options={"HIDDEN"},
         description="选择实时预览或 PC2 缓存烘焙模式",
     )
     hardness: FloatProperty(
@@ -99,6 +157,7 @@ class SSBL_PreviewSettings(PropertyGroup):
         default=120,
         min=1,
         soft_max=1000,
+        options={"HIDDEN"},
         description="预览计时器要模拟的帧数",
     )
     preview_target_fps: FloatProperty(
@@ -376,6 +435,12 @@ class SSBL_PreviewSettings(PropertyGroup):
         options={"HIDDEN"},
         description="Internal preview vertex-surface pair compaction for self-collision solve/probe/recovery",
     )
+    jitter_stabilizer_enabled: BoolProperty(
+        name="Jitter stabilizer",
+        default=True,
+        options={"HIDDEN"},
+        description="Internal fast-preview filter for high-frequency self-collision surface jitter",
+    )
     use_ground: BoolProperty(
         name="地面平面",
         default=True,
@@ -429,7 +494,7 @@ CLASSES = (
     operators.SSBL_OT_reset_preview,
     operators.SSBL_OT_bake_xpbd_cache,
     operators.SSBL_OT_clear_xpbd_cache,
-    ui.SSBL_PT_preview_panel,
+    ui.SSBL_PT_physics_panel,
 )
 
 
@@ -437,9 +502,11 @@ def register():
     for cls in CLASSES:
         bpy.utils.register_class(cls)
     bpy.types.Scene.ssbl_preview = PointerProperty(type=SSBL_PreviewSettings)
+    bpy.types.Object.ssbl_cloth = PointerProperty(type=SSBL_PreviewSettings)
     _initialize_hardness_for_scenes()
     if _initialize_hardness_for_scenes not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(_initialize_hardness_for_scenes)
+    operators.register_playback_handlers()
     bpy.types.Object.ssbl_collision_layer = IntProperty(
         name="碰撞层级",
         default=1,
@@ -465,12 +532,15 @@ def unregister():
         pass
     if hasattr(bpy.types.Scene, "ssbl_preview"):
         del bpy.types.Scene.ssbl_preview
+    if hasattr(bpy.types.Object, "ssbl_cloth"):
+        del bpy.types.Object.ssbl_cloth
     if hasattr(bpy.types.Object, "ssbl_collision_layer"):
         del bpy.types.Object.ssbl_collision_layer
     if hasattr(bpy.types.Object, "ssbl_enable_cross_cloth_collision"):
         del bpy.types.Object.ssbl_enable_cross_cloth_collision
     if _initialize_hardness_for_scenes in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(_initialize_hardness_for_scenes)
+    operators.unregister_playback_handlers()
     for cls in reversed(CLASSES):
         try:
             bpy.utils.unregister_class(cls)
