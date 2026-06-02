@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
+import hashlib
 
 import bmesh
 import bpy
@@ -23,6 +25,7 @@ _HARDNESS_OUTPUT_SCALE = 0.70
 _TETHER_START_HARDNESS = 0.50
 _LEGACY_BALANCED_STRETCH = 1.0e-6
 _LEGACY_BALANCED_BEND = 1.0e-4
+_STARTUP_CACHE_LIMIT = 16
 
 
 @dataclass
@@ -83,6 +86,18 @@ class ClothBuildData:
     rest_volume: float
 
 
+@dataclass
+class _TopologyCacheEntry:
+    triangles: np.ndarray
+    edges: np.ndarray
+    edge_color_offsets: np.ndarray
+    bends: np.ndarray
+    bend_color_offsets: np.ndarray
+    lra_edges: np.ndarray
+    lra_color_offsets: np.ndarray
+    pin_indices: np.ndarray
+
+
 @dataclass(frozen=True)
 class HardnessDerivedSettings:
     hardness: float
@@ -91,6 +106,30 @@ class HardnessDerivedSettings:
     hidden_tether_enabled: bool
     hidden_tether_compliance: float
     hidden_tether_slack: float
+
+
+_TOPOLOGY_CACHE: OrderedDict[tuple, _TopologyCacheEntry] = OrderedDict()
+_TOPOLOGY_CACHE_STATS = {
+    "hits": 0,
+    "misses": 0,
+    "last_hit": False,
+}
+
+
+def clear_cloth_topology_cache() -> None:
+    _TOPOLOGY_CACHE.clear()
+    _TOPOLOGY_CACHE_STATS["hits"] = 0
+    _TOPOLOGY_CACHE_STATS["misses"] = 0
+    _TOPOLOGY_CACHE_STATS["last_hit"] = False
+
+
+def cloth_topology_cache_stats() -> dict[str, int | bool]:
+    return {
+        "hits": int(_TOPOLOGY_CACHE_STATS["hits"]),
+        "misses": int(_TOPOLOGY_CACHE_STATS["misses"]),
+        "last_hit": bool(_TOPOLOGY_CACHE_STATS["last_hit"]),
+        "size": int(len(_TOPOLOGY_CACHE)),
+    }
 
 
 def _clamp01(value: float) -> float:
@@ -166,7 +205,90 @@ def preview_hardness_settings(settings) -> HardnessDerivedSettings:
     return derive_hardness_settings(float(getattr(settings, "hardness", DEFAULT_HARDNESS)))
 
 
-def build_cloth_data(
+def _array_digest(array: np.ndarray) -> str:
+    contiguous = np.ascontiguousarray(array)
+    digest = hashlib.blake2b(digest_size=16)
+    digest.update(str(contiguous.dtype).encode("ascii"))
+    digest.update(np.asarray(contiguous.shape, dtype=np.int64).tobytes())
+    digest.update(contiguous.tobytes())
+    return digest.hexdigest()
+
+
+def _mesh_loop_signature(mesh: bpy.types.Mesh) -> tuple[int, str]:
+    loop_indices = np.empty(len(mesh.loops), dtype=np.int32)
+    if len(loop_indices) > 0:
+        mesh.loops.foreach_get("vertex_index", loop_indices)
+    return len(loop_indices), _array_digest(loop_indices)
+
+
+def _matrix_linear_signature(matrix) -> tuple[float, ...]:
+    mat = np.asarray(matrix, dtype=np.float64)
+    return tuple(round(float(mat[row, col]), 6) for row in range(3) for col in range(3))
+
+
+def _pin_indices_signature(pin_indices: np.ndarray) -> tuple[int, str]:
+    indices = np.ascontiguousarray(pin_indices, dtype=np.int32)
+    return int(len(indices)), _array_digest(indices)
+
+
+def _topology_cache_key(
+    obj: bpy.types.Object,
+    mesh: bpy.types.Mesh,
+    use_evaluated_mesh: bool,
+    pin_indices: np.ndarray,
+    derived: HardnessDerivedSettings,
+    matrix_world,
+    local_positions: np.ndarray,
+) -> tuple:
+    lra_position_signature = (
+        _array_digest(np.asarray(local_positions, dtype=np.float32))
+        if bool(derived.hidden_tether_enabled)
+        else ""
+    )
+    return (
+        int(obj.as_pointer()),
+        int(obj.data.as_pointer()),
+        bool(use_evaluated_mesh),
+        len(mesh.vertices),
+        len(mesh.polygons),
+        len(mesh.loops),
+        _mesh_loop_signature(mesh),
+        _pin_indices_signature(pin_indices),
+        bool(derived.hidden_tether_enabled),
+        round(float(derived.hidden_tether_slack), 6),
+        _matrix_linear_signature(matrix_world),
+        lra_position_signature,
+    )
+
+
+def _get_topology_cache_entry(key: tuple) -> _TopologyCacheEntry | None:
+    entry = _TOPOLOGY_CACHE.get(key)
+    if entry is None:
+        _TOPOLOGY_CACHE_STATS["misses"] = int(_TOPOLOGY_CACHE_STATS["misses"]) + 1
+        _TOPOLOGY_CACHE_STATS["last_hit"] = False
+        return None
+    _TOPOLOGY_CACHE.move_to_end(key)
+    _TOPOLOGY_CACHE_STATS["hits"] = int(_TOPOLOGY_CACHE_STATS["hits"]) + 1
+    _TOPOLOGY_CACHE_STATS["last_hit"] = True
+    return entry
+
+
+def _store_topology_cache_entry(key: tuple, entry: _TopologyCacheEntry) -> None:
+    _TOPOLOGY_CACHE[key] = entry
+    _TOPOLOGY_CACHE.move_to_end(key)
+    while len(_TOPOLOGY_CACHE) > _STARTUP_CACHE_LIMIT:
+        _TOPOLOGY_CACHE.popitem(last=False)
+
+
+def _distance_rest_lengths(constraints: np.ndarray, rest_world: np.ndarray, scale: float = 1.0) -> np.ndarray:
+    if len(constraints) == 0:
+        return np.empty(0, dtype=np.float32)
+    delta = rest_world[constraints[:, 1]] - rest_world[constraints[:, 0]]
+    rest = np.maximum(np.linalg.norm(delta, axis=1) * float(scale), _EPS)
+    return np.asarray(rest, dtype=np.float32)
+
+
+def _build_cloth_data_uncached(
     obj: bpy.types.Object,
     settings,
     depsgraph: bpy.types.Depsgraph | None = None,
@@ -228,6 +350,146 @@ def build_cloth_data(
         lra_rest_lengths=np.ascontiguousarray(lra_rest, dtype=np.float32),
         lra_color_offsets=np.ascontiguousarray(lra_color_offsets, dtype=np.int32),
         pin_indices=pin_indices,
+        pin_targets_world=pin_targets,
+        matrix_world_inv=matrix_world_inv,
+        rest_volume=float(rest_volume),
+    )
+
+
+def build_cloth_data(
+    obj: bpy.types.Object,
+    settings,
+    depsgraph: bpy.types.Depsgraph | None = None,
+) -> ClothBuildData:
+    if obj is None or obj.type != "MESH":
+        raise ValueError("A mesh object is required for cloth simulation.")
+
+    derived = sync_hardness_settings(settings)
+    use_evaluated_mesh = bool(getattr(settings, "use_evaluated_mesh", True))
+    if not use_evaluated_mesh:
+        return _build_cloth_data_from_mesh(
+            obj,
+            settings,
+            derived,
+            obj.data,
+            mesh_local_positions(obj.data),
+            obj.matrix_world.copy(),
+            use_evaluated_mesh=False,
+        )
+
+    depsgraph = depsgraph or bpy.context.evaluated_depsgraph_get()
+    eval_obj = obj.evaluated_get(depsgraph)
+    mesh = eval_obj.to_mesh()
+    try:
+        if len(mesh.vertices) != len(obj.data.vertices):
+            raise ValueError(
+                "Evaluated cloth input must keep the same vertex count as the source mesh."
+            )
+        return _build_cloth_data_from_mesh(
+            obj,
+            settings,
+            derived,
+            mesh,
+            mesh_local_positions(mesh),
+            eval_obj.matrix_world.copy(),
+            use_evaluated_mesh=True,
+        )
+    finally:
+        eval_obj.to_mesh_clear()
+
+
+def _build_cloth_data_from_mesh(
+    obj: bpy.types.Object,
+    settings,
+    derived: HardnessDerivedSettings,
+    mesh: bpy.types.Mesh,
+    local: np.ndarray,
+    matrix_world,
+    use_evaluated_mesh: bool,
+) -> ClothBuildData:
+    world, _matrix_world = to_world(local, matrix_world)
+    matrix_world_inv = np.array(matrix_world.inverted(), dtype=np.float32)
+    pin_mask = pin_mask_from_group(obj, str(settings.pin_vertex_group).strip(), len(local))
+    pin_indices = np.flatnonzero(pin_mask).astype(np.int32)
+    cache_key = _topology_cache_key(
+        obj,
+        mesh,
+        use_evaluated_mesh,
+        pin_indices,
+        derived,
+        matrix_world,
+        local,
+    )
+    cache_entry = _get_topology_cache_entry(cache_key)
+    if cache_entry is not None:
+        triangles = np.array(cache_entry.triangles, dtype=np.int32, copy=True)
+        edges = np.array(cache_entry.edges, dtype=np.int32, copy=True)
+        edge_color_offsets = np.array(cache_entry.edge_color_offsets, dtype=np.int32, copy=True)
+        bends = np.array(cache_entry.bends, dtype=np.int32, copy=True)
+        bend_color_offsets = np.array(cache_entry.bend_color_offsets, dtype=np.int32, copy=True)
+        lra_edges = np.array(cache_entry.lra_edges, dtype=np.int32, copy=True)
+        lra_color_offsets = np.array(cache_entry.lra_color_offsets, dtype=np.int32, copy=True)
+        pin_indices = np.array(cache_entry.pin_indices, dtype=np.int32, copy=True)
+    else:
+        triangles = triangulated_faces(mesh)
+        edges, edge_rest_for_coloring = edge_constraints(triangles, world)
+        edges, _edge_rest, edge_color_offsets = color_distance_constraints(edges, edge_rest_for_coloring, len(world))
+        bends, bend_rest_for_coloring = bend_constraints(triangles, world)
+        bends, _bend_rest, bend_color_offsets = color_distance_constraints(bends, bend_rest_for_coloring, len(world))
+        if derived.hidden_tether_enabled:
+            lra_edges, _lra_rest = hidden_tether_constraints(world, pin_mask, derived.hidden_tether_slack)
+        else:
+            lra_edges = np.empty((0, 2), dtype=np.int32)
+        lra_color_offsets = np.asarray([0], dtype=np.int32)
+        _store_topology_cache_entry(
+            cache_key,
+            _TopologyCacheEntry(
+                triangles=np.ascontiguousarray(triangles, dtype=np.int32),
+                edges=np.ascontiguousarray(edges, dtype=np.int32),
+                edge_color_offsets=np.ascontiguousarray(edge_color_offsets, dtype=np.int32),
+                bends=np.ascontiguousarray(bends, dtype=np.int32),
+                bend_color_offsets=np.ascontiguousarray(bend_color_offsets, dtype=np.int32),
+                lra_edges=np.ascontiguousarray(lra_edges, dtype=np.int32),
+                lra_color_offsets=np.ascontiguousarray(lra_color_offsets, dtype=np.int32),
+                pin_indices=np.ascontiguousarray(pin_indices, dtype=np.int32),
+            ),
+        )
+
+    if len(triangles) == 0:
+        raise ValueError("The cloth mesh needs at least one face.")
+    if np.all(pin_mask):
+        raise ValueError("All vertices are pinned; there is no simulated cloth region.")
+
+    use_volume_pressure = bool(getattr(settings, "use_volume_pressure", False))
+    rest_volume = signed_mesh_volume(world, triangles)
+    if use_volume_pressure:
+        if not is_closed_triangle_mesh(triangles):
+            raise ValueError("Volume pressure requires a closed triangle mesh.")
+        if abs(rest_volume) <= 1.0e-7:
+            raise ValueError("Volume pressure requires a non-zero signed rest volume.")
+        if np.count_nonzero(~pin_mask) < 4:
+            raise ValueError("Volume pressure needs at least four unpinned vertices.")
+
+    edge_rest = _distance_rest_lengths(edges, world)
+    bend_rest = _distance_rest_lengths(bends, world)
+    lra_rest = _distance_rest_lengths(lra_edges, world, derived.hidden_tether_slack)
+    inv_mass = vertex_inverse_mass(world, triangles, float(settings.density), pin_mask)
+    pin_targets = world[pin_indices].astype(np.float32, copy=True)
+
+    return ClothBuildData(
+        positions_world=np.ascontiguousarray(world, dtype=np.float32),
+        inv_mass=np.ascontiguousarray(inv_mass, dtype=np.float32),
+        triangles=np.ascontiguousarray(triangles, dtype=np.int32),
+        edges=np.ascontiguousarray(edges, dtype=np.int32),
+        edge_rest_lengths=np.ascontiguousarray(edge_rest, dtype=np.float32),
+        edge_color_offsets=np.ascontiguousarray(edge_color_offsets, dtype=np.int32),
+        bends=np.ascontiguousarray(bends, dtype=np.int32),
+        bend_rest_lengths=np.ascontiguousarray(bend_rest, dtype=np.float32),
+        bend_color_offsets=np.ascontiguousarray(bend_color_offsets, dtype=np.int32),
+        lra_edges=np.ascontiguousarray(lra_edges, dtype=np.int32),
+        lra_rest_lengths=np.ascontiguousarray(lra_rest, dtype=np.float32),
+        lra_color_offsets=np.ascontiguousarray(lra_color_offsets, dtype=np.int32),
+        pin_indices=np.ascontiguousarray(pin_indices, dtype=np.int32),
         pin_targets_world=pin_targets,
         matrix_world_inv=matrix_world_inv,
         rest_volume=float(rest_volume),

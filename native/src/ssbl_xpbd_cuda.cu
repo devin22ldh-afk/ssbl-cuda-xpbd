@@ -18,15 +18,14 @@ thread_local std::string g_last_error;
 constexpr float kEps = 1.0e-8f;
 constexpr float kProjectionRelaxation = 0.35f;
 constexpr float kSelfProjectionRelaxation = 0.40f;
-constexpr float kSelfRecoveryProjectionRelaxation = 0.70f;
+constexpr float kSelfRecoveryProjectionRelaxation = 0.30f;
 constexpr float kSelfRecoveryVelocityDamping = 0.65f;
 constexpr float kMaxSubstepMove = 0.35f;
 constexpr float kMaxVelocity = 35.0f;
 constexpr int kSelfCollisionPasses = 2;
 constexpr int kSelfSurfaceSamplesPerTriangleDefault = 7;
 constexpr int kSelfSurfaceSamplesPerTriangleReduced = 4;
-constexpr int kSelfRecoveryPassLimit = 2;
-constexpr int kSelfRecoveryCcdClampThreshold = 8;
+constexpr int kSelfRecoveryPassLimit = 1;
 constexpr int kLargeMeshSelfVertexThreshold = 80000;
 constexpr int kLargeMeshSelfTriangleThreshold = 150000;
 constexpr float kSelfCoarseDistanceMultiplier = 1.5f;
@@ -3086,6 +3085,34 @@ __global__ void damp_self_recovery_velocity_kernel(Solver solver) {
     solver.prev[i] = add(solver.prev[i], mul(recovery_delta, kSelfRecoveryVelocityDamping));
 }
 
+__global__ void clamp_self_recovery_displacement_kernel(Solver solver, float max_delta) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= solver.cfg.vertex_count
+        || !solver.self_recovery_touched
+        || !solver.self_recovery_delta
+        || solver.self_recovery_touched[i] == 0
+        || solver.inv_mass[i] <= 0.0f) {
+        return;
+    }
+    Vec3 delta = solver.self_recovery_delta[i];
+    if (!finite_vec(delta)) {
+        diag_note_nonfinite(solver);
+        solver.self_recovery_delta[i] = {0.0f, 0.0f, 0.0f};
+        return;
+    }
+    float len = norm(delta);
+    if (len <= max_delta || len <= kEps) {
+        return;
+    }
+    Vec3 allowed = mul(delta, max_delta / len);
+    Vec3 excess = sub(delta, allowed);
+    solver.pos[i] = sub(solver.pos[i], excess);
+    solver.self_recovery_delta[i] = allowed;
+    if (solver.self_sample_hash_dirty) {
+        atomicExch(solver.self_sample_hash_dirty, 1);
+    }
+}
+
 __global__ void clear_self_sleep_frame_flags_kernel(Solver solver) {
     int region = blockIdx.x * blockDim.x + threadIdx.x;
     if (region >= solver.self_sleep_region_count) {
@@ -3781,6 +3808,48 @@ bool restore_step_diagnostics_state(Solver* solver) {
     );
 }
 
+bool clear_self_recovery_tracking(Solver* solver, const char* label) {
+    if (!solver) {
+        return set_error("invalid self recovery tracking reset");
+    }
+    if (solver->self_recovery_touched) {
+        if (!set_cuda_error(
+                cudaMemset(solver->self_recovery_touched, 0, sizeof(int) * solver->cfg.vertex_count),
+                label)) {
+            return false;
+        }
+    }
+    if (solver->self_recovery_delta) {
+        if (!set_cuda_error(
+                cudaMemset(solver->self_recovery_delta, 0, sizeof(Vec3) * solver->cfg.vertex_count),
+                label)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool clamp_self_recovery_displacement(
+    Solver* solver,
+    int v_blocks,
+    float cloth_thickness,
+    std::vector<TimedSegment>* timings
+) {
+    if (!solver || !solver->self_recovery_touched || !solver->self_recovery_delta) {
+        return true;
+    }
+    TimedSegment segment;
+    if (!begin_timed_segment(timings, kTimingSelfRecovery, &segment, "start recovery displacement clamp timing")) {
+        return false;
+    }
+    float max_delta = std::max(1.0e-4f, cloth_thickness * 0.5f);
+    clamp_self_recovery_displacement_kernel<<<v_blocks, 256>>>(*solver, max_delta);
+    if (!end_timed_segment(timings, &segment, "end recovery displacement clamp timing")) {
+        return false;
+    }
+    return set_cuda_error(cudaGetLastError(), "launch self recovery displacement clamp");
+}
+
 bool run_self_collision_pass(
     Solver* solver,
     int v_blocks,
@@ -3992,13 +4061,12 @@ bool probe_self_collision(
 }
 
 bool self_probe_triggers_recovery(const SsblXpbdDiagnostics& diag, float cloth_thickness) {
-    const float trigger_gap = -0.25f * cloth_thickness;
-    return (valid_min_gap(diag.min_gap) && diag.min_gap < trigger_gap)
-        || diag.ccd_clamp_count >= kSelfRecoveryCcdClampThreshold;
+    const float trigger_gap = -0.85f * cloth_thickness;
+    return valid_min_gap(diag.min_gap) && diag.min_gap < trigger_gap;
 }
 
 bool self_probe_triggers_retry(const SsblXpbdDiagnostics& diag, float cloth_thickness) {
-    const float retry_gap = -0.5f * cloth_thickness;
+    const float retry_gap = -1.25f * cloth_thickness;
     return valid_min_gap(diag.min_gap) && diag.min_gap < retry_gap;
 }
 
@@ -4193,24 +4261,17 @@ bool run_substep(
             }
             float cloth_thickness = std::max(solver->cfg.cloth_thickness, 1.0e-4f);
             int extra_recovery_passes = 0;
-            if (solver->self_recovery_touched) {
-                if (!set_cuda_error(
-                        cudaMemset(solver->self_recovery_touched, 0, sizeof(int) * solver->cfg.vertex_count),
-                        "clear self recovery touched flags")) {
-                    return false;
-                }
-            }
-            if (solver->self_recovery_delta) {
-                if (!set_cuda_error(
-                        cudaMemset(solver->self_recovery_delta, 0, sizeof(Vec3) * solver->cfg.vertex_count),
-                        "clear self recovery delta")) {
-                    return false;
-                }
-            }
             while (extra_recovery_passes < kSelfRecoveryPassLimit
                 && self_probe_triggers_recovery(probe_diag, cloth_thickness)) {
+                if (!clear_self_recovery_tracking(solver, "clear self recovery tracking")) {
+                    return false;
+                }
                 solver->self_source_mode = probe_source_mode;
                 if (!run_self_collision_pass(solver, v_blocks, true, true, timings)) {
+                    solver->self_source_mode = kSelfSourceFull;
+                    return false;
+                }
+                if (!clamp_self_recovery_displacement(solver, v_blocks, cloth_thickness, timings)) {
                     solver->self_source_mode = kSelfSourceFull;
                     return false;
                 }
@@ -4225,8 +4286,14 @@ bool run_substep(
                 }
             }
             if (use_source_compaction && self_probe_triggers_retry(probe_diag, cloth_thickness)) {
+                if (!clear_self_recovery_tracking(solver, "clear full self recovery tracking")) {
+                    return false;
+                }
                 solver->self_source_mode = kSelfSourceFull;
                 if (!run_self_collision_pass(solver, v_blocks, true, true, timings)) {
+                    return false;
+                }
+                if (!clamp_self_recovery_displacement(solver, v_blocks, cloth_thickness, timings)) {
                     return false;
                 }
                 ++extra_recovery_passes;

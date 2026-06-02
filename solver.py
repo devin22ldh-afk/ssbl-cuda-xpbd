@@ -11,6 +11,7 @@ from .session_manager import (
     backend_status_text,
     bake_xpbd_cache,
     cleanup_all_sessions,
+    clear_startup_build_caches,
     clear_xpbd_cache,
     has_session,
     preview_warnings,

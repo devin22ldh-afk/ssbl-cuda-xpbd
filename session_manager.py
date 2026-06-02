@@ -12,11 +12,12 @@ import bpy
 from mathutils import Vector
 import numpy as np
 
-from .collision import collect_static_triangles
+from .collision import clear_static_collision_cache, collect_static_triangles
 from .native_backend import NativeStepDiagnostics, NativeXpbdSolver, status as native_status
 from .xpbd_core import (
     ClothBuildData,
     build_cloth_data,
+    clear_cloth_topology_cache,
     settings_to_options,
     to_local,
     world_positions_from_object,
@@ -249,6 +250,11 @@ def reset_preview_object(obj: bpy.types.Object) -> bool:
 def cleanup_all_sessions() -> None:
     for session in list(_SCENE_SESSIONS.values()):
         _finish_session(session, STATUS_IDLE)
+
+
+def clear_startup_build_caches() -> None:
+    clear_cloth_topology_cache()
+    clear_static_collision_cache()
 
 
 def start_preview(context: bpy.types.Context, obj: bpy.types.Object) -> SceneSession:
