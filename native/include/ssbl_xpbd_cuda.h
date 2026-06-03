@@ -56,6 +56,9 @@ typedef struct SsblXpbdConfig {
     float self_compaction_active_fraction_threshold;
     int self_pair_compaction_enabled;
     int jitter_stabilizer_enabled;
+    float contact_friction;
+    float contact_tangent_damping;
+    float contact_compliance;
 } SsblXpbdConfig;
 
 typedef struct SsblXpbdDiagnostics {
@@ -63,6 +66,7 @@ typedef struct SsblXpbdDiagnostics {
     float hash_build_ms;
     float constraints_ms;
     float volume_ms;
+    float analytic_collision_ms;
     float static_collision_ms;
     float dynamic_collision_ms;
     float self_hash_ms;
@@ -94,6 +98,15 @@ typedef struct SsblXpbdDiagnostics {
     long long jitter_stabilized_vertices;
     long long jitter_rejected_vertices;
     float jitter_max_correction;
+    long long external_contact_cache_hits;
+    long long external_contact_cache_misses;
+    long long external_contact_cache_count;
+    long long external_contact_cache_overflow;
+    long long external_friction_corrections;
+    long long force_field_count;
+    long long unsupported_force_field_count;
+    long long dynamic_triangle_count;
+    long long static_triangle_count;
     int finite_flag;
 } SsblXpbdDiagnostics;
 
@@ -124,6 +137,34 @@ typedef struct SsblXpbdRuntimeColliders {
     float sphere_radius;
 } SsblXpbdRuntimeColliders;
 
+typedef struct SsblXpbdForceField {
+    int type;
+    int use_min_distance;
+    int use_max_distance;
+    int seed;
+    float strength;
+    float origin[3];
+    float direction[3];
+    float axis[3];
+    float falloff_power;
+    float distance_min;
+    float distance_max;
+    float radial_min;
+    float radial_max;
+    float noise;
+    float linear_drag;
+    float quadratic_drag;
+    float harmonic_damping;
+    float flow;
+    float size;
+    float rest_length;
+    float radial_falloff;
+    float texture_nabla;
+    int use_radial_min;
+    int use_radial_max;
+    int use_2d_force;
+} SsblXpbdForceField;
+
 typedef struct SsblXpbdFrameInputs {
     int update_pin_targets;
     const int* pin_indices;
@@ -137,6 +178,10 @@ typedef struct SsblXpbdFrameInputs {
     int update_dynamic_triangles;
     const float* dynamic_triangles;
     int dynamic_triangle_count;
+    int update_force_fields;
+    const SsblXpbdForceField* force_fields;
+    int force_field_count;
+    int unsupported_force_field_count;
 } SsblXpbdFrameInputs;
 
 SSBL_API void* ssbl_create_solver(const SsblXpbdConfig* config, const SsblXpbdMesh* mesh);
@@ -144,6 +189,7 @@ SSBL_API int ssbl_destroy_solver(void* handle);
 SSBL_API int ssbl_reset_solver(void* handle);
 SSBL_API int ssbl_update_pin_targets(void* handle, const int* indices, const float* positions, int count);
 SSBL_API int ssbl_update_runtime_colliders(void* handle, const SsblXpbdRuntimeColliders* inputs);
+SSBL_API int ssbl_update_positions(void* handle, const float* positions, int max_floats);
 SSBL_API int ssbl_update_static_triangles(void* handle, const float* triangles, int triangle_count);
 SSBL_API int ssbl_update_dynamic_triangles(void* handle, const float* triangles, int triangle_count);
 SSBL_API int ssbl_update_frame_inputs(void* handle, const SsblXpbdFrameInputs* inputs);

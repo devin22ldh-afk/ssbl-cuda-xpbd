@@ -66,6 +66,9 @@ class SolverOptions:
     self_compaction_active_fraction_threshold: float
     self_pair_compaction_enabled: bool
     jitter_stabilizer_enabled: bool
+    contact_friction: float
+    contact_tangent_damping: float
+    contact_compliance: float
 
 
 @dataclass
@@ -508,7 +511,10 @@ def _build_cloth_data_from_mesh(
 def mesh_local_positions(mesh_or_obj) -> np.ndarray:
     mesh = mesh_or_obj.data if hasattr(mesh_or_obj, "data") else mesh_or_obj
     coords = np.empty(len(mesh.vertices) * 3, dtype=np.float64)
-    mesh.vertices.foreach_get("co", coords)
+    if "position" in mesh.attributes:
+        mesh.attributes["position"].data.foreach_get("vector", coords)
+    else:
+        mesh.vertices.foreach_get("co", coords)
     return coords.reshape((-1, 3))
 
 
@@ -689,6 +695,19 @@ def hidden_tether_constraints(
 
     if _env_bool("SSBL_LRA_KDTREE_ENABLED", True):
         try:
+            from scipy.spatial import cKDTree
+            pin_positions = rest_world[pin_indices].astype(np.float64, copy=False)
+            dynamic_positions = rest_world[dynamic_indices].astype(np.float64, copy=False)
+            tree = cKDTree(pin_positions)
+            distances, indices = tree.query(dynamic_positions, k=1, workers=-1)
+            nearest_pin = pin_indices[indices]
+            pairs = np.column_stack((nearest_pin, dynamic_indices)).astype(np.int32, copy=False)
+            rest = np.maximum(distances * max(float(slack), 0.5), _EPS).astype(np.float32)
+            return pairs, rest
+        except Exception:
+            pass
+
+        try:
             from mathutils import kdtree
 
             tree = kdtree.KDTree(len(pin_indices))
@@ -808,9 +827,10 @@ def settings_to_options(settings, runtime_mode_override: str | None = None) -> S
         # Legacy scenes/scripts may still store the removed Quality mode.
         # Keep them usable by running the remaining fast self-collision path.
         mode_name = "fast"
-    if bool(getattr(settings, "self_collision", False)) and mode_name == "off":
-        mode_name = "fast"
-    mode_value = {"off": SELF_COLLISION_OFF, "fast": SELF_COLLISION_FAST}.get(mode_name, SELF_COLLISION_OFF)
+    self_collision_enabled = bool(getattr(settings, "self_collision", False))
+    if mode_name != "off":
+        self_collision_enabled = True
+    mode_value = SELF_COLLISION_FAST if self_collision_enabled else SELF_COLLISION_OFF
 
     run_mode = (
         str(runtime_mode_override).lower()
@@ -853,7 +873,7 @@ def settings_to_options(settings, runtime_mode_override: str | None = None) -> S
         use_sphere=bool(settings.use_sphere and sphere_obj is not None),
         sphere_center=sphere_center,
         sphere_radius=float(sphere_radius),
-        self_collision=mode_value > 0,
+        self_collision=self_collision_enabled,
         self_collision_mode=mode_value,
         cloth_thickness=float(getattr(settings, "cloth_thickness", 0.02)),
         self_collision_interval=max(int(getattr(settings, "self_collision_interval", 2)), 1),
@@ -875,4 +895,7 @@ def settings_to_options(settings, runtime_mode_override: str | None = None) -> S
         ),
         self_pair_compaction_enabled=self_pair_compaction_enabled,
         jitter_stabilizer_enabled=jitter_enabled,
+        contact_friction=max(float(getattr(settings, "contact_friction", 0.35)), 0.0),
+        contact_tangent_damping=max(float(getattr(settings, "contact_tangent_damping", 0.2)), 0.0),
+        contact_compliance=max(float(getattr(settings, "contact_compliance", 0.0)), 0.0),
     )

@@ -136,7 +136,7 @@ $lines = @(
     "set ""PATH=$(Split-Path -Parent $cmake);$cudaBin;%PATH%""",
     "set ""CUDA_PATH=$cudaRoot""",
     "set ""CudaToolkitDir=$cudaToolkitDir""",
-    """$cmake"" -S ""$Root"" -B ""$BuildDir"" -G ""Visual Studio 17 2022"" -A x64 -T ""cuda=$cudaRoot"" -DCMAKE_CUDA_COMPILER=""$cudaBin\nvcc.exe"" || exit /b 1",
+    """$cmake"" -S ""$Root"" -B ""$BuildDir"" -G ""Visual Studio 17 2022"" -A x64 -T ""cuda=$cudaRoot"" -DCMAKE_CUDA_COMPILER=""$cudaBin\nvcc.exe"" -DSSBL_CUDA_OUTPUT_NAME=ssbl_xpbd_cuda_abi35 || exit /b 1",
     """$cmake"" --build ""$BuildDir"" --config $Config || exit /b 1"
 )
 
@@ -150,7 +150,7 @@ try {
     Remove-Item -LiteralPath $tempCmd -Force -ErrorAction SilentlyContinue
 }
 
-$dllPath = Join-Path $Root "bin\ssbl_xpbd_cuda_abi31.dll"
+$dllPath = Join-Path $Root "bin\ssbl_xpbd_cuda_abi35.dll"
 if (-not (Test-Path -LiteralPath $dllPath)) {
     throw "Build completed but DLL was not found at $dllPath."
 }

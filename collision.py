@@ -243,7 +243,10 @@ def _mesh_input_data(
 def _mesh_local_positions(mesh_or_obj) -> np.ndarray:
     mesh = mesh_or_obj.data if hasattr(mesh_or_obj, "data") else mesh_or_obj
     coords = np.empty(len(mesh.vertices) * 3, dtype=np.float64)
-    mesh.vertices.foreach_get("co", coords)
+    if "position" in mesh.attributes:
+        mesh.attributes["position"].data.foreach_get("vector", coords)
+    else:
+        mesh.vertices.foreach_get("co", coords)
     return coords.reshape((-1, 3))
 
 

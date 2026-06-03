@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import ctypes
 import os
@@ -64,6 +64,9 @@ class _NativeConfig(ctypes.Structure):
         ("self_compaction_active_fraction_threshold", ctypes.c_float),
         ("self_pair_compaction_enabled", ctypes.c_int),
         ("jitter_stabilizer_enabled", ctypes.c_int),
+        ("contact_friction", ctypes.c_float),
+        ("contact_tangent_damping", ctypes.c_float),
+        ("contact_compliance", ctypes.c_float),
     ]
 
 
@@ -98,6 +101,36 @@ class _NativeRuntimeColliders(ctypes.Structure):
     ]
 
 
+class _NativeForceField(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("use_min_distance", ctypes.c_int),
+        ("use_max_distance", ctypes.c_int),
+        ("seed", ctypes.c_int),
+        ("strength", ctypes.c_float),
+        ("origin", ctypes.c_float * 3),
+        ("direction", ctypes.c_float * 3),
+        ("axis", ctypes.c_float * 3),
+        ("falloff_power", ctypes.c_float),
+        ("distance_min", ctypes.c_float),
+        ("distance_max", ctypes.c_float),
+        ("radial_min", ctypes.c_float),
+        ("radial_max", ctypes.c_float),
+        ("noise", ctypes.c_float),
+        ("linear_drag", ctypes.c_float),
+        ("quadratic_drag", ctypes.c_float),
+        ("harmonic_damping", ctypes.c_float),
+        ("flow", ctypes.c_float),
+        ("size", ctypes.c_float),
+        ("rest_length", ctypes.c_float),
+        ("radial_falloff", ctypes.c_float),
+        ("texture_nabla", ctypes.c_float),
+        ("use_radial_min", ctypes.c_int),
+        ("use_radial_max", ctypes.c_int),
+        ("use_2d_force", ctypes.c_int),
+    ]
+
+
 class _NativeFrameInputs(ctypes.Structure):
     _fields_ = [
         ("update_pin_targets", ctypes.c_int),
@@ -112,6 +145,10 @@ class _NativeFrameInputs(ctypes.Structure):
         ("update_dynamic_triangles", ctypes.c_int),
         ("dynamic_triangles", ctypes.POINTER(ctypes.c_float)),
         ("dynamic_triangle_count", ctypes.c_int),
+        ("update_force_fields", ctypes.c_int),
+        ("force_fields", ctypes.POINTER(_NativeForceField)),
+        ("force_field_count", ctypes.c_int),
+        ("unsupported_force_field_count", ctypes.c_int),
     ]
 
 
@@ -121,6 +158,7 @@ class _NativeDiagnostics(ctypes.Structure):
         ("hash_build_ms", ctypes.c_float),
         ("constraints_ms", ctypes.c_float),
         ("volume_ms", ctypes.c_float),
+        ("analytic_collision_ms", ctypes.c_float),
         ("static_collision_ms", ctypes.c_float),
         ("dynamic_collision_ms", ctypes.c_float),
         ("self_hash_ms", ctypes.c_float),
@@ -152,6 +190,15 @@ class _NativeDiagnostics(ctypes.Structure):
         ("jitter_stabilized_vertices", ctypes.c_longlong),
         ("jitter_rejected_vertices", ctypes.c_longlong),
         ("jitter_max_correction", ctypes.c_float),
+        ("external_contact_cache_hits", ctypes.c_longlong),
+        ("external_contact_cache_misses", ctypes.c_longlong),
+        ("external_contact_cache_count", ctypes.c_longlong),
+        ("external_contact_cache_overflow", ctypes.c_longlong),
+        ("external_friction_corrections", ctypes.c_longlong),
+        ("force_field_count", ctypes.c_longlong),
+        ("unsupported_force_field_count", ctypes.c_longlong),
+        ("dynamic_triangle_count", ctypes.c_longlong),
+        ("static_triangle_count", ctypes.c_longlong),
         ("finite_flag", ctypes.c_int),
     ]
 
@@ -169,6 +216,7 @@ class NativeStepDiagnostics:
     hash_build_ms: float = 0.0
     constraints_ms: float = 0.0
     volume_ms: float = 0.0
+    analytic_collision_ms: float = 0.0
     static_collision_ms: float = 0.0
     dynamic_collision_ms: float = 0.0
     self_hash_ms: float = 0.0
@@ -200,6 +248,15 @@ class NativeStepDiagnostics:
     jitter_stabilized_vertices: int = 0
     jitter_rejected_vertices: int = 0
     jitter_max_correction: float = 0.0
+    external_contact_cache_hits: int = 0
+    external_contact_cache_misses: int = 0
+    external_contact_cache_count: int = 0
+    external_contact_cache_overflow: int = 0
+    external_friction_corrections: int = 0
+    force_field_count: int = 0
+    unsupported_force_field_count: int = 0
+    dynamic_triangle_count: int = 0
+    static_triangle_count: int = 0
     finite: bool = True
     frame_ms: float = 0.0
     frame_set_ms: float = 0.0
@@ -231,19 +288,22 @@ _LOAD_ERROR = ""
 
 
 def dll_path() -> str:
+    override = os.environ.get("SSBL_NATIVE_DLL_PATH")
+    if override:
+        return override
     root = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(root, "native", "bin", "ssbl_xpbd_cuda_abi31.dll")
+    return os.path.join(root, "native", "bin", "ssbl_xpbd_cuda_abi35.dll")
 
 
 def status() -> NativeStatus:
     path = dll_path()
     if not os.path.exists(path):
-        return NativeStatus(False, f"缺少 CUDA 解算 DLL：{path}", path)
+        return NativeStatus(False, f"Missing CUDA solver DLL: {path}", path)
     try:
         _load_library()
     except NativeBackendUnavailable as exc:
         return NativeStatus(False, str(exc), path)
-    return NativeStatus(True, "CUDA 解算 DLL 已加载", path)
+    return NativeStatus(True, "CUDA solver DLL loaded.", path)
 
 
 def _load_library():
@@ -254,7 +314,7 @@ def _load_library():
     path = dll_path()
     if not os.path.exists(path):
         raise NativeBackendUnavailable(
-            "缺少 CUDA 解算 DLL。请先安装 CUDA Toolkit、CMake 和 VS Build Tools，然后运行 native/build.ps1 进行构建。"
+            "Missing CUDA solver DLL. Install CUDA Toolkit, CMake, and VS Build Tools, then run native/build.ps1."
         )
 
     try:
@@ -263,7 +323,7 @@ def _load_library():
         lib = ctypes.WinDLL(path) if os.name == "nt" else ctypes.CDLL(path)
     except OSError as exc:
         _LOAD_ERROR = str(exc)
-        raise NativeBackendUnavailable(f"无法加载 CUDA 解算 DLL：{exc}") from exc
+        raise NativeBackendUnavailable(f"Unable to load CUDA solver DLL: {exc}") from exc
 
     lib.ssbl_create_solver.argtypes = [ctypes.POINTER(_NativeConfig), ctypes.POINTER(_NativeMesh)]
     lib.ssbl_create_solver.restype = ctypes.c_void_p
@@ -280,6 +340,13 @@ def _load_library():
     lib.ssbl_update_pin_targets.restype = ctypes.c_int
     lib.ssbl_update_runtime_colliders.argtypes = [ctypes.c_void_p, ctypes.POINTER(_NativeRuntimeColliders)]
     lib.ssbl_update_runtime_colliders.restype = ctypes.c_int
+    if hasattr(lib, "ssbl_update_positions"):
+        lib.ssbl_update_positions.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_int,
+        ]
+        lib.ssbl_update_positions.restype = ctypes.c_int
     lib.ssbl_update_static_triangles.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int]
     lib.ssbl_update_static_triangles.restype = ctypes.c_int
     lib.ssbl_update_dynamic_triangles.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int]
@@ -326,7 +393,7 @@ def _as_int_ptr(arr: np.ndarray):
 def _last_error(lib) -> str:
     raw = lib.ssbl_last_error()
     if not raw:
-        return "原生 CUDA 解算器执行失败，但没有返回错误信息"
+        return "Native CUDA solver failed without an error message."
     return raw.decode("utf-8", errors="replace")
 
 
@@ -381,6 +448,9 @@ def _config_from_options(
     cfg.self_compaction_active_fraction_threshold = float(options.self_compaction_active_fraction_threshold)
     cfg.self_pair_compaction_enabled = int(options.self_pair_compaction_enabled)
     cfg.jitter_stabilizer_enabled = int(options.jitter_stabilizer_enabled)
+    cfg.contact_friction = float(getattr(options, "contact_friction", 0.35))
+    cfg.contact_tangent_damping = float(getattr(options, "contact_tangent_damping", 0.2))
+    cfg.contact_compliance = float(getattr(options, "contact_compliance", 0.0))
     return cfg
 
 
@@ -395,6 +465,46 @@ def _runtime_colliders_from_options(options: SolverOptions) -> _NativeRuntimeCol
     inputs.sphere_center = (ctypes.c_float * 3)(*map(float, options.sphere_center))
     inputs.sphere_radius = float(options.sphere_radius)
     return inputs
+
+
+def _force_field_array(force_fields):
+    samples = tuple(getattr(force_fields, "fields", ()) or ()) if force_fields is not None else ()
+    array_type = _NativeForceField * len(samples)
+    array = array_type()
+    for index, sample in enumerate(samples):
+        item = array[index]
+        item.type = int(getattr(sample, "field_type", 0))
+        item.use_min_distance = int(getattr(sample, "use_min_distance", 0))
+        item.use_max_distance = int(getattr(sample, "use_max_distance", 0))
+        item.seed = int(getattr(sample, "seed", 0))
+        item.strength = float(getattr(sample, "strength", 0.0))
+        item.origin = (ctypes.c_float * 3)(*map(float, getattr(sample, "origin", (0.0, 0.0, 0.0))))
+        item.direction = (ctypes.c_float * 3)(*map(float, getattr(sample, "direction", (0.0, 0.0, 1.0))))
+        item.axis = (ctypes.c_float * 3)(*map(float, getattr(sample, "axis", (0.0, 0.0, 1.0))))
+        item.falloff_power = float(getattr(sample, "falloff_power", 0.0))
+        item.distance_min = float(getattr(sample, "distance_min", 0.0))
+        item.distance_max = float(getattr(sample, "distance_max", 0.0))
+        item.radial_min = float(getattr(sample, "radial_min", 0.0))
+        item.radial_max = float(getattr(sample, "radial_max", 0.0))
+        item.noise = float(getattr(sample, "noise", 0.0))
+        item.linear_drag = float(getattr(sample, "linear_drag", 0.0))
+        item.quadratic_drag = float(getattr(sample, "quadratic_drag", 0.0))
+        item.harmonic_damping = float(getattr(sample, "harmonic_damping", 0.0))
+        item.flow = float(getattr(sample, "flow", 0.0))
+        item.size = float(getattr(sample, "size", 0.0))
+        item.rest_length = float(getattr(sample, "rest_length", 0.0))
+        item.radial_falloff = float(getattr(sample, "radial_falloff", 0.0))
+        item.texture_nabla = float(getattr(sample, "texture_nabla", 0.0))
+        item.use_radial_min = int(getattr(sample, "use_radial_min", 0))
+        item.use_radial_max = int(getattr(sample, "use_radial_max", 0))
+        item.use_2d_force = int(getattr(sample, "use_2d_force", 0))
+    return array
+
+
+def _as_force_field_ptr(arr):
+    if len(arr) == 0:
+        return ctypes.POINTER(_NativeForceField)()
+    return ctypes.cast(arr, ctypes.POINTER(_NativeForceField))
 
 
 class NativeXpbdSolver:
@@ -453,6 +563,17 @@ class NativeXpbdSolver:
         if not self._lib.ssbl_update_runtime_colliders(self._handle, ctypes.byref(self._runtime_colliders)):
             raise NativeSolverError(_last_error(self._lib))
 
+    def update_positions(self, positions: np.ndarray) -> None:
+        if not hasattr(self._lib, "ssbl_update_positions"):
+            raise NativeSolverError("Loaded CUDA solver DLL does not support runtime position upload.")
+        positions = np.ascontiguousarray(positions, dtype=np.float32)
+        if positions.shape != (self._vertex_count, 3):
+            raise NativeSolverError(
+                f"Position upload expected shape ({self._vertex_count}, 3), got {tuple(positions.shape)}."
+            )
+        if not self._lib.ssbl_update_positions(self._handle, _as_float_ptr(positions), int(positions.size)):
+            raise NativeSolverError(_last_error(self._lib))
+
     def update_static_triangles(self, static_triangles: np.ndarray) -> None:
         triangle_count = int(len(static_triangles))
         if triangle_count <= 0 and self._static_triangle_count <= 0:
@@ -460,7 +581,7 @@ class NativeXpbdSolver:
         static_triangles = np.ascontiguousarray(static_triangles.reshape((-1, 3)), dtype=np.float32)
         if triangle_count != self._static_triangle_count:
             raise NativeSolverError(
-                f"静态碰撞体拓扑发生变化：三角形数量从 {self._static_triangle_count} 变为 {triangle_count}。"
+                f"Static collider triangle count changed from {self._static_triangle_count} to {triangle_count}."
             )
         if not self._lib.ssbl_update_static_triangles(
             self._handle,
@@ -471,21 +592,14 @@ class NativeXpbdSolver:
 
     def update_dynamic_triangles(self, dynamic_triangles: np.ndarray) -> None:
         triangle_count = int(len(dynamic_triangles))
-        if triangle_count <= 0 and (self._dynamic_triangle_count is None or self._dynamic_triangle_count <= 0):
-            return
         dynamic_triangles = np.ascontiguousarray(dynamic_triangles.reshape((-1, 3)), dtype=np.float32)
-        if self._dynamic_triangle_count is None and triangle_count > 0:
-            self._dynamic_triangle_count = triangle_count
-        elif triangle_count > 0 and self._dynamic_triangle_count != triangle_count:
-            raise NativeSolverError(
-                f"动态布料碰撞体拓扑发生变化：三角形数量从 {self._dynamic_triangle_count} 变为 {triangle_count}。"
-            )
         if not self._lib.ssbl_update_dynamic_triangles(
             self._handle,
             _as_float_ptr(dynamic_triangles),
             triangle_count,
         ):
             raise NativeSolverError(_last_error(self._lib))
+        self._dynamic_triangle_count = triangle_count
 
     def update_frame_inputs(
         self,
@@ -499,8 +613,12 @@ class NativeXpbdSolver:
         update_static: bool,
         dynamic_triangles: np.ndarray | None,
         update_dynamic: bool,
+        force_fields=None,
+        update_force_fields: bool = False,
     ) -> None:
         if not hasattr(self._lib, "ssbl_update_frame_inputs"):
+            if update_force_fields and force_fields is not None and len(getattr(force_fields, "fields", ()) or ()) > 0:
+                raise NativeSolverError("Loaded CUDA solver DLL does not support Blender force fields.")
             if update_pin:
                 self.update_pin_targets(
                     np.asarray(pin_indices if pin_indices is not None else [], dtype=np.int32),
@@ -522,13 +640,6 @@ class NativeXpbdSolver:
         )
         static_triangle_count = int(len(static_triangles)) if static_triangles is not None else 0
         dynamic_triangle_count = int(len(dynamic_triangles)) if dynamic_triangles is not None else 0
-        if update_dynamic and dynamic_triangle_count > 0:
-            if self._dynamic_triangle_count is None:
-                self._dynamic_triangle_count = dynamic_triangle_count
-            elif self._dynamic_triangle_count != dynamic_triangle_count:
-                raise NativeSolverError(
-                    f"鍔ㄦ€佸竷鏂欑鎾炰綋鎷撴墤鍙戠敓鍙樺寲锛氫笁瑙掑舰鏁伴噺浠?{self._dynamic_triangle_count} 鍙樹负 {dynamic_triangle_count}銆?"
-                )
         static_arr = np.ascontiguousarray(
             static_triangles.reshape((-1, 3)) if static_triangles is not None else np.empty((0, 3), dtype=np.float32),
             dtype=np.float32,
@@ -537,6 +648,9 @@ class NativeXpbdSolver:
             dynamic_triangles.reshape((-1, 3)) if dynamic_triangles is not None else np.empty((0, 3), dtype=np.float32),
             dtype=np.float32,
         )
+        force_field_arr = _force_field_array(force_fields)
+        force_field_count = int(len(force_field_arr))
+        unsupported_force_field_count = int(getattr(force_fields, "unsupported_count", 0) if force_fields is not None else 0)
         runtime_inputs = _runtime_colliders_from_options(options) if options is not None else self._runtime_colliders
         frame_inputs = _NativeFrameInputs(
             update_pin_targets=int(update_pin),
@@ -551,12 +665,18 @@ class NativeXpbdSolver:
             update_dynamic_triangles=int(update_dynamic),
             dynamic_triangles=_as_float_ptr(dynamic_arr),
             dynamic_triangle_count=dynamic_triangle_count,
+            update_force_fields=int(update_force_fields),
+            force_fields=_as_force_field_ptr(force_field_arr),
+            force_field_count=force_field_count,
+            unsupported_force_field_count=unsupported_force_field_count,
         )
         ok = self._lib.ssbl_update_frame_inputs(self._handle, ctypes.byref(frame_inputs))
         if not ok:
             raise NativeSolverError(_last_error(self._lib))
         if update_runtime:
             self._runtime_colliders = runtime_inputs
+        if update_dynamic:
+            self._dynamic_triangle_count = dynamic_triangle_count
 
     def step(self, substeps: int, iterations: int, diagnostics: bool = True, synchronize: bool = True) -> None:
         fetch_diagnostics = 1 if diagnostics else 0
@@ -600,6 +720,7 @@ class NativeXpbdSolver:
             hash_build_ms=float(raw.hash_build_ms),
             constraints_ms=float(raw.constraints_ms),
             volume_ms=float(raw.volume_ms),
+            analytic_collision_ms=float(raw.analytic_collision_ms),
             static_collision_ms=float(raw.static_collision_ms),
             dynamic_collision_ms=float(raw.dynamic_collision_ms),
             self_hash_ms=float(raw.self_hash_ms),
@@ -631,6 +752,15 @@ class NativeXpbdSolver:
             jitter_stabilized_vertices=int(raw.jitter_stabilized_vertices),
             jitter_rejected_vertices=int(raw.jitter_rejected_vertices),
             jitter_max_correction=float(raw.jitter_max_correction),
+            external_contact_cache_hits=int(raw.external_contact_cache_hits),
+            external_contact_cache_misses=int(raw.external_contact_cache_misses),
+            external_contact_cache_count=int(raw.external_contact_cache_count),
+            external_contact_cache_overflow=int(raw.external_contact_cache_overflow),
+            external_friction_corrections=int(raw.external_friction_corrections),
+            force_field_count=int(raw.force_field_count),
+            unsupported_force_field_count=int(raw.unsupported_force_field_count),
+            dynamic_triangle_count=int(raw.dynamic_triangle_count),
+            static_triangle_count=int(raw.static_triangle_count),
             finite=bool(raw.finite_flag),
         )
         self._last_diagnostics = diag
@@ -641,3 +771,4 @@ class NativeXpbdSolver:
             self.close()
         except Exception:
             pass
+

@@ -105,10 +105,42 @@ def _run_multi(scene: bpy.types.Scene) -> dict[str, object]:
     session = ssbl.solver.start_timeline_preview(bpy.context, scene)
     scene.frame_current = 2
     ssbl.solver.step_timeline_preview(bpy.context, scene)
-    finite = _finite_object(first) and _finite_object(second) and bool(ssbl.solver.session_diagnostics(first).finite)
+    diagnostics = ssbl.solver.session_diagnostics(first)
+    finite = _finite_object(first) and _finite_object(second) and bool(diagnostics.finite)
+    cross_mode = str(session.cross_cloth_mode) if session else ""
     ssbl.solver.reset_preview_object(first)
     return {
         "slots": len(session.slots) if session else 0,
+        "cross_mode": cross_mode,
+        "dynamic_upload_ms": float(diagnostics.dynamic_upload_ms),
+        "dynamic_collision_ms": float(diagnostics.dynamic_collision_ms),
+        "finite": bool(finite),
+        "restore_delta_first": _max_source_delta(first, before_first),
+        "restore_delta_second": _max_source_delta(second, before_second),
+    }
+
+
+def _run_manual_multi(scene: bpy.types.Scene) -> dict[str, object]:
+    first = _make_cloth("SSBL_Manual_Multi_A", (-0.7, 0.0, 1.0))
+    second = _make_cloth("SSBL_Manual_Multi_B", (0.7, 0.0, 1.0))
+    before_first = _snapshot(first)
+    before_second = _snapshot(second)
+    bpy.ops.object.select_all(action="DESELECT")
+    first.select_set(True)
+    second.select_set(True)
+    bpy.context.view_layer.objects.active = first
+    scene.frame_current = 1
+    session = ssbl.solver.start_preview(bpy.context, first)
+    ssbl.solver.step_preview(bpy.context, first.name)
+    diagnostics = ssbl.solver.session_diagnostics(first)
+    finite = _finite_object(first) and _finite_object(second) and bool(diagnostics.finite)
+    cross_mode = str(session.cross_cloth_mode) if session else ""
+    ssbl.solver.reset_preview_object(first)
+    return {
+        "slots": len(session.slots) if session else 0,
+        "cross_mode": cross_mode,
+        "dynamic_upload_ms": float(diagnostics.dynamic_upload_ms),
+        "dynamic_collision_ms": float(diagnostics.dynamic_collision_ms),
         "finite": bool(finite),
         "restore_delta_first": _max_source_delta(first, before_first),
         "restore_delta_second": _max_source_delta(second, before_second),
@@ -139,6 +171,29 @@ def _run_jump_restart(scene: bpy.types.Scene) -> dict[str, object]:
     }
 
 
+def _run_endpoint_reset(scene: bpy.types.Scene) -> dict[str, object]:
+    obj = _make_cloth("SSBL_Playback_Endpoint", (0.0, 0.0, 1.0))
+    bpy.context.view_layer.objects.active = obj
+    original_mesh = obj.data
+    before = _snapshot(obj)
+    scene.frame_start = 1
+    scene.frame_end = 8
+    scene.frame_current = 1
+    session = ssbl.solver.start_timeline_preview(bpy.context, scene)
+    scene.frame_current = 2
+    ssbl.solver.step_timeline_preview(bpy.context, scene)
+    active_before_endpoint = ssbl.solver.has_session(obj) and obj.data != original_mesh
+    scene.frame_current = scene.frame_end
+    ssbl.operators._ssbl_frame_change_post(scene)
+    return {
+        "slots": len(session.slots) if session else 0,
+        "active_before_endpoint": bool(active_before_endpoint),
+        "reset_at_endpoint": not ssbl.solver.has_session(obj),
+        "restored_mesh": obj.data == original_mesh,
+        "restore_delta": _max_source_delta(obj, before),
+    }
+
+
 def main() -> None:
     try:
         ssbl.unregister()
@@ -154,11 +209,19 @@ def main() -> None:
         multi = _run_multi(scene)
         ssbl.solver.cleanup_all_sessions()
         _clear_scene()
+        manual_multi = _run_manual_multi(scene)
+        ssbl.solver.cleanup_all_sessions()
+        _clear_scene()
         jump = _run_jump_restart(scene)
+        ssbl.solver.cleanup_all_sessions()
+        _clear_scene()
+        endpoint = _run_endpoint_reset(scene)
         result = {
             "single": single,
             "multi": multi,
+            "manual_multi": manual_multi,
             "jump": jump,
+            "endpoint": endpoint,
         }
         print("SSBL_PLAYBACK_PREVIEW_SMOKE", json.dumps(result, ensure_ascii=False, sort_keys=True))
         if not (
@@ -169,14 +232,27 @@ def main() -> None:
             and single["restore_delta"] == 0.0
             and single["finite"]
             and multi["slots"] == 2
+            and multi["cross_mode"] == "all_selected"
+            and multi["dynamic_upload_ms"] > 0.0
             and multi["finite"]
             and multi["restore_delta_first"] == 0.0
             and multi["restore_delta_second"] == 0.0
+            and manual_multi["slots"] == 2
+            and manual_multi["cross_mode"] == "all_selected"
+            and manual_multi["dynamic_upload_ms"] > 0.0
+            and manual_multi["finite"]
+            and manual_multi["restore_delta_first"] == 0.0
+            and manual_multi["restore_delta_second"] == 0.0
             and jump["first_slots"] == 1
             and jump["second_slots"] == 1
             and jump["restarted"]
             and jump["finite"]
             and jump["restore_delta"] == 0.0
+            and endpoint["slots"] == 1
+            and endpoint["active_before_endpoint"]
+            and endpoint["reset_at_endpoint"]
+            and endpoint["restored_mesh"]
+            and endpoint["restore_delta"] == 0.0
         ):
             raise RuntimeError(f"Playback preview smoke failed: {result}")
     finally:

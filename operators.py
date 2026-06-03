@@ -37,14 +37,16 @@ def _ssbl_animation_playback_pre(*args):
 
 @persistent
 def _ssbl_frame_change_post(*args):
-    if not _is_animation_playing():
-        return
+    is_playing = _is_animation_playing()
     scene = _scene_from_handler_args(args)
     if scene is None:
         return
     try:
-        solver.step_timeline_preview(bpy.context, scene)
-        _tag_viewports(bpy.context)
+        if is_playing:
+            solver.step_timeline_preview(bpy.context, scene)
+            _tag_viewports(bpy.context)
+        elif solver.reset_timeline_preview_if_endpoint(scene):
+            _tag_viewports(bpy.context)
     except Exception:
         pass
 
@@ -55,7 +57,8 @@ def _ssbl_animation_playback_post(*args):
     if scene is None:
         return
     try:
-        solver.pause_timeline_preview(scene)
+        if not solver.reset_timeline_preview_if_endpoint(scene):
+            solver.pause_timeline_preview(scene)
         _tag_viewports(bpy.context)
     except Exception:
         pass
@@ -118,13 +121,17 @@ def cleanup_fps_overlays() -> None:
 
 
 def _tag_viewports(context: bpy.types.Context) -> None:
+    _tag_areas(context, {"VIEW_3D"})
+
+
+def _tag_areas(context: bpy.types.Context, area_types: set[str] | None = None) -> None:
     window_manager = context.window_manager
     for window in window_manager.windows:
         screen = window.screen
         if screen is None:
             continue
         for area in screen.areas:
-            if area.type == "VIEW_3D":
+            if area_types is None or area.type in area_types:
                 area.tag_redraw()
 
 
@@ -235,11 +242,40 @@ class SSBL_OT_bake_xpbd_cache(bpy.types.Operator):
         if obj is None:
             self.report({"ERROR"}, "请先选择一个网格对象")
             return {"CANCELLED"}
+        wm = context.window_manager
+        workspace = getattr(context, "workspace", None)
+        progress_started = False
+
+        def _update_progress(current: int, total: int) -> None:
+            nonlocal progress_started
+            total = max(int(total), 1)
+            current = max(0, min(int(current), total))
+            if not progress_started:
+                wm.progress_begin(0, total)
+                progress_started = True
+            wm.progress_update(current)
+            if workspace is not None:
+                try:
+                    workspace.status_text_set(
+                        f"SSBL 烘焙 {obj.name}: {current}/{total} ({(float(current) / float(total)) * 100.0:.0f}%)"
+                    )
+                except Exception:
+                    pass
+            _tag_areas(context)
         try:
-            path = solver.bake_xpbd_cache(context, obj)
+            path = solver.bake_xpbd_cache(context, obj, progress_callback=_update_progress)
         except Exception as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
+        finally:
+            if progress_started:
+                wm.progress_end()
+            if workspace is not None:
+                try:
+                    workspace.status_text_set(None)
+                except Exception:
+                    pass
+            _tag_areas(context)
         _tag_viewports(context)
         self.report({"INFO"}, f"已烘焙 XPBD 缓存：{path}")
         return {"FINISHED"}

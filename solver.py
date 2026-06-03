@@ -19,6 +19,7 @@ from .session_manager import (
     record_viewport_tag_ms,
     request_stop,
     reset_preview_object,
+    reset_timeline_preview_if_endpoint,
     session_diagnostics,
     session_fps,
     session_status,

@@ -1,7 +1,7 @@
 bl_info = {
     "name": "SSBL CUDA XPBD",
     "author": "OpenAI",
-    "version": (0, 4, 1),
+    "version": (0, 4, 2),
     "blender": (5, 0, 0),
     "location": "3D 视图 > 侧边栏 > SSBL",
     "description": "Blender 本地 CUDA XPBD 布料预览与 PC2 烘焙插件",
@@ -28,6 +28,10 @@ from .xpbd_core import DEFAULT_HARDNESS, sync_hardness_settings
 
 def _apply_self_collision_mode(settings, _context):
     mode = settings.self_collision_mode
+    enabled = mode != "off"
+    if bool(getattr(settings, "self_collision", False)) != enabled:
+        settings.self_collision = enabled
+        return
     if mode != "off":
         settings.self_collision_interval = 2
         settings.max_self_collision_neighbors = 16
@@ -45,6 +49,19 @@ def _apply_self_collision_mode(settings, _context):
         settings.self_pair_compaction_enabled = False
 
 
+def _apply_self_collision_toggle(settings, _context):
+    enabled = bool(getattr(settings, "self_collision", False))
+    target_mode = "fast" if enabled else "off"
+    if str(getattr(settings, "self_collision_mode", "off")) != target_mode:
+        settings.self_collision_mode = target_mode
+        return
+    if enabled:
+        _apply_self_collision_mode(settings, _context)
+    else:
+        settings.self_sleep_enabled = False
+        settings.self_pair_compaction_enabled = False
+
+
 def _apply_hardness(settings, _context):
     settings.hardness_initialized = True
     sync_hardness_settings(settings)
@@ -54,6 +71,10 @@ _OBJECT_SETTING_COPY_SKIP = {
     "rna_type",
     "enabled",
     "object_settings_initialized",
+    "bake_in_progress",
+    "bake_progress_percent",
+    "bake_progress_current",
+    "bake_progress_total",
 }
 
 
@@ -169,10 +190,11 @@ class SSBL_PreviewSettings(PropertyGroup):
     )
     preview_writeback_interval: IntProperty(
         name="Preview writeback interval",
-        default=1,
-        min=1,
+        default=0,
+        min=0,
         soft_max=8,
-        description="Only update the viewport mesh every N simulated preview frames; baking still writes every frame",
+        options={"HIDDEN"},
+        description="0 uses adaptive preview mesh writeback; values >= 1 force a fixed interval. Baking still writes every frame",
     )
     use_evaluated_mesh: BoolProperty(
         name="动态网格",
@@ -180,18 +202,20 @@ class SSBL_PreviewSettings(PropertyGroup):
         description="读取 Blender 修改器和绑定后的动态网格输入；顶点数和拓扑必须保持不变",
     )
     multi_cloth_preview: BoolProperty(
+        options={"HIDDEN"},
         name="多布料预览",
         default=False,
         description="启用后，开始预览会同时解算当前选中的多个布料网格",
     )
     cross_cloth_collision: EnumProperty(
+        options={"HIDDEN"},
         name="跨布料碰撞",
         items=[
             ("off", "关闭", "不使用其他布料作为动态碰撞体"),
             ("lower_layers", "较低层级", "只接收碰撞层级更低的布料作为动态碰撞体"),
             ("all_selected", "所有已选", "接收所有其他已选布料作为动态碰撞体"),
         ],
-        default="lower_layers",
+        default="off",
         description="多布料预览时如何收集动态布料碰撞体",
     )
     bake_start: IntProperty(
@@ -204,6 +228,36 @@ class SSBL_PreviewSettings(PropertyGroup):
         default=120,
         min=1,
         description="写入 PC2 缓存的最后一帧",
+    )
+    bake_in_progress: BoolProperty(
+        name="Bake in progress",
+        default=False,
+        options={"HIDDEN"},
+        description="Internal runtime flag used to show SSBL bake progress",
+    )
+    bake_progress_percent: FloatProperty(
+        name="Bake progress",
+        default=0.0,
+        min=0.0,
+        max=100.0,
+        precision=0,
+        subtype="PERCENTAGE",
+        options={"HIDDEN"},
+        description="Internal SSBL bake progress percentage",
+    )
+    bake_progress_current: IntProperty(
+        name="Bake progress current",
+        default=0,
+        min=0,
+        options={"HIDDEN"},
+        description="Internal SSBL bake progress current sample",
+    )
+    bake_progress_total: IntProperty(
+        name="Bake progress total",
+        default=0,
+        min=0,
+        options={"HIDDEN"},
+        description="Internal SSBL bake progress total samples",
     )
     dt: FloatProperty(
         name="时间步长",
@@ -324,6 +378,24 @@ class SSBL_PreviewSettings(PropertyGroup):
         subtype="ACCELERATION",
         description="世界空间中的重力向量",
     )
+    use_blender_force_fields: BoolProperty(
+        name="使用 Blender 力场",
+        default=True,
+        description="读取场景中的 Blender Force Field，并作为 SSBL 布料外力参与解算",
+    )
+    force_field_collection: PointerProperty(
+        name="力场集合",
+        type=bpy.types.Collection,
+        description="为空时读取当前场景全部 Force Field；指定后只读取该集合内的 Force Field",
+    )
+    force_field_strength_scale: FloatProperty(
+        name="力场强度倍率",
+        default=1.0,
+        min=0.0,
+        soft_max=10.0,
+        precision=3,
+        description="SSBL 接收 Blender 力场时使用的整体强度倍率",
+    )
     pin_vertex_group: StringProperty(
         name="固定点组",
         default="ssbl_pin",
@@ -338,17 +410,19 @@ class SSBL_PreviewSettings(PropertyGroup):
         description="碰撞投影时保持的最小分离距离",
     )
     self_collision: BoolProperty(
+        update=_apply_self_collision_toggle,
         name="自碰撞",
         default=False,
         description="兼容旧选项；启用后会映射到“快速”自碰撞",
     )
     self_collision_mode: EnumProperty(
+        options={"HIDDEN"},
         name="自碰撞模式",
         items=[
             ("off", "关闭", "关闭布料自碰撞"),
             ("fast", "快速", "使用受限顶点空间哈希自碰撞"),
         ],
-        default="fast",
+        default="off",
         update=_apply_self_collision_mode,
         description="面向大规模布料网格调优的自碰撞模式",
     )
@@ -441,6 +515,33 @@ class SSBL_PreviewSettings(PropertyGroup):
         options={"HIDDEN"},
         description="Internal fast-preview filter for high-frequency self-collision surface jitter",
     )
+    contact_friction: FloatProperty(
+        name="Contact friction",
+        default=0.35,
+        min=0.0,
+        max=4.0,
+        precision=3,
+        options={"HIDDEN"},
+        description="Internal static/dynamic triangle contact friction coefficient",
+    )
+    contact_tangent_damping: FloatProperty(
+        name="Contact tangent damping",
+        default=0.2,
+        min=0.0,
+        max=1.0,
+        precision=3,
+        options={"HIDDEN"},
+        description="Internal static/dynamic triangle tangential contact damping",
+    )
+    contact_compliance: FloatProperty(
+        name="Contact compliance",
+        default=0.0,
+        min=0.0,
+        soft_max=1.0e-4,
+        precision=6,
+        options={"HIDDEN"},
+        description="Internal XPBD compliance for static/dynamic triangle contacts",
+    )
     use_ground: BoolProperty(
         name="地面平面",
         default=True,
@@ -508,6 +609,7 @@ def register():
         bpy.app.handlers.load_post.append(_initialize_hardness_for_scenes)
     operators.register_playback_handlers()
     bpy.types.Object.ssbl_collision_layer = IntProperty(
+        options={"HIDDEN"},
         name="碰撞层级",
         default=1,
         min=0,
@@ -515,6 +617,7 @@ def register():
         description="多布料分层碰撞中的层级；数值越小越靠内并先解算",
     )
     bpy.types.Object.ssbl_enable_cross_cloth_collision = BoolProperty(
+        options={"HIDDEN"},
         name="跨布料碰撞体",
         default=True,
         description="启用后，该对象会在多布料预览中作为其他布料的动态碰撞体",

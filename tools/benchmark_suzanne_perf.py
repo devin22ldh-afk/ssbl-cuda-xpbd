@@ -313,6 +313,8 @@ def _run_case(obj: bpy.types.Object, label: str, *, self_collision: bool, volume
         "jitter_stabilized_vertices": int(diag.jitter_stabilized_vertices),
         "jitter_rejected_vertices": int(diag.jitter_rejected_vertices),
         "jitter_max_correction": round(float(diag.jitter_max_correction), 6),
+        "force_field_count": int(getattr(diag, "force_field_count", 0)),
+        "unsupported_force_field_count": int(getattr(diag, "unsupported_force_field_count", 0)),
     }
 
 
