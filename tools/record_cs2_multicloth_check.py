@@ -298,6 +298,10 @@ def main() -> None:
     first_dynamic_frame = None
     max_analytic_collision_ms = 0.0
     max_dynamic_collision_ms = 0.0
+    max_dynamic_particle_collision_ms = 0.0
+    max_dynamic_particle_count = 0
+    max_dynamic_particle_contacts = 0
+    max_dynamic_particle_overflow = 0
     min_aabb_distance = float("inf")
     min_surface_distance = float("inf")
     max_near_contact_vertices = 0
@@ -309,6 +313,13 @@ def main() -> None:
         finite = finite and bool(diag.finite)
         max_analytic_collision_ms = max(max_analytic_collision_ms, float(diag.analytic_collision_ms))
         max_dynamic_collision_ms = max(max_dynamic_collision_ms, float(diag.dynamic_collision_ms))
+        max_dynamic_particle_collision_ms = max(
+            max_dynamic_particle_collision_ms,
+            float(diag.dynamic_particle_collision_ms),
+        )
+        max_dynamic_particle_count = max(max_dynamic_particle_count, int(diag.dynamic_particle_count))
+        max_dynamic_particle_contacts = max(max_dynamic_particle_contacts, int(diag.dynamic_particle_contacts))
+        max_dynamic_particle_overflow = max(max_dynamic_particle_overflow, int(diag.dynamic_particle_overflow))
         for slot in session.slots.values():
             max_edge_ratio = max(max_edge_ratio, _slot_max_edge_ratio(slot))
         active_slot = session.slots.get(active_obj.name)
@@ -351,10 +362,15 @@ def main() -> None:
             "frame": frame,
             "finite": bool(diag.finite),
             "dynamic_triangle_count": int(diag.dynamic_triangle_count),
+            "dynamic_particle_count": int(diag.dynamic_particle_count),
+            "dynamic_particle_candidate_count": int(diag.dynamic_particle_candidate_count),
+            "dynamic_particle_contacts": int(diag.dynamic_particle_contacts),
+            "dynamic_particle_overflow": int(diag.dynamic_particle_overflow),
             "analytic_collision_ms": float(diag.analytic_collision_ms),
             "static_collision_ms": float(diag.static_collision_ms),
             "dynamic_upload_ms": float(diag.dynamic_upload_ms),
             "dynamic_collision_ms": float(diag.dynamic_collision_ms),
+            "dynamic_particle_collision_ms": float(diag.dynamic_particle_collision_ms),
             "resolved_contacts": int(diag.resolved_contacts),
             "candidate_count": int(diag.candidate_count),
             "min_gap": None if diag.min_gap is None else float(diag.min_gap),
@@ -395,13 +411,21 @@ def main() -> None:
         "max_edge_ratio": float(max_edge_ratio),
         "max_analytic_collision_ms": float(max_analytic_collision_ms),
         "max_dynamic_collision_ms": float(max_dynamic_collision_ms),
+        "max_dynamic_particle_collision_ms": float(max_dynamic_particle_collision_ms),
+        "max_dynamic_particle_count": int(max_dynamic_particle_count),
+        "max_dynamic_particle_contacts": int(max_dynamic_particle_contacts),
+        "max_dynamic_particle_overflow": int(max_dynamic_particle_overflow),
         "finite": bool(finite),
         "stopped": bool(stopped),
         "restore_delta_cube": _restore_mesh_delta(cube, before_cube),
         "restore_delta_suzanne": _restore_mesh_delta(suzanne, before_suzanne),
         "final_dynamic_triangle_count": int(final_diag.dynamic_triangle_count),
+        "final_dynamic_particle_count": int(final_diag.dynamic_particle_count),
+        "final_dynamic_particle_contacts": int(final_diag.dynamic_particle_contacts),
+        "final_dynamic_particle_overflow": int(final_diag.dynamic_particle_overflow),
         "final_analytic_collision_ms": float(final_diag.analytic_collision_ms),
         "final_dynamic_collision_ms": float(final_diag.dynamic_collision_ms),
+        "final_dynamic_particle_collision_ms": float(final_diag.dynamic_particle_collision_ms),
         "samples": samples,
     }
     (OUTPUT_DIR / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")

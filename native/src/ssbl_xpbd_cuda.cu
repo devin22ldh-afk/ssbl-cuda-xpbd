@@ -18,19 +18,19 @@ thread_local std::string g_last_error;
 constexpr float kEps = 1.0e-8f;
 constexpr float kProjectionRelaxation = 0.35f;
 constexpr float kSelfProjectionRelaxation = 0.40f;
-constexpr float kSelfRecoveryProjectionRelaxation = 0.30f;
+constexpr float kSelfRecoveryProjectionRelaxation = 0.55f;
 constexpr float kSelfRecoveryVelocityDamping = 0.65f;
-constexpr float kSelfCorrectionMaxDisplacementScale = 0.05f;
+constexpr float kSelfCorrectionMaxDisplacementScale = 0.45f;
 constexpr float kSelfRecoveryMaxDisplacementScale = 0.50f;
 constexpr float kMaxSubstepMove = 0.35f;
 constexpr float kMaxVelocity = 35.0f;
 constexpr int kSelfCollisionPasses = 2;
 constexpr int kSelfSurfaceSamplesPerTriangleDefault = 7;
 constexpr int kSelfSurfaceSamplesPerTriangleReduced = 4;
-constexpr int kSelfRecoveryPassLimit = 1;
+constexpr int kSelfRecoveryPassLimit = 2;
 constexpr int kLargeMeshSelfVertexThreshold = 80000;
 constexpr int kLargeMeshSelfTriangleThreshold = 150000;
-constexpr float kSelfCoarseDistanceMultiplier = 1.5f;
+constexpr float kSelfCoarseDistanceMultiplier = 2.5f;
 constexpr float kSelfApproachEps = 1.0e-5f;
 constexpr float kSelfContactDistanceEdgeP10Scale = 0.60f;
 constexpr int kSelfSleepTargetVerticesPerRegion = 512;
@@ -81,6 +81,10 @@ constexpr int kStaticCollisionPasses = 4;
 constexpr int kMaxDynamicTriangleHashCells = 32;
 constexpr int kMaxDynamicVertexQueryCells = 64;
 constexpr int kMaxDynamicVertexCandidates = 64;
+constexpr int kMaxDynamicParticleQueryCells = 125;
+constexpr int kMaxDynamicParticleNeighbors = 64;
+constexpr float kDynamicParticleCollisionRelaxation = 0.8f;
+constexpr float kDynamicParticleMaxCorrectionScale = 1.0f;
 constexpr int kMaxDynamicCollisionPasses = 2;
 constexpr int kDynamicCollisionTwoPassTriangleLimit = 128;
 constexpr long long kDynamicCollisionTwoPassWorkLimit = 50000000;
@@ -99,7 +103,7 @@ constexpr int kExternalContactMaxAge = 8;
 constexpr int kExternalContactCapacityMin = 4096;
 constexpr int kExternalContactCapacityMax = 1048576;
 constexpr float kExternalContactWarmStartScale = 0.35f;
-constexpr int kDiagCountSlots = 12;
+constexpr int kDiagCountSlots = 15;
 constexpr int kDiagCandidateCount = 0;
 constexpr int kDiagResolvedContacts = 1;
 constexpr int kDiagCcdClampCount = 2;
@@ -112,6 +116,9 @@ constexpr int kDiagExternalContactCacheMisses = 8;
 constexpr int kDiagExternalContactCacheOverflow = 9;
 constexpr int kDiagExternalFrictionCorrections = 10;
 constexpr int kDiagExternalContactCacheCount = 11;
+constexpr int kDiagDynamicParticleCandidates = 12;
+constexpr int kDiagDynamicParticleContacts = 13;
+constexpr int kDiagDynamicParticleOverflow = 14;
 
 struct Vec3 {
     float x;
@@ -138,6 +145,14 @@ struct ExternalContact {
     Vec3 lambda_t;
     int age;
     int active;
+};
+
+struct DynamicParticle {
+    Vec3 position;
+    float radius;
+    float inv_mass;
+    int slot_id;
+    int phase;
 };
 
 struct Solver {
@@ -189,6 +204,15 @@ struct Solver {
     int* dynamic_tri_entry_count = nullptr;
     int dynamic_tri_entry_capacity = 0;
     int dynamic_hash_table_size = 0;
+    DynamicParticle* dynamic_particles = nullptr;
+    int dynamic_particle_count = 0;
+    int dynamic_particle_capacity = 0;
+    float dynamic_particle_max_radius = 0.0f;
+    int* dynamic_particle_heads = nullptr;
+    int* dynamic_particle_next = nullptr;
+    int* dynamic_particle_index = nullptr;
+    int* dynamic_particle_count_buffer = nullptr;
+    int dynamic_particle_hash_table_size = 0;
     ExternalContact* external_contacts = nullptr;
     int external_contact_capacity = 0;
     SsblXpbdForceField* force_fields = nullptr;
@@ -198,6 +222,9 @@ struct Solver {
     int* self_vert_heads = nullptr;
     int* self_vert_next = nullptr;
     int self_vert_hash_table_size = 0;
+    int* self_edge_heads = nullptr;
+    int* self_edge_next = nullptr;
+    int self_edge_hash_table_size = 0;
     int* self_sample_heads = nullptr;
     int* self_sample_next = nullptr;
     int* self_sample_hash_dirty = nullptr;
@@ -292,6 +319,7 @@ enum TimingSlot {
     kTimingAnalyticCollision,
     kTimingStaticCollision,
     kTimingDynamicCollision,
+    kTimingDynamicParticleCollision,
     kTimingSelfHash,
     kTimingSelfSolve,
     kTimingSelfProbe,
@@ -324,6 +352,8 @@ float* timing_field(SsblXpbdDiagnostics* diag, int slot) {
             return &diag->static_collision_ms;
         case kTimingDynamicCollision:
             return &diag->dynamic_collision_ms;
+        case kTimingDynamicParticleCollision:
+            return &diag->dynamic_particle_collision_ms;
         case kTimingSelfHash:
             return &diag->self_hash_ms;
         case kTimingSelfSolve:
@@ -352,6 +382,8 @@ float* timing_primary_field(SsblXpbdDiagnostics* diag, int slot) {
             return &diag->self_solve_ms;
         case kTimingSelfVsPairProjectRecovery:
             return &diag->self_recovery_ms;
+        case kTimingDynamicParticleCollision:
+            return &diag->dynamic_collision_ms;
         default:
             return nullptr;
     }
@@ -712,11 +744,11 @@ float compute_self_contact_distance(const SsblXpbdConfig* config, const SsblXpbd
 
 int self_fast_surface_sample_count_per_triangle(const Solver* solver) {
     if (!solver) {
-        return kSelfSurfaceSamplesPerTriangleReduced;
+        return kSelfSurfaceSamplesPerTriangleDefault;
     }
     return std::min(
         std::max(solver->self_samples_per_triangle, 1),
-        kSelfSurfaceSamplesPerTriangleReduced
+        kSelfSurfaceSamplesPerTriangleDefault
     );
 }
 
@@ -1227,6 +1259,11 @@ __device__ float static_cell_size(Solver solver) {
     return fmaxf(external_contact_distance(solver) * 2.0f, 1.25e-2f);
 }
 
+__device__ float dynamic_particle_cell_size(Solver solver) {
+    float radius = external_contact_distance(solver) + fmaxf(solver.dynamic_particle_max_radius, 0.0f);
+    return fmaxf(radius * 2.0f, 1.25e-2f);
+}
+
 __device__ void diag_note_gap(Solver solver, float gap) {
     atomic_min_float(solver.diag_min_gap, gap);
 }
@@ -1275,6 +1312,24 @@ __device__ void diag_note_external_contact_cache_overflow(Solver solver) {
 __device__ void diag_note_external_friction_correction(Solver solver) {
     if (solver.diag_counts) {
         atomicAdd(&solver.diag_counts[kDiagExternalFrictionCorrections], 1ull);
+    }
+}
+
+__device__ void diag_note_dynamic_particle_candidate(Solver solver) {
+    if (solver.diag_counts) {
+        atomicAdd(&solver.diag_counts[kDiagDynamicParticleCandidates], 1ull);
+    }
+}
+
+__device__ void diag_note_dynamic_particle_contact(Solver solver) {
+    if (solver.diag_counts) {
+        atomicAdd(&solver.diag_counts[kDiagDynamicParticleContacts], 1ull);
+    }
+}
+
+__device__ void diag_note_dynamic_particle_overflow(Solver solver) {
+    if (solver.diag_counts) {
+        atomicAdd(&solver.diag_counts[kDiagDynamicParticleOverflow], 1ull);
     }
 }
 
@@ -1742,6 +1797,10 @@ __device__ bool self_is_approaching(Vec3 delta, Vec3 previous_delta, Vec3 normal
     return current_sep <= previous_sep - kSelfApproachEps;
 }
 
+__device__ bool self_should_project_contact(float gap, Vec3 delta, Vec3 previous_delta, Vec3 normal) {
+    return gap < 0.0f || self_is_approaching(delta, previous_delta, normal);
+}
+
 __device__ float self_projection_relaxation(Solver solver) {
     return solver.self_recovery_mode ? kSelfRecoveryProjectionRelaxation : kSelfProjectionRelaxation;
 }
@@ -1865,6 +1924,325 @@ __device__ bool triangles_share_vertex(Int3 a, Int3 b) {
     return a.x == b.x || a.x == b.y || a.x == b.z
         || a.y == b.x || a.y == b.y || a.y == b.z
         || a.z == b.x || a.z == b.y || a.z == b.z;
+}
+
+__device__ bool edges_share_vertex(Int2 a, Int2 b) {
+    return a.x == b.x || a.x == b.y || a.y == b.x || a.y == b.y;
+}
+
+__device__ bool rest_edges_neighbor(Solver solver, Int2 a, Int2 b) {
+    if (edges_share_vertex(a, b)) {
+        return true;
+    }
+    if (same_or_one_ring_neighbor(solver, a.x, b.x)
+        || same_or_one_ring_neighbor(solver, a.x, b.y)
+        || same_or_one_ring_neighbor(solver, a.y, b.x)
+        || same_or_one_ring_neighbor(solver, a.y, b.y)) {
+        return true;
+    }
+    float thickness = self_contact_distance(solver);
+    float close_threshold = fmaxf(thickness * 0.5f, 1.0e-5f);
+    Vec3 mid_a = mul(add(solver.rest[a.x], solver.rest[a.y]), 0.5f);
+    Vec3 mid_b = mul(add(solver.rest[b.x], solver.rest[b.y]), 0.5f);
+    return norm(sub(mid_a, mid_b)) <= close_threshold;
+}
+
+__device__ void closest_segment_parameters(
+    Vec3 p1,
+    Vec3 q1,
+    Vec3 p2,
+    Vec3 q2,
+    float* s_out,
+    float* t_out
+) {
+    Vec3 d1 = sub(q1, p1);
+    Vec3 d2 = sub(q2, p2);
+    Vec3 r = sub(p1, p2);
+    float a = dot(d1, d1);
+    float e = dot(d2, d2);
+    float f = dot(d2, r);
+    float s = 0.0f;
+    float t = 0.0f;
+
+    if (a <= kEps && e <= kEps) {
+        *s_out = 0.0f;
+        *t_out = 0.0f;
+        return;
+    }
+    if (a <= kEps) {
+        s = 0.0f;
+        t = f / fmaxf(e, kEps);
+        t = fminf(fmaxf(t, 0.0f), 1.0f);
+    } else {
+        float c = dot(d1, r);
+        if (e <= kEps) {
+            t = 0.0f;
+            s = fminf(fmaxf(-c / fmaxf(a, kEps), 0.0f), 1.0f);
+        } else {
+            float b = dot(d1, d2);
+            float denom = a * e - b * b;
+            if (denom != 0.0f) {
+                s = fminf(fmaxf((b * f - c * e) / denom, 0.0f), 1.0f);
+            } else {
+                s = 0.0f;
+            }
+            t = (b * s + f) / e;
+            if (t < 0.0f) {
+                t = 0.0f;
+                s = fminf(fmaxf(-c / fmaxf(a, kEps), 0.0f), 1.0f);
+            } else if (t > 1.0f) {
+                t = 1.0f;
+                s = fminf(fmaxf((b - c) / fmaxf(a, kEps), 0.0f), 1.0f);
+            }
+        }
+    }
+    *s_out = s;
+    *t_out = t;
+}
+
+__device__ bool segment_triangle_intersection(
+    Vec3 p0,
+    Vec3 p1,
+    Vec3 a,
+    Vec3 b,
+    Vec3 c,
+    float* edge_t,
+    float* wa,
+    float* wb,
+    float* wc
+) {
+    Vec3 direction = sub(p1, p0);
+    Vec3 edge1 = sub(b, a);
+    Vec3 edge2 = sub(c, a);
+    Vec3 h = cross(direction, edge2);
+    float det = dot(edge1, h);
+    if (fabsf(det) <= 1.0e-7f) {
+        return false;
+    }
+    float inv_det = 1.0f / det;
+    Vec3 s = sub(p0, a);
+    float u = inv_det * dot(s, h);
+    if (u < 0.0f || u > 1.0f) {
+        return false;
+    }
+    Vec3 q = cross(s, edge1);
+    float v = inv_det * dot(direction, q);
+    if (v < 0.0f || u + v > 1.0f) {
+        return false;
+    }
+    float t = inv_det * dot(edge2, q);
+    if (t < 0.0f || t > 1.0f) {
+        return false;
+    }
+    *edge_t = t;
+    *wa = 1.0f - u - v;
+    *wb = u;
+    *wc = v;
+    return true;
+}
+
+__device__ Vec3 closest_point_on_triangle(
+    Vec3 p,
+    Vec3 a,
+    Vec3 b,
+    Vec3 c,
+    float* wa,
+    float* wb,
+    float* wc
+) {
+    Vec3 ab = sub(b, a);
+    Vec3 ac = sub(c, a);
+    Vec3 ap = sub(p, a);
+    float d1 = dot(ab, ap);
+    float d2 = dot(ac, ap);
+    if (d1 <= 0.0f && d2 <= 0.0f) {
+        *wa = 1.0f;
+        *wb = 0.0f;
+        *wc = 0.0f;
+        return a;
+    }
+
+    Vec3 bp = sub(p, b);
+    float d3 = dot(ab, bp);
+    float d4 = dot(ac, bp);
+    if (d3 >= 0.0f && d4 <= d3) {
+        *wa = 0.0f;
+        *wb = 1.0f;
+        *wc = 0.0f;
+        return b;
+    }
+
+    float vc = d1 * d4 - d3 * d2;
+    if (vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f) {
+        float v = d1 / fmaxf(d1 - d3, kEps);
+        *wa = 1.0f - v;
+        *wb = v;
+        *wc = 0.0f;
+        return add(a, mul(ab, v));
+    }
+
+    Vec3 cp = sub(p, c);
+    float d5 = dot(ab, cp);
+    float d6 = dot(ac, cp);
+    if (d6 >= 0.0f && d5 <= d6) {
+        *wa = 0.0f;
+        *wb = 0.0f;
+        *wc = 1.0f;
+        return c;
+    }
+
+    float vb = d5 * d2 - d1 * d6;
+    if (vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f) {
+        float w = d2 / fmaxf(d2 - d6, kEps);
+        *wa = 1.0f - w;
+        *wb = 0.0f;
+        *wc = w;
+        return add(a, mul(ac, w));
+    }
+
+    float va = d3 * d6 - d5 * d4;
+    if (va <= 0.0f && (d4 - d3) >= 0.0f && (d5 - d6) >= 0.0f) {
+        float w = (d4 - d3) / fmaxf((d4 - d3) + (d5 - d6), kEps);
+        *wa = 0.0f;
+        *wb = 1.0f - w;
+        *wc = w;
+        return add(b, mul(sub(c, b), w));
+    }
+
+    float denom = 1.0f / fmaxf(va + vb + vc, kEps);
+    float v = vb * denom;
+    float w = vc * denom;
+    *wa = 1.0f - v - w;
+    *wb = v;
+    *wc = w;
+    return add(a, add(mul(ab, v), mul(ac, w)));
+}
+
+__device__ void closest_segment_triangle_contact(
+    Vec3 p0,
+    Vec3 p1,
+    Vec3 a,
+    Vec3 b,
+    Vec3 c,
+    float* edge_t,
+    float* wa,
+    float* wb,
+    float* wc,
+    float* distance,
+    Vec3* edge_point,
+    Vec3* triangle_point
+) {
+    if (segment_triangle_intersection(p0, p1, a, b, c, edge_t, wa, wb, wc)) {
+        *edge_point = add(p0, mul(sub(p1, p0), *edge_t));
+        *triangle_point = weighted_triangle_point(a, b, c, *wa, *wb, *wc);
+        *distance = 0.0f;
+        return;
+    }
+
+    float best_d2 = FLT_MAX;
+    float best_t = 0.0f;
+    float best_wa = 1.0f;
+    float best_wb = 0.0f;
+    float best_wc = 0.0f;
+    Vec3 best_edge_point = p0;
+    Vec3 best_tri_point = a;
+
+    for (int endpoint = 0; endpoint < 2; ++endpoint) {
+        Vec3 p = endpoint == 0 ? p0 : p1;
+        float twa;
+        float twb;
+        float twc;
+        Vec3 q = closest_point_on_triangle(p, a, b, c, &twa, &twb, &twc);
+        Vec3 delta = sub(p, q);
+        float d2 = dot(delta, delta);
+        if (d2 < best_d2) {
+            best_d2 = d2;
+            best_t = endpoint == 0 ? 0.0f : 1.0f;
+            best_wa = twa;
+            best_wb = twb;
+            best_wc = twc;
+            best_edge_point = p;
+            best_tri_point = q;
+        }
+    }
+
+    for (int tri_edge = 0; tri_edge < 3; ++tri_edge) {
+        Vec3 q0 = tri_edge == 0 ? a : (tri_edge == 1 ? b : c);
+        Vec3 q1 = tri_edge == 0 ? b : (tri_edge == 1 ? c : a);
+        float s = 0.0f;
+        float t = 0.0f;
+        closest_segment_parameters(p0, p1, q0, q1, &s, &t);
+        Vec3 p = add(p0, mul(sub(p1, p0), s));
+        Vec3 q = add(q0, mul(sub(q1, q0), t));
+        Vec3 delta = sub(p, q);
+        float d2 = dot(delta, delta);
+        if (d2 < best_d2) {
+            best_d2 = d2;
+            best_t = s;
+            if (tri_edge == 0) {
+                best_wa = 1.0f - t;
+                best_wb = t;
+                best_wc = 0.0f;
+            } else if (tri_edge == 1) {
+                best_wa = 0.0f;
+                best_wb = 1.0f - t;
+                best_wc = t;
+            } else {
+                best_wa = t;
+                best_wb = 0.0f;
+                best_wc = 1.0f - t;
+            }
+            best_edge_point = p;
+            best_tri_point = q;
+        }
+    }
+
+    *edge_t = best_t;
+    *wa = best_wa;
+    *wb = best_wb;
+    *wc = best_wc;
+    *edge_point = best_edge_point;
+    *triangle_point = best_tri_point;
+    *distance = sqrtf(fmaxf(best_d2, 0.0f));
+}
+
+__device__ bool rest_edge_surface_neighbor(Solver solver, Int2 edge, Int3 tri) {
+    if (edge.x == tri.x || edge.x == tri.y || edge.x == tri.z
+        || edge.y == tri.x || edge.y == tri.y || edge.y == tri.z) {
+        return true;
+    }
+    if (same_or_one_ring_neighbor(solver, edge.x, tri.x)
+        || same_or_one_ring_neighbor(solver, edge.x, tri.y)
+        || same_or_one_ring_neighbor(solver, edge.x, tri.z)
+        || same_or_one_ring_neighbor(solver, edge.y, tri.x)
+        || same_or_one_ring_neighbor(solver, edge.y, tri.y)
+        || same_or_one_ring_neighbor(solver, edge.y, tri.z)) {
+        return true;
+    }
+
+    float edge_t;
+    float wa;
+    float wb;
+    float wc;
+    float distance;
+    Vec3 edge_point;
+    Vec3 tri_point;
+    closest_segment_triangle_contact(
+        solver.rest[edge.x],
+        solver.rest[edge.y],
+        solver.rest[tri.x],
+        solver.rest[tri.y],
+        solver.rest[tri.z],
+        &edge_t,
+        &wa,
+        &wb,
+        &wc,
+        &distance,
+        &edge_point,
+        &tri_point
+    );
+    float close_threshold = fmaxf(self_contact_distance(solver) * 0.35f, 1.0e-5f);
+    return distance <= close_threshold;
 }
 
 __device__ float weighted_inv_mass(Solver solver, Int3 tri, float wa, float wb, float wc) {
@@ -2657,6 +3035,126 @@ __global__ void static_collision_hashed_kernel(Solver solver) {
     solver.prev[i] = prev;
 }
 
+__global__ void build_dynamic_particle_hash_kernel(Solver solver) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= solver.dynamic_particle_count || !solver.dynamic_particles) {
+        return;
+    }
+    DynamicParticle particle = solver.dynamic_particles[i];
+    Vec3 p = particle.position;
+    if (!finite_vec(p)) {
+        return;
+    }
+    float cell_size = dynamic_particle_cell_size(solver);
+    int cx = cell_coord(p.x, cell_size);
+    int cy = cell_coord(p.y, cell_size);
+    int cz = cell_coord(p.z, cell_size);
+    int hash = hash_cell(cx, cy, cz, solver.dynamic_particle_hash_table_size);
+    int entry = atomicAdd(solver.dynamic_particle_count_buffer, 1);
+    if (entry >= solver.dynamic_particle_count) {
+        diag_note_dynamic_particle_overflow(solver);
+        return;
+    }
+    solver.dynamic_particle_index[entry] = i;
+    solver.dynamic_particle_next[entry] = atomicExch(&solver.dynamic_particle_heads[hash], entry);
+}
+
+__global__ void dynamic_particle_collision_kernel(Solver solver) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= solver.cfg.vertex_count || solver.inv_mass[i] <= 0.0f || solver.dynamic_particle_count <= 0) {
+        return;
+    }
+    if (!solver.dynamic_particles
+        || !solver.dynamic_particle_heads
+        || !solver.dynamic_particle_next
+        || !solver.dynamic_particle_index) {
+        return;
+    }
+    Vec3 p = solver.pos[i];
+    Vec3 prev = solver.prev[i];
+    if (!finite_vec(p) || !finite_vec(prev)) {
+        diag_note_nonfinite(solver);
+        return;
+    }
+    float target_radius = external_contact_distance(solver);
+    float cell_size = dynamic_particle_cell_size(solver);
+    float query_radius = target_radius + fmaxf(solver.dynamic_particle_max_radius, 0.0f);
+    float expand = fmaxf(query_radius, 1.0e-4f);
+    int min_x = cell_coord(p.x - expand, cell_size);
+    int min_y = cell_coord(p.y - expand, cell_size);
+    int min_z = cell_coord(p.z - expand, cell_size);
+    int max_x = cell_coord(p.x + expand, cell_size);
+    int max_y = cell_coord(p.y + expand, cell_size);
+    int max_z = cell_coord(p.z + expand, cell_size);
+    int queried = 0;
+    int contacts = 0;
+    float wi = fmaxf(solver.inv_mass[i], 0.0f);
+
+    for (int z = min_z; z <= max_z && queried < kMaxDynamicParticleQueryCells; ++z) {
+        for (int y = min_y; y <= max_y && queried < kMaxDynamicParticleQueryCells; ++y) {
+            for (int x = min_x; x <= max_x && queried < kMaxDynamicParticleQueryCells; ++x) {
+                int hash = hash_cell(x, y, z, solver.dynamic_particle_hash_table_size);
+                int entry = solver.dynamic_particle_heads[hash];
+                while (entry >= 0) {
+                    int particle_index = solver.dynamic_particle_index[entry];
+                    if (particle_index >= 0 && particle_index < solver.dynamic_particle_count) {
+                        DynamicParticle particle = solver.dynamic_particles[particle_index];
+                        if (particle.phase >= 0 && finite_vec(particle.position)) {
+                            float source_radius = fmaxf(particle.radius, 0.0f);
+                            float min_dist = target_radius + source_radius;
+                            if (min_dist > 0.0f) {
+                                Vec3 delta = sub(p, particle.position);
+                                float dist_sq = dot(delta, delta);
+                                if (isfinite(dist_sq) && dist_sq < min_dist * min_dist) {
+                                    float dist = sqrtf(fmaxf(dist_sq, 0.0f));
+                                    float gap = dist - min_dist;
+                                    diag_note_candidate(solver, gap);
+                                    diag_note_dynamic_particle_candidate(solver);
+                                    if (contacts < kMaxDynamicParticleNeighbors) {
+                                        Vec3 normal = {0.0f, 0.0f, 1.0f};
+                                        if (dist > 1.0e-7f) {
+                                            normal = mul(delta, 1.0f / dist);
+                                        } else {
+                                            Vec3 motion = sub(p, prev);
+                                            float motion_len = norm(motion);
+                                            if (motion_len > 1.0e-7f && finite_vec(motion)) {
+                                                normal = mul(motion, -1.0f / motion_len);
+                                            }
+                                        }
+                                        float wj = fmaxf(particle.inv_mass, 0.0f);
+                                        float total = wi + wj;
+                                        float target_fraction = total > kEps ? wi / total : 0.0f;
+                                        float depth = fmaxf(-gap, 0.0f);
+                                        float correction_len = depth * target_fraction * kDynamicParticleCollisionRelaxation;
+                                        float max_correction = fmaxf(
+                                            kExternalCollisionMinCorrection,
+                                            min_dist * kDynamicParticleMaxCorrectionScale
+                                        );
+                                        correction_len = fminf(correction_len, max_correction);
+                                        if (correction_len > 0.0f && finite_vec(normal)) {
+                                            Vec3 correction = mul(normal, correction_len);
+                                            apply_external_collision_response(&p, &prev, correction);
+                                            diag_note_resolved(solver);
+                                            diag_note_dynamic_particle_contact(solver);
+                                            ++contacts;
+                                        }
+                                    } else {
+                                        diag_note_dynamic_particle_overflow(solver);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    entry = solver.dynamic_particle_next[entry];
+                }
+                ++queried;
+            }
+        }
+    }
+    solver.pos[i] = p;
+    solver.prev[i] = prev;
+}
+
 __global__ void dynamic_collision_kernel(Solver solver) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= solver.cfg.vertex_count || solver.inv_mass[i] <= 0.0f) {
@@ -2866,6 +3364,154 @@ __global__ void build_self_vertex_hash_kernel(Solver solver) {
     solver.self_vert_next[i] = atomicExch(&solver.self_vert_heads[hash], i);
 }
 
+__global__ void build_self_edge_hash_kernel(Solver solver) {
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= solver.cfg.edge_count || !solver.edges || !solver.self_edge_heads || !solver.self_edge_next) {
+        return;
+    }
+    Int2 edge = solver.edges[e];
+    if (edge.x < 0 || edge.x >= solver.cfg.vertex_count || edge.y < 0 || edge.y >= solver.cfg.vertex_count) {
+        return;
+    }
+    Vec3 mid = mul(add(solver.pos[edge.x], solver.pos[edge.y]), 0.5f);
+    if (!finite_vec(mid)) {
+        return;
+    }
+    float cell_size = self_cell_size(solver);
+    int cx = cell_coord(mid.x, cell_size);
+    int cy = cell_coord(mid.y, cell_size);
+    int cz = cell_coord(mid.z, cell_size);
+    int hash = hash_cell(cx, cy, cz, solver.self_edge_hash_table_size);
+    solver.self_edge_next[e] = atomicExch(&solver.self_edge_heads[hash], e);
+}
+
+__global__ void self_edge_edge_collision_kernel(Solver solver) {
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= solver.cfg.edge_count || !solver.edges || !solver.self_edge_heads || !solver.self_edge_next) {
+        return;
+    }
+    Int2 edge_a = solver.edges[e];
+    if (edge_a.x < 0 || edge_a.x >= solver.cfg.vertex_count
+        || edge_a.y < 0 || edge_a.y >= solver.cfg.vertex_count) {
+        return;
+    }
+    float wx0 = solver.inv_mass[edge_a.x];
+    float wx1 = solver.inv_mass[edge_a.y];
+    if (wx0 <= 0.0f && wx1 <= 0.0f) {
+        return;
+    }
+
+    Vec3 a0 = solver.pos[edge_a.x];
+    Vec3 a1 = solver.pos[edge_a.y];
+    if (!finite_vec(a0) || !finite_vec(a1)) {
+        diag_note_nonfinite(solver);
+        return;
+    }
+    Vec3 mid = mul(add(a0, a1), 0.5f);
+    float thickness = self_contact_distance(solver);
+    float cell_size = self_cell_size(solver);
+    int max_neighbors = solver.cfg.max_self_collision_neighbors > 1 ? solver.cfg.max_self_collision_neighbors : 1;
+    if (solver.self_recovery_mode) {
+        max_neighbors = min(max_neighbors * 2, 256);
+    }
+    int candidates = 0;
+    int scanned = 0;
+    int scan_limit = max_neighbors * 32;
+    int base_x = cell_coord(mid.x, cell_size);
+    int base_y = cell_coord(mid.y, cell_size);
+    int base_z = cell_coord(mid.z, cell_size);
+
+    for (int dz = -2; dz <= 2; ++dz) {
+        for (int dy = -2; dy <= 2; ++dy) {
+            for (int dx = -2; dx <= 2; ++dx) {
+                int hash = hash_cell(base_x + dx, base_y + dy, base_z + dz, solver.self_edge_hash_table_size);
+                int other = solver.self_edge_heads[hash];
+                while (other >= 0 && candidates < max_neighbors && scanned < scan_limit) {
+                    ++scanned;
+                    if (other > e) {
+                        Int2 edge_b = solver.edges[other];
+                        if (edge_b.x >= 0 && edge_b.x < solver.cfg.vertex_count
+                            && edge_b.y >= 0 && edge_b.y < solver.cfg.vertex_count
+                            && !rest_edges_neighbor(solver, edge_a, edge_b)) {
+                            Vec3 b0 = solver.pos[edge_b.x];
+                            Vec3 b1 = solver.pos[edge_b.y];
+                            if (finite_vec(b0) && finite_vec(b1)) {
+                                float s = 0.0f;
+                                float t = 0.0f;
+                                closest_segment_parameters(a0, a1, b0, b1, &s, &t);
+                                Vec3 pa = add(a0, mul(sub(a1, a0), s));
+                                Vec3 pb = add(b0, mul(sub(b1, b0), t));
+                                Vec3 delta = sub(pa, pb);
+                                float d2 = dot(delta, delta);
+                                float d = sqrtf(fmaxf(d2, 0.0f));
+                                if (self_coarse_distance_ok(d, thickness)) {
+                                    float gap = d - thickness;
+                                    diag_note_gap(solver, gap);
+                                    Vec3 prev_a0 = solver.prev[edge_a.x];
+                                    Vec3 prev_a1 = solver.prev[edge_a.y];
+                                    Vec3 prev_b0 = solver.prev[edge_b.x];
+                                    Vec3 prev_b1 = solver.prev[edge_b.y];
+                                    Vec3 prev_pa = add(prev_a0, mul(sub(prev_a1, prev_a0), s));
+                                    Vec3 prev_pb = add(prev_b0, mul(sub(prev_b1, prev_b0), t));
+                                    Vec3 previous_delta = sub(prev_pa, prev_pb);
+                                    Vec3 normal;
+                                    float contact_distance = d;
+                                    if (d2 > kEps) {
+                                        normal = mul(delta, 1.0f / fmaxf(d, kEps));
+                                    } else {
+                                        Vec3 rest_a = sub(solver.rest[edge_a.y], solver.rest[edge_a.x]);
+                                        Vec3 rest_b = sub(solver.rest[edge_b.y], solver.rest[edge_b.x]);
+                                        normal = cross(rest_a, rest_b);
+                                        if (dot(normal, normal) <= kEps) {
+                                            normal = sub(
+                                                mul(add(solver.rest[edge_a.x], solver.rest[edge_a.y]), 0.5f),
+                                                mul(add(solver.rest[edge_b.x], solver.rest[edge_b.y]), 0.5f)
+                                            );
+                                        }
+                                        if (dot(normal, normal) <= kEps) {
+                                            normal = {0.0f, 0.0f, 1.0f};
+                                        } else {
+                                            normal = normalize(normal);
+                                        }
+                                        contact_distance = 0.0f;
+                                    }
+                                    if (self_should_project_contact(gap, delta, previous_delta, normal)) {
+                                        diag_note_effective_candidate(solver);
+                                        ++candidates;
+                                        if (gap < 0.0f) {
+                                            float ca0 = 1.0f - s;
+                                            float ca1 = s;
+                                            float cb0 = 1.0f - t;
+                                            float cb1 = t;
+                                            float wb0_mass = solver.inv_mass[edge_b.x];
+                                            float wb1_mass = solver.inv_mass[edge_b.y];
+                                            float total = ca0 * ca0 * wx0
+                                                + ca1 * ca1 * wx1
+                                                + cb0 * cb0 * wb0_mass
+                                                + cb1 * cb1 * wb1_mass;
+                                            if (total > 0.0f) {
+                                                Vec3 correction = mul(normal, self_projection_relaxation(solver) * (thickness - contact_distance) / total);
+                                                apply_self_collision_correction(solver, edge_a.x, mul(correction, wx0 * ca0));
+                                                apply_self_collision_correction(solver, edge_a.y, mul(correction, wx1 * ca1));
+                                                apply_self_collision_correction(solver, edge_b.x, mul(correction, -wb0_mass * cb0));
+                                                apply_self_collision_correction(solver, edge_b.y, mul(correction, -wb1_mass * cb1));
+                                                diag_note_resolved(solver);
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                diag_note_nonfinite(solver);
+                            }
+                        }
+                    }
+                    other = solver.self_edge_next[other];
+                }
+            }
+        }
+    }
+}
+
 __global__ void self_particle_collision_kernel(Solver solver) {
     int ordinal = blockIdx.x * blockDim.x + threadIdx.x;
     if (ordinal >= self_vertex_source_count(solver)) {
@@ -2926,8 +3572,7 @@ __global__ void self_particle_collision_kernel(Solver solver) {
                             contact_distance = 0.0f;
                         }
                         Vec3 previous_delta = sub(solver.prev[i], solver.prev[j]);
-                        bool allow_recovery_projection = solver.self_recovery_mode && gap < 0.0f;
-                        if (!allow_recovery_projection && !self_is_approaching(delta, previous_delta, normal)) {
+                        if (!self_should_project_contact(gap, delta, previous_delta, normal)) {
                             j = solver.self_vert_next[j];
                             continue;
                         }
@@ -3003,6 +3648,154 @@ __global__ void build_self_surface_sample_hash_if_dirty_kernel(Solver solver) {
         return;
     }
     build_self_surface_sample_hash_entry(solver, sample);
+}
+
+__global__ void self_edge_surface_collision_kernel(Solver solver) {
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= solver.cfg.edge_count || !solver.edges || !solver.self_sample_heads || !solver.self_sample_next) {
+        return;
+    }
+    Int2 edge = solver.edges[e];
+    if (edge.x < 0 || edge.x >= solver.cfg.vertex_count
+        || edge.y < 0 || edge.y >= solver.cfg.vertex_count) {
+        return;
+    }
+    float wx0 = solver.inv_mass[edge.x];
+    float wx1 = solver.inv_mass[edge.y];
+    if (wx0 <= 0.0f && wx1 <= 0.0f) {
+        return;
+    }
+    Vec3 p0 = solver.pos[edge.x];
+    Vec3 p1 = solver.pos[edge.y];
+    if (!finite_vec(p0) || !finite_vec(p1)) {
+        diag_note_nonfinite(solver);
+        return;
+    }
+
+    float thickness = self_contact_distance(solver);
+    float cell_size = self_cell_size(solver);
+    int max_neighbors = solver.cfg.max_self_collision_neighbors > 1 ? solver.cfg.max_self_collision_neighbors : 1;
+    if (solver.self_recovery_mode) {
+        max_neighbors = min(max_neighbors * 2, 256);
+    }
+    int candidates = 0;
+    int scanned = 0;
+    int scan_limit = max_neighbors * 16;
+
+    for (int anchor_index = 0; anchor_index < 1 && candidates < max_neighbors; ++anchor_index) {
+        float anchor_t = 0.5f;
+        Vec3 query = add(p0, mul(sub(p1, p0), anchor_t));
+        int base_x = cell_coord(query.x, cell_size);
+        int base_y = cell_coord(query.y, cell_size);
+        int base_z = cell_coord(query.z, cell_size);
+        for (int dz = -1; dz <= 1 && candidates < max_neighbors && scanned < scan_limit; ++dz) {
+            for (int dy = -1; dy <= 1 && candidates < max_neighbors && scanned < scan_limit; ++dy) {
+                for (int dx = -1; dx <= 1 && candidates < max_neighbors && scanned < scan_limit; ++dx) {
+                    int hash = hash_cell(base_x + dx, base_y + dy, base_z + dz, solver.self_sample_hash_table_size);
+                    int sample = solver.self_sample_heads[hash];
+                    while (sample >= 0 && candidates < max_neighbors && scanned < scan_limit) {
+                        ++scanned;
+                        int tri_index = self_sample_triangle_index(solver, sample);
+                        if (tri_index >= 0 && tri_index < solver.cfg.triangle_count) {
+                            Int3 tri = solver.triangles[tri_index];
+                            if (!rest_edge_surface_neighbor(solver, edge, tri)) {
+                                Vec3 a = solver.pos[tri.x];
+                                Vec3 b = solver.pos[tri.y];
+                                Vec3 c = solver.pos[tri.z];
+                                if (finite_vec(a) && finite_vec(b) && finite_vec(c)) {
+                                    float edge_t;
+                                    float wa;
+                                    float wb;
+                                    float wc;
+                                    float distance;
+                                    Vec3 edge_point;
+                                    Vec3 tri_point;
+                                    closest_segment_triangle_contact(
+                                        p0,
+                                        p1,
+                                        a,
+                                        b,
+                                        c,
+                                        &edge_t,
+                                        &wa,
+                                        &wb,
+                                        &wc,
+                                        &distance,
+                                        &edge_point,
+                                        &tri_point
+                                    );
+                                    if (self_coarse_distance_ok(distance, thickness)) {
+                                        float gap = distance - thickness;
+                                        diag_note_gap(solver, gap);
+                                        Vec3 surface_normal = stable_triangle_normal(
+                                            a,
+                                            b,
+                                            c,
+                                            solver.rest[tri.x],
+                                            solver.rest[tri.y],
+                                            solver.rest[tri.z]
+                                        );
+                                        Vec3 prev_edge_point = add(
+                                            solver.prev[edge.x],
+                                            mul(sub(solver.prev[edge.y], solver.prev[edge.x]), edge_t)
+                                        );
+                                        Vec3 prev_tri_point = weighted_triangle_point(
+                                            solver.prev[tri.x],
+                                            solver.prev[tri.y],
+                                            solver.prev[tri.z],
+                                            wa,
+                                            wb,
+                                            wc
+                                        );
+                                        Vec3 delta = sub(edge_point, tri_point);
+                                        Vec3 previous_delta = sub(prev_edge_point, prev_tri_point);
+                                        float contact_distance = 0.0f;
+                                        Vec3 normal = self_collision_normal(
+                                            delta,
+                                            surface_normal,
+                                            previous_delta,
+                                            thickness,
+                                            &contact_distance
+                                        );
+                                        if (self_should_project_contact(gap, delta, previous_delta, normal)) {
+                                            diag_note_effective_candidate(solver);
+                                            ++candidates;
+                                            if (gap < 0.0f) {
+                                                float edge_w0 = 1.0f - edge_t;
+                                                float edge_w1 = edge_t;
+                                                float tri_weight = weighted_inv_mass(solver, tri, wa, wb, wc);
+                                                float total = edge_w0 * edge_w0 * wx0
+                                                    + edge_w1 * edge_w1 * wx1
+                                                    + tri_weight;
+                                                if (total > 0.0f) {
+                                                    Vec3 correction = mul(
+                                                        normal,
+                                                        self_projection_relaxation(solver) * (thickness - contact_distance) / total
+                                                    );
+                                                    apply_self_collision_correction(solver, edge.x, mul(correction, wx0 * edge_w0));
+                                                    apply_self_collision_correction(solver, edge.y, mul(correction, wx1 * edge_w1));
+                                                    apply_self_collision_correction(solver, tri.x, mul(correction, -solver.inv_mass[tri.x] * wa));
+                                                    apply_self_collision_correction(solver, tri.y, mul(correction, -solver.inv_mass[tri.y] * wb));
+                                                    apply_self_collision_correction(solver, tri.z, mul(correction, -solver.inv_mass[tri.z] * wc));
+                                                    if (solver.self_sample_hash_dirty) {
+                                                        atomicExch(solver.self_sample_hash_dirty, 1);
+                                                    }
+                                                    diag_note_resolved(solver);
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    diag_note_nonfinite(solver);
+                                }
+                            }
+                        }
+                        sample = solver.self_sample_next[sample];
+                    }
+                }
+            }
+        }
+    }
 }
 
 int dynamic_collision_pass_count(const Solver* solver) {
@@ -3115,8 +3908,7 @@ __global__ void build_self_vertex_surface_pairs_kernel(Solver solver, int store_
                             Vec3 previous_delta = sub(solver.prev[i], prev_sample);
                             float d = 0.0f;
                             Vec3 normal = self_collision_normal(delta, surface_normal, previous_delta, thickness, &d);
-                            append_pair = (solver.self_recovery_mode && gap < 0.0f)
-                                || self_is_approaching(delta, previous_delta, normal);
+                            append_pair = self_should_project_contact(gap, delta, previous_delta, normal);
                         }
                         if (append_pair) {
                             append_self_vs_pair(solver, i, sample);
@@ -3187,8 +3979,7 @@ __global__ void self_vertex_surface_pair_project_kernel(Solver solver) {
     Vec3 previous_delta = sub(solver.prev[i], prev_sample);
     float d = 0.0f;
     Vec3 normal = self_collision_normal(delta, surface_normal, previous_delta, thickness, &d);
-    bool allow_recovery_projection = solver.self_recovery_mode && gap < 0.0f;
-    if (!allow_recovery_projection && !self_is_approaching(delta, previous_delta, normal)) {
+    if (!self_should_project_contact(gap, delta, previous_delta, normal)) {
         return;
     }
     diag_note_effective_candidate(solver);
@@ -3276,7 +4067,7 @@ __global__ void probe_self_vertex_surface_pairs_kernel(Solver solver) {
     Vec3 previous_delta = sub(solver.prev[i], prev_sample);
     float contact_distance = 0.0f;
     Vec3 normal = self_collision_normal(delta, surface_normal, previous_delta, thickness, &contact_distance);
-    if (!self_is_approaching(delta, previous_delta, normal)) {
+    if (!self_should_project_contact(gap, delta, previous_delta, normal)) {
         return;
     }
     diag_note_effective_candidate(solver);
@@ -3369,8 +4160,7 @@ __global__ void self_vertex_surface_collision_kernel(Solver solver) {
                             thickness,
                             &d
                         );
-                        bool allow_recovery_projection = solver.self_recovery_mode && gap < 0.0f;
-                        if (!allow_recovery_projection && !self_is_approaching(delta, previous_delta, normal)) {
+                        if (!self_should_project_contact(gap, delta, previous_delta, normal)) {
                             sample = solver.self_sample_next[sample];
                             continue;
                         }
@@ -3515,8 +4305,7 @@ __global__ void self_surface_sample_collision_kernel(Solver solver) {
                                 thickness,
                                 &d
                             );
-                            bool allow_recovery_projection = solver.self_recovery_mode && gap < 0.0f;
-                            if (!allow_recovery_projection && !self_is_approaching(delta, previous_delta, normal)) {
+                            if (!self_should_project_contact(gap, delta, previous_delta, normal)) {
                                 sample_b = solver.self_sample_next[sample_b];
                                 continue;
                             }
@@ -3608,7 +4397,7 @@ __global__ void probe_self_particle_collision_kernel(Solver solver) {
                             normal = dot(rest_delta, rest_delta) > kEps ? normalize(rest_delta) : Vec3{0.0f, 0.0f, 1.0f};
                         }
                         Vec3 previous_delta = sub(solver.prev[i], solver.prev[j]);
-                        if (!self_is_approaching(delta, previous_delta, normal)) {
+                        if (!self_should_project_contact(gap, delta, previous_delta, normal)) {
                             j = solver.self_vert_next[j];
                             continue;
                         }
@@ -3696,7 +4485,7 @@ __global__ void probe_self_vertex_surface_collision_kernel(Solver solver) {
                         Vec3 previous_delta = sub(solver.prev[i], prev_sample);
                         float contact_distance = 0.0f;
                         Vec3 normal = self_collision_normal(delta, surface_normal, previous_delta, thickness, &contact_distance);
-                        if (!self_is_approaching(delta, previous_delta, normal)) {
+                        if (!self_should_project_contact(gap, delta, previous_delta, normal)) {
                             sample = solver.self_sample_next[sample];
                             continue;
                         }
@@ -4193,6 +4982,78 @@ bool rebuild_dynamic_triangle_hash(Solver* solver) {
     return true;
 }
 
+bool allocate_dynamic_particle_collision(Solver* solver, int particle_count) {
+    if (particle_count <= 0) {
+        solver->dynamic_particle_count = 0;
+        solver->dynamic_particle_max_radius = 0.0f;
+        return true;
+    }
+    if (particle_count <= solver->dynamic_particle_capacity
+        && solver->dynamic_particles
+        && solver->dynamic_particle_heads
+        && solver->dynamic_particle_next
+        && solver->dynamic_particle_index
+        && solver->dynamic_particle_count_buffer) {
+        solver->dynamic_particle_count = particle_count;
+        return true;
+    }
+
+    cudaFree(solver->dynamic_particles);
+    cudaFree(solver->dynamic_particle_heads);
+    cudaFree(solver->dynamic_particle_next);
+    cudaFree(solver->dynamic_particle_index);
+    cudaFree(solver->dynamic_particle_count_buffer);
+    solver->dynamic_particles = nullptr;
+    solver->dynamic_particle_heads = nullptr;
+    solver->dynamic_particle_next = nullptr;
+    solver->dynamic_particle_index = nullptr;
+    solver->dynamic_particle_count_buffer = nullptr;
+
+    solver->dynamic_particle_capacity = particle_count;
+    solver->dynamic_particle_count = particle_count;
+    solver->dynamic_particle_hash_table_size = next_power_of_two(std::max(1024, particle_count * 2));
+
+    cudaError_t err = cudaMalloc(reinterpret_cast<void**>(&solver->dynamic_particles), sizeof(DynamicParticle) * particle_count);
+    if (!set_cuda_error(err, "dynamic particle allocation")) {
+        return false;
+    }
+    err = cudaMalloc(reinterpret_cast<void**>(&solver->dynamic_particle_heads), sizeof(int) * solver->dynamic_particle_hash_table_size);
+    if (!set_cuda_error(err, "dynamic particle hash allocation")) {
+        return false;
+    }
+    err = cudaMalloc(reinterpret_cast<void**>(&solver->dynamic_particle_next), sizeof(int) * particle_count);
+    if (!set_cuda_error(err, "dynamic particle link allocation")) {
+        return false;
+    }
+    err = cudaMalloc(reinterpret_cast<void**>(&solver->dynamic_particle_index), sizeof(int) * particle_count);
+    if (!set_cuda_error(err, "dynamic particle entry allocation")) {
+        return false;
+    }
+    err = cudaMalloc(reinterpret_cast<void**>(&solver->dynamic_particle_count_buffer), sizeof(int));
+    return set_cuda_error(err, "dynamic particle counter allocation");
+}
+
+bool rebuild_dynamic_particle_hash(Solver* solver) {
+    if (!solver || solver->dynamic_particle_count <= 0) {
+        return true;
+    }
+    if (!solver->dynamic_particle_heads
+        || !solver->dynamic_particle_next
+        || !solver->dynamic_particle_index
+        || !solver->dynamic_particle_count_buffer) {
+        return set_error("dynamic particle hash is not allocated");
+    }
+    const auto hash_start = std::chrono::high_resolution_clock::now();
+    cudaMemset(solver->dynamic_particle_heads, 0xff, sizeof(int) * solver->dynamic_particle_hash_table_size);
+    cudaMemset(solver->dynamic_particle_count_buffer, 0, sizeof(int));
+    build_dynamic_particle_hash_kernel<<<block_count(solver->dynamic_particle_count), 256>>>(*solver);
+    if (!set_cuda_error(cudaDeviceSynchronize(), "rebuild dynamic particle hash")) {
+        return false;
+    }
+    solver->pending_hash_build_ms += elapsed_ms_since(hash_start);
+    return true;
+}
+
 bool clear_external_contact_cache(Solver* solver, const char* label) {
     if (!solver || !solver->external_contacts || solver->external_contact_capacity <= 0) {
         return true;
@@ -4271,6 +5132,9 @@ bool fetch_diagnostics_buffers(
     host_diag->external_contact_cache_overflow = static_cast<long long>(counts[kDiagExternalContactCacheOverflow]);
     host_diag->external_friction_corrections = static_cast<long long>(counts[kDiagExternalFrictionCorrections]);
     host_diag->external_contact_cache_count = static_cast<long long>(counts[kDiagExternalContactCacheCount]);
+    host_diag->dynamic_particle_candidate_count = static_cast<long long>(counts[kDiagDynamicParticleCandidates]);
+    host_diag->dynamic_particle_contacts = static_cast<long long>(counts[kDiagDynamicParticleContacts]);
+    host_diag->dynamic_particle_overflow = static_cast<long long>(counts[kDiagDynamicParticleOverflow]);
     host_diag->min_gap = min_gap;
     return true;
 }
@@ -4322,6 +5186,7 @@ bool fetch_step_diagnostics(Solver* solver) {
     }
     solver->diag.force_field_count = static_cast<long long>(solver->force_field_count);
     solver->diag.unsupported_force_field_count = static_cast<long long>(solver->unsupported_force_field_count);
+    solver->diag.dynamic_particle_count = static_cast<long long>(solver->dynamic_particle_count);
     solver->diag.dynamic_triangle_count = static_cast<long long>(solver->dynamic_triangle_count);
     solver->diag.static_triangle_count = static_cast<long long>(solver->cfg.static_triangle_count);
     return true;
@@ -4837,6 +5702,7 @@ bool run_self_collision_pass(
     }
     const int vertex_source_count = host_self_vertex_source_count(&collision_solver, collision_solver.self_source_mode);
     const int vertex_source_blocks = block_count(std::max(vertex_source_count, 1));
+    const int edge_blocks = block_count(std::max(solver->cfg.edge_count, 1));
     const int sample_source_count = host_self_sample_source_count(
         &collision_solver,
         collision_solver.self_source_mode,
@@ -4850,6 +5716,10 @@ bool run_self_collision_pass(
     }
     cudaMemset(solver->self_vert_heads, 0xff, sizeof(int) * solver->self_vert_hash_table_size);
     build_self_vertex_hash_kernel<<<v_blocks, 256>>>(collision_solver);
+    if (solver->self_edge_heads && solver->self_edge_next && solver->cfg.edge_count > 0) {
+        cudaMemset(solver->self_edge_heads, 0xff, sizeof(int) * solver->self_edge_hash_table_size);
+        build_self_edge_hash_kernel<<<edge_blocks, 256>>>(collision_solver);
+    }
     if (!end_timed_segment(timings, &hash_segment, "end self hash timing")) {
         return false;
     }
@@ -4860,6 +5730,9 @@ bool run_self_collision_pass(
         return false;
     }
     self_particle_collision_kernel<<<vertex_source_blocks, 256>>>(collision_solver);
+    if (solver->self_edge_heads && solver->self_edge_next && solver->cfg.edge_count > 0) {
+        self_edge_edge_collision_kernel<<<edge_blocks, 256>>>(collision_solver);
+    }
     if (!end_timed_segment(timings, &solve_segment, "end self solve timing")) {
         return false;
     }
@@ -4935,6 +5808,15 @@ bool run_self_collision_pass(
             }
             self_surface_sample_collision_kernel<<<sample_source_blocks, 256>>>(collision_solver);
             if (!end_timed_segment(timings, &solve_segment, "end self surface-pair timing")) {
+                return false;
+            }
+        }
+        if (recovery_mode && solver->cfg.edge_count > 0) {
+            if (!begin_timed_segment(timings, solve_slot, &solve_segment, "start self edge-surface timing")) {
+                return false;
+            }
+            self_edge_surface_collision_kernel<<<edge_blocks, 256>>>(collision_solver);
+            if (!end_timed_segment(timings, &solve_segment, "end self edge-surface timing")) {
                 return false;
             }
         }
@@ -5043,12 +5925,12 @@ bool probe_self_collision(
 }
 
 bool self_probe_triggers_recovery(const SsblXpbdDiagnostics& diag, float cloth_thickness) {
-    const float trigger_gap = -0.85f * cloth_thickness;
+    const float trigger_gap = -0.05f * cloth_thickness;
     return valid_min_gap(diag.min_gap) && diag.min_gap < trigger_gap;
 }
 
 bool self_probe_triggers_retry(const SsblXpbdDiagnostics& diag, float cloth_thickness) {
-    const float retry_gap = -1.25f * cloth_thickness;
+    const float retry_gap = -0.50f * cloth_thickness;
     return valid_min_gap(diag.min_gap) && diag.min_gap < retry_gap;
 }
 
@@ -5205,6 +6087,15 @@ bool run_substep(
                 }
             }
             if (!end_timed_segment(timings, &segment, "end static collision timing")) {
+                return false;
+            }
+        }
+        if (solver->dynamic_particle_count > 0) {
+            if (!begin_timed_segment(timings, kTimingDynamicParticleCollision, &segment, "start dynamic particle collision timing")) {
+                return false;
+            }
+            dynamic_particle_collision_kernel<<<v_blocks, 256>>>(*solver);
+            if (!end_timed_segment(timings, &segment, "end dynamic particle collision timing")) {
                 return false;
             }
         }
@@ -5444,10 +6335,17 @@ void free_solver(Solver* solver) {
     cudaFree(solver->dynamic_tri_entry_next);
     cudaFree(solver->dynamic_tri_entry_index);
     cudaFree(solver->dynamic_tri_entry_count);
+    cudaFree(solver->dynamic_particles);
+    cudaFree(solver->dynamic_particle_heads);
+    cudaFree(solver->dynamic_particle_next);
+    cudaFree(solver->dynamic_particle_index);
+    cudaFree(solver->dynamic_particle_count_buffer);
     cudaFree(solver->external_contacts);
     cudaFree(solver->force_fields);
     cudaFree(solver->self_vert_heads);
     cudaFree(solver->self_vert_next);
+    cudaFree(solver->self_edge_heads);
+    cudaFree(solver->self_edge_next);
     cudaFree(solver->self_sample_heads);
     cudaFree(solver->self_sample_next);
     cudaFree(solver->self_sample_hash_dirty);
@@ -5641,6 +6539,59 @@ bool update_dynamic_triangles_internal(Solver* solver, const float* triangles, i
         return false;
     }
     return rebuild_dynamic_triangle_hash(solver);
+}
+
+bool update_dynamic_particles_internal(
+    Solver* solver,
+    const float* positions,
+    const float* radii,
+    const float* inv_mass,
+    const int* slot_ids,
+    const int* phases,
+    int particle_count
+) {
+    if (!solver) {
+        return set_error("invalid dynamic particle update");
+    }
+    if (particle_count <= 0) {
+        solver->dynamic_particle_count = 0;
+        solver->dynamic_particle_max_radius = 0.0f;
+        return true;
+    }
+    if (!positions || !radii || !inv_mass || !slot_ids || !phases) {
+        return set_error("missing dynamic particle data");
+    }
+    if (!allocate_dynamic_particle_collision(solver, particle_count)) {
+        return false;
+    }
+
+    std::vector<DynamicParticle> particles(static_cast<size_t>(particle_count));
+    float max_radius = 0.0f;
+    for (int i = 0; i < particle_count; ++i) {
+        DynamicParticle& particle = particles[static_cast<size_t>(i)];
+        particle.position = {
+            positions[i * 3 + 0],
+            positions[i * 3 + 1],
+            positions[i * 3 + 2],
+        };
+        particle.radius = std::isfinite(radii[i]) ? std::max(radii[i], 0.0f) : 0.0f;
+        particle.inv_mass = std::isfinite(inv_mass[i]) ? std::max(inv_mass[i], 0.0f) : 0.0f;
+        particle.slot_id = slot_ids[i];
+        particle.phase = phases[i];
+        max_radius = std::max(max_radius, particle.radius);
+    }
+    solver->dynamic_particle_count = particle_count;
+    solver->dynamic_particle_max_radius = max_radius;
+    if (!set_cuda_error(
+            cudaMemcpy(
+                solver->dynamic_particles,
+                particles.data(),
+                sizeof(DynamicParticle) * static_cast<size_t>(particle_count),
+                cudaMemcpyHostToDevice),
+            "upload dynamic particles")) {
+        return false;
+    }
+    return rebuild_dynamic_particle_hash(solver);
 }
 
 bool update_force_fields_internal(
@@ -5904,6 +6855,13 @@ extern "C" SSBL_API void* ssbl_create_solver(const SsblXpbdConfig* config, const
         ok = ok && set_cuda_error(err, "self vertex hash allocation");
         err = cudaMalloc(reinterpret_cast<void**>(&solver->self_vert_next), sizeof(int) * config->vertex_count);
         ok = ok && set_cuda_error(err, "self vertex link allocation");
+        if (ok && config->edge_count > 0) {
+            solver->self_edge_hash_table_size = next_power_of_two(std::max(1024, config->edge_count * 2));
+            err = cudaMalloc(reinterpret_cast<void**>(&solver->self_edge_heads), sizeof(int) * solver->self_edge_hash_table_size);
+            ok = ok && set_cuda_error(err, "self edge hash allocation");
+            err = cudaMalloc(reinterpret_cast<void**>(&solver->self_edge_next), sizeof(int) * config->edge_count);
+            ok = ok && set_cuda_error(err, "self edge link allocation");
+        }
         err = cudaMalloc(reinterpret_cast<void**>(&solver->self_recovery_touched), sizeof(int) * config->vertex_count);
         ok = ok && set_cuda_error(err, "self recovery touched allocation");
         ok = ok && set_cuda_error(
@@ -6109,6 +7067,17 @@ extern "C" SSBL_API int ssbl_update_frame_inputs(void* handle, const SsblXpbdFra
     }
     if (inputs->update_dynamic_triangles
         && !update_dynamic_triangles_internal(solver, inputs->dynamic_triangles, inputs->dynamic_triangle_count)) {
+        return 0;
+    }
+    if (inputs->update_dynamic_particles
+        && !update_dynamic_particles_internal(
+            solver,
+            inputs->dynamic_particle_positions,
+            inputs->dynamic_particle_radii,
+            inputs->dynamic_particle_inv_mass,
+            inputs->dynamic_particle_slot_ids,
+            inputs->dynamic_particle_phases,
+            inputs->dynamic_particle_count)) {
         return 0;
     }
     if (inputs->update_force_fields

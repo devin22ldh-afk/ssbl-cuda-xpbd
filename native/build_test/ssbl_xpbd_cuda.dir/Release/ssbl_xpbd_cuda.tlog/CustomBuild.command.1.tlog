@@ -1,0 +1,10 @@
+^C:\USERS\ADMINISTRATOR\APPDATA\ROAMING\BLENDER FOUNDATION\BLENDER\5.0\SCRIPTS\ADDONS\SSBL\NATIVE\CMAKELISTS.TXT
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" "-SC:/Users/Administrator/AppData/Roaming/Blender Foundation/Blender/5.0/scripts/addons/ssbl/native" "-BC:/Users/Administrator/AppData/Roaming/Blender Foundation/Blender/5.0/scripts/addons/ssbl/native/build_test" --check-stamp-file "C:/Users/Administrator/AppData/Roaming/Blender Foundation/Blender/5.0/scripts/addons/ssbl/native/build_test/CMakeFiles/generate.stamp"
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

@@ -200,6 +200,7 @@ def record_viewport_tag_ms(object_name: str, elapsed_ms: float) -> None:
         analytic_collision_ms=diag.analytic_collision_ms,
         static_collision_ms=diag.static_collision_ms,
         dynamic_collision_ms=diag.dynamic_collision_ms,
+        dynamic_particle_collision_ms=diag.dynamic_particle_collision_ms,
         self_hash_ms=diag.self_hash_ms,
         self_solve_ms=diag.self_solve_ms,
         self_probe_ms=diag.self_probe_ms,
@@ -236,6 +237,10 @@ def record_viewport_tag_ms(object_name: str, elapsed_ms: float) -> None:
         external_friction_corrections=diag.external_friction_corrections,
         force_field_count=diag.force_field_count,
         unsupported_force_field_count=diag.unsupported_force_field_count,
+        dynamic_particle_count=diag.dynamic_particle_count,
+        dynamic_particle_candidate_count=diag.dynamic_particle_candidate_count,
+        dynamic_particle_contacts=diag.dynamic_particle_contacts,
+        dynamic_particle_overflow=diag.dynamic_particle_overflow,
         dynamic_triangle_count=diag.dynamic_triangle_count,
         static_triangle_count=diag.static_triangle_count,
         finite=diag.finite,
@@ -1483,6 +1488,7 @@ def _step_session_slots(session: SceneSession, download_positions, perf: FramePe
         if cross_cloth_enabled:
             started = time.perf_counter()
             dynamic_triangles = _collect_cross_cloth_triangles(session, slot)
+            dynamic_particles = _collect_cross_cloth_particles(session, slot)
             slot.native.update_frame_inputs(
                 pin_indices=None,
                 pin_positions=None,
@@ -1493,6 +1499,8 @@ def _step_session_slots(session: SceneSession, download_positions, perf: FramePe
                 update_static=False,
                 dynamic_triangles=dynamic_triangles,
                 update_dynamic=True,
+                dynamic_particles=dynamic_particles,
+                update_dynamic_particles=True,
                 force_fields=None,
                 update_force_fields=False,
             )
@@ -1525,7 +1533,7 @@ def _collect_cross_cloth_triangles(session: SceneSession, target: ClothSlot) -> 
     target_aabb = _swept_positions_aabb(target)
     all_tris: list[np.ndarray] = []
     for source in session.slots.values():
-        if source.object_name == target.object_name:
+        if not _cross_cloth_source_enabled(mode, target, source):
             continue
         positions = source.current_positions_world
         if positions is None or len(source.cloth.triangles) == 0:
@@ -1545,6 +1553,86 @@ def _collect_cross_cloth_triangles(session: SceneSession, target: ClothSlot) -> 
     if not all_tris:
         return np.empty((0, 3, 3), dtype=np.float32)
     return np.ascontiguousarray(np.concatenate(all_tris, axis=0), dtype=np.float32)
+
+
+def _collect_cross_cloth_particles(session: SceneSession, target: ClothSlot) -> dict[str, np.ndarray]:
+    empty = {
+        "positions": np.empty((0, 3), dtype=np.float32),
+        "radii": np.empty(0, dtype=np.float32),
+        "inv_mass": np.empty(0, dtype=np.float32),
+        "slot_ids": np.empty(0, dtype=np.int32),
+        "phases": np.empty(0, dtype=np.int32),
+    }
+    mode = str(session.cross_cloth_mode or "off").lower()
+    if mode == "off":
+        return empty
+    target_aabb = _swept_positions_aabb(target)
+    positions_list: list[np.ndarray] = []
+    radii_list: list[np.ndarray] = []
+    inv_mass_list: list[np.ndarray] = []
+    slot_id_list: list[np.ndarray] = []
+    phase_list: list[np.ndarray] = []
+    slot_ids = {name: index + 1 for index, name in enumerate(session.solve_order)}
+    for source in session.slots.values():
+        if not _cross_cloth_source_enabled(mode, target, source):
+            continue
+        positions = source.current_positions_world
+        if positions is None or len(positions) == 0:
+            continue
+        source_aabb = _swept_positions_aabb(source)
+        if target_aabb is not None and source_aabb is not None:
+            contact_radius = max(float(target.external_contact_distance), float(source.external_contact_distance))
+            motion_padding = max(
+                contact_radius * 4.0,
+                _slot_max_motion(target) * 2.0,
+                _slot_max_motion(source) * 2.0,
+                0.08,
+            )
+            if _aabb_distance(target_aabb, source_aabb) > contact_radius + motion_padding:
+                continue
+        source_positions = np.asarray(positions, dtype=np.float32)
+        count = int(len(source_positions))
+        if count <= 0:
+            continue
+        positions_list.append(source_positions)
+        radii_list.append(np.full(count, float(source.external_contact_distance), dtype=np.float32))
+        source_inv_mass = np.asarray(source.cloth.inv_mass, dtype=np.float32).reshape((-1,))
+        if len(source_inv_mass) == count:
+            inv_mass_list.append(source_inv_mass)
+        else:
+            inv_mass_list.append(np.ones(count, dtype=np.float32))
+        slot_id = int(slot_ids.get(source.object_name, 0))
+        slot_id_list.append(np.full(count, slot_id, dtype=np.int32))
+        phase_list.append(np.full(count, int(source.collision_layer), dtype=np.int32))
+    if not positions_list:
+        return empty
+    return {
+        "positions": np.ascontiguousarray(np.concatenate(positions_list, axis=0), dtype=np.float32),
+        "radii": np.ascontiguousarray(np.concatenate(radii_list, axis=0), dtype=np.float32),
+        "inv_mass": np.ascontiguousarray(np.concatenate(inv_mass_list, axis=0), dtype=np.float32),
+        "slot_ids": np.ascontiguousarray(np.concatenate(slot_id_list, axis=0), dtype=np.int32),
+        "phases": np.ascontiguousarray(np.concatenate(phase_list, axis=0), dtype=np.int32),
+    }
+
+
+def _cross_cloth_source_enabled(mode: str, target: ClothSlot, source: ClothSlot) -> bool:
+    if source.object_name == target.object_name:
+        return False
+    source_obj = bpy.data.objects.get(source.object_name)
+    if source_obj is not None and not bool(
+        getattr(
+            source_obj,
+            "ssbl_enable_cross_cloth_collision",
+            source_obj.get("ssbl_enable_cross_cloth_collision", True),
+        )
+    ):
+        return False
+    normalized = str(mode or "off").lower()
+    if normalized == "off":
+        return False
+    if normalized == "lower_layers":
+        return int(source.collision_layer) < int(target.collision_layer)
+    return True
 
 
 def _swept_positions_aabb(slot: ClothSlot) -> tuple[np.ndarray, np.ndarray] | None:
@@ -1961,6 +2049,7 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
     analytic_collision_ms = 0.0
     static_collision_ms = 0.0
     dynamic_collision_ms = 0.0
+    dynamic_particle_collision_ms = 0.0
     self_hash_ms = 0.0
     self_solve_ms = 0.0
     self_probe_ms = 0.0
@@ -1998,6 +2087,10 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
     external_friction_corrections = 0
     force_field_count = 0
     unsupported_force_field_count = 0
+    dynamic_particle_count = 0
+    dynamic_particle_candidate_count = 0
+    dynamic_particle_contacts = 0
+    dynamic_particle_overflow = 0
     dynamic_triangle_count = 0
     static_triangle_count = 0
     finite = True
@@ -2012,6 +2105,7 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
         analytic_collision_ms += float(diag.analytic_collision_ms)
         static_collision_ms += float(diag.static_collision_ms)
         dynamic_collision_ms += float(diag.dynamic_collision_ms)
+        dynamic_particle_collision_ms += float(diag.dynamic_particle_collision_ms)
         self_hash_ms += float(diag.self_hash_ms)
         self_solve_ms += float(diag.self_solve_ms)
         self_probe_ms += float(diag.self_probe_ms)
@@ -2048,6 +2142,10 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
         external_friction_corrections += int(diag.external_friction_corrections)
         force_field_count += int(diag.force_field_count)
         unsupported_force_field_count += int(diag.unsupported_force_field_count)
+        dynamic_particle_count += int(diag.dynamic_particle_count)
+        dynamic_particle_candidate_count += int(diag.dynamic_particle_candidate_count)
+        dynamic_particle_contacts += int(diag.dynamic_particle_contacts)
+        dynamic_particle_overflow += int(diag.dynamic_particle_overflow)
         dynamic_triangle_count += int(diag.dynamic_triangle_count)
         static_triangle_count += int(diag.static_triangle_count)
         finite = finite and bool(diag.finite)
@@ -2064,6 +2162,7 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
         analytic_collision_ms=analytic_collision_ms,
         static_collision_ms=static_collision_ms,
         dynamic_collision_ms=dynamic_collision_ms,
+        dynamic_particle_collision_ms=dynamic_particle_collision_ms,
         self_hash_ms=self_hash_ms,
         self_solve_ms=self_solve_ms,
         self_probe_ms=self_probe_ms,
@@ -2101,6 +2200,10 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
         external_friction_corrections=external_friction_corrections,
         force_field_count=force_field_count,
         unsupported_force_field_count=unsupported_force_field_count,
+        dynamic_particle_count=dynamic_particle_count,
+        dynamic_particle_candidate_count=dynamic_particle_candidate_count,
+        dynamic_particle_contacts=dynamic_particle_contacts,
+        dynamic_particle_overflow=dynamic_particle_overflow,
         dynamic_triangle_count=dynamic_triangle_count,
         static_triangle_count=static_triangle_count,
         finite=finite,

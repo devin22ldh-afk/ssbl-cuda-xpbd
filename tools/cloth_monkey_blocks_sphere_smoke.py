@@ -176,6 +176,9 @@ def main() -> None:
         rows: list[dict[str, object]] = []
         finite = True
         max_dynamic_triangles = 0
+        max_dynamic_particles = 0
+        max_dynamic_particle_contacts = 0
+        max_dynamic_particle_overflow = 0
         max_resolved_contacts = 0
         full_overlap_frames = 0
         min_center_above_support = float("inf")
@@ -188,6 +191,9 @@ def main() -> None:
             monkey_box = _positions_aabb(monkey_positions)
             finite = finite and _all_finite(sphere_positions) and _all_finite(monkey_positions) and bool(diag.finite)
             max_dynamic_triangles = max(max_dynamic_triangles, int(diag.dynamic_triangle_count))
+            max_dynamic_particles = max(max_dynamic_particles, int(diag.dynamic_particle_count))
+            max_dynamic_particle_contacts = max(max_dynamic_particle_contacts, int(diag.dynamic_particle_contacts))
+            max_dynamic_particle_overflow = max(max_dynamic_particle_overflow, int(diag.dynamic_particle_overflow))
             max_resolved_contacts = max(max_resolved_contacts, int(diag.resolved_contacts))
 
             center_above_support = float(sphere_box["center_z"] - initial_monkey_top)
@@ -208,6 +214,9 @@ def main() -> None:
                         "center_above_initial_monkey_top": center_above_support,
                         "sphere_fully_below_initial_monkey_top": sphere_fully_below_initial_top,
                         "dynamic_triangle_count": int(diag.dynamic_triangle_count),
+                        "dynamic_particle_count": int(diag.dynamic_particle_count),
+                        "dynamic_particle_contacts": int(diag.dynamic_particle_contacts),
+                        "dynamic_particle_overflow": int(diag.dynamic_particle_overflow),
                         "resolved_contacts": int(diag.resolved_contacts),
                         "penetration_depth_diag": float(diag.penetration_depth),
                     }
@@ -225,6 +234,9 @@ def main() -> None:
             "min_center_above_support": min_center_above_support,
             "full_overlap_frames": full_overlap_frames,
             "max_dynamic_triangle_count": max_dynamic_triangles,
+            "max_dynamic_particle_count": max_dynamic_particles,
+            "max_dynamic_particle_contacts": max_dynamic_particle_contacts,
+            "max_dynamic_particle_overflow": max_dynamic_particle_overflow,
             "max_resolved_contacts": max_resolved_contacts,
             "finite": bool(finite),
             "stopped": bool(stopped),
@@ -243,6 +255,9 @@ def main() -> None:
             and result["cross_mode"] == "all_selected"
             and result["finite"]
             and result["max_dynamic_triangle_count"] > 0
+            and result["max_dynamic_particle_count"] > 0
+            and result["max_dynamic_particle_contacts"] > 0
+            and result["max_dynamic_particle_overflow"] == 0
             and result["max_resolved_contacts"] > 0
             and result["full_overlap_frames"] <= MAX_FULL_OVERLAP_FRAMES
             and min_center_above_support >= MIN_CENTER_ABOVE_SUPPORT

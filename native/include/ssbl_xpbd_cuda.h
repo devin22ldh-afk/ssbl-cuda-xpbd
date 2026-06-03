@@ -69,6 +69,7 @@ typedef struct SsblXpbdDiagnostics {
     float analytic_collision_ms;
     float static_collision_ms;
     float dynamic_collision_ms;
+    float dynamic_particle_collision_ms;
     float self_hash_ms;
     float self_solve_ms;
     float self_probe_ms;
@@ -105,6 +106,10 @@ typedef struct SsblXpbdDiagnostics {
     long long external_friction_corrections;
     long long force_field_count;
     long long unsupported_force_field_count;
+    long long dynamic_particle_count;
+    long long dynamic_particle_candidate_count;
+    long long dynamic_particle_contacts;
+    long long dynamic_particle_overflow;
     long long dynamic_triangle_count;
     long long static_triangle_count;
     int finite_flag;
@@ -178,6 +183,13 @@ typedef struct SsblXpbdFrameInputs {
     int update_dynamic_triangles;
     const float* dynamic_triangles;
     int dynamic_triangle_count;
+    int update_dynamic_particles;
+    const float* dynamic_particle_positions;
+    const float* dynamic_particle_radii;
+    const float* dynamic_particle_inv_mass;
+    const int* dynamic_particle_slot_ids;
+    const int* dynamic_particle_phases;
+    int dynamic_particle_count;
     int update_force_fields;
     const SsblXpbdForceField* force_fields;
     int force_field_count;

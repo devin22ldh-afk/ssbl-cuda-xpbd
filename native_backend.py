@@ -145,6 +145,13 @@ class _NativeFrameInputs(ctypes.Structure):
         ("update_dynamic_triangles", ctypes.c_int),
         ("dynamic_triangles", ctypes.POINTER(ctypes.c_float)),
         ("dynamic_triangle_count", ctypes.c_int),
+        ("update_dynamic_particles", ctypes.c_int),
+        ("dynamic_particle_positions", ctypes.POINTER(ctypes.c_float)),
+        ("dynamic_particle_radii", ctypes.POINTER(ctypes.c_float)),
+        ("dynamic_particle_inv_mass", ctypes.POINTER(ctypes.c_float)),
+        ("dynamic_particle_slot_ids", ctypes.POINTER(ctypes.c_int)),
+        ("dynamic_particle_phases", ctypes.POINTER(ctypes.c_int)),
+        ("dynamic_particle_count", ctypes.c_int),
         ("update_force_fields", ctypes.c_int),
         ("force_fields", ctypes.POINTER(_NativeForceField)),
         ("force_field_count", ctypes.c_int),
@@ -161,6 +168,7 @@ class _NativeDiagnostics(ctypes.Structure):
         ("analytic_collision_ms", ctypes.c_float),
         ("static_collision_ms", ctypes.c_float),
         ("dynamic_collision_ms", ctypes.c_float),
+        ("dynamic_particle_collision_ms", ctypes.c_float),
         ("self_hash_ms", ctypes.c_float),
         ("self_solve_ms", ctypes.c_float),
         ("self_probe_ms", ctypes.c_float),
@@ -197,6 +205,10 @@ class _NativeDiagnostics(ctypes.Structure):
         ("external_friction_corrections", ctypes.c_longlong),
         ("force_field_count", ctypes.c_longlong),
         ("unsupported_force_field_count", ctypes.c_longlong),
+        ("dynamic_particle_count", ctypes.c_longlong),
+        ("dynamic_particle_candidate_count", ctypes.c_longlong),
+        ("dynamic_particle_contacts", ctypes.c_longlong),
+        ("dynamic_particle_overflow", ctypes.c_longlong),
         ("dynamic_triangle_count", ctypes.c_longlong),
         ("static_triangle_count", ctypes.c_longlong),
         ("finite_flag", ctypes.c_int),
@@ -219,6 +231,7 @@ class NativeStepDiagnostics:
     analytic_collision_ms: float = 0.0
     static_collision_ms: float = 0.0
     dynamic_collision_ms: float = 0.0
+    dynamic_particle_collision_ms: float = 0.0
     self_hash_ms: float = 0.0
     self_solve_ms: float = 0.0
     self_probe_ms: float = 0.0
@@ -255,6 +268,10 @@ class NativeStepDiagnostics:
     external_friction_corrections: int = 0
     force_field_count: int = 0
     unsupported_force_field_count: int = 0
+    dynamic_particle_count: int = 0
+    dynamic_particle_candidate_count: int = 0
+    dynamic_particle_contacts: int = 0
+    dynamic_particle_overflow: int = 0
     dynamic_triangle_count: int = 0
     static_triangle_count: int = 0
     finite: bool = True
@@ -292,7 +309,7 @@ def dll_path() -> str:
     if override:
         return override
     root = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(root, "native", "bin", "ssbl_xpbd_cuda_abi35.dll")
+    return os.path.join(root, "native", "bin", "ssbl_xpbd_cuda_abi36.dll")
 
 
 def status() -> NativeStatus:
@@ -613,6 +630,8 @@ class NativeXpbdSolver:
         update_static: bool,
         dynamic_triangles: np.ndarray | None,
         update_dynamic: bool,
+        dynamic_particles: dict[str, np.ndarray] | None = None,
+        update_dynamic_particles: bool = False,
         force_fields=None,
         update_force_fields: bool = False,
     ) -> None:
@@ -648,6 +667,39 @@ class NativeXpbdSolver:
             dynamic_triangles.reshape((-1, 3)) if dynamic_triangles is not None else np.empty((0, 3), dtype=np.float32),
             dtype=np.float32,
         )
+        particle_positions = np.ascontiguousarray(
+            (dynamic_particles or {}).get("positions", np.empty((0, 3), dtype=np.float32)).reshape((-1, 3)),
+            dtype=np.float32,
+        )
+        dynamic_particle_count = int(len(particle_positions))
+        particle_radii = np.ascontiguousarray(
+            (dynamic_particles or {}).get("radii", np.empty(0, dtype=np.float32)),
+            dtype=np.float32,
+        ).reshape((-1,))
+        particle_inv_mass = np.ascontiguousarray(
+            (dynamic_particles or {}).get("inv_mass", np.empty(0, dtype=np.float32)),
+            dtype=np.float32,
+        ).reshape((-1,))
+        particle_slot_ids = np.ascontiguousarray(
+            (dynamic_particles or {}).get("slot_ids", np.empty(0, dtype=np.int32)),
+            dtype=np.int32,
+        ).reshape((-1,))
+        particle_phases = np.ascontiguousarray(
+            (dynamic_particles or {}).get("phases", np.empty(0, dtype=np.int32)),
+            dtype=np.int32,
+        ).reshape((-1,))
+        if dynamic_particle_count <= 0:
+            particle_radii = np.empty(0, dtype=np.float32)
+            particle_inv_mass = np.empty(0, dtype=np.float32)
+            particle_slot_ids = np.empty(0, dtype=np.int32)
+            particle_phases = np.empty(0, dtype=np.int32)
+        elif not (
+            len(particle_radii) == dynamic_particle_count
+            and len(particle_inv_mass) == dynamic_particle_count
+            and len(particle_slot_ids) == dynamic_particle_count
+            and len(particle_phases) == dynamic_particle_count
+        ):
+            raise NativeSolverError("Dynamic particle arrays must have matching lengths.")
         force_field_arr = _force_field_array(force_fields)
         force_field_count = int(len(force_field_arr))
         unsupported_force_field_count = int(getattr(force_fields, "unsupported_count", 0) if force_fields is not None else 0)
@@ -665,6 +717,13 @@ class NativeXpbdSolver:
             update_dynamic_triangles=int(update_dynamic),
             dynamic_triangles=_as_float_ptr(dynamic_arr),
             dynamic_triangle_count=dynamic_triangle_count,
+            update_dynamic_particles=int(update_dynamic_particles),
+            dynamic_particle_positions=_as_float_ptr(particle_positions),
+            dynamic_particle_radii=_as_float_ptr(particle_radii),
+            dynamic_particle_inv_mass=_as_float_ptr(particle_inv_mass),
+            dynamic_particle_slot_ids=_as_int_ptr(particle_slot_ids),
+            dynamic_particle_phases=_as_int_ptr(particle_phases),
+            dynamic_particle_count=dynamic_particle_count,
             update_force_fields=int(update_force_fields),
             force_fields=_as_force_field_ptr(force_field_arr),
             force_field_count=force_field_count,
@@ -723,6 +782,7 @@ class NativeXpbdSolver:
             analytic_collision_ms=float(raw.analytic_collision_ms),
             static_collision_ms=float(raw.static_collision_ms),
             dynamic_collision_ms=float(raw.dynamic_collision_ms),
+            dynamic_particle_collision_ms=float(raw.dynamic_particle_collision_ms),
             self_hash_ms=float(raw.self_hash_ms),
             self_solve_ms=float(raw.self_solve_ms),
             self_probe_ms=float(raw.self_probe_ms),
@@ -759,6 +819,10 @@ class NativeXpbdSolver:
             external_friction_corrections=int(raw.external_friction_corrections),
             force_field_count=int(raw.force_field_count),
             unsupported_force_field_count=int(raw.unsupported_force_field_count),
+            dynamic_particle_count=int(raw.dynamic_particle_count),
+            dynamic_particle_candidate_count=int(raw.dynamic_particle_candidate_count),
+            dynamic_particle_contacts=int(raw.dynamic_particle_contacts),
+            dynamic_particle_overflow=int(raw.dynamic_particle_overflow),
             dynamic_triangle_count=int(raw.dynamic_triangle_count),
             static_triangle_count=int(raw.static_triangle_count),
             finite=bool(raw.finite_flag),

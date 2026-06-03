@@ -12,7 +12,7 @@ add_library(ssbl_xpbd_cuda SHARED
     src/ssbl_xpbd_cuda.cu
 )
 
-set(SSBL_CUDA_OUTPUT_NAME "ssbl_xpbd_cuda_abi35" CACHE STRING "Native SSBL CUDA DLL output name")
+set(SSBL_CUDA_OUTPUT_NAME "ssbl_xpbd_cuda_abi36" CACHE STRING "Native SSBL CUDA DLL output name")
 set(SSBL_CUDA_OUTPUT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/bin" CACHE PATH "Native SSBL CUDA DLL output directory")
 
 target_include_directories(ssbl_xpbd_cuda

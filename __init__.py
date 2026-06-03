@@ -33,10 +33,11 @@ def _apply_self_collision_mode(settings, _context):
         settings.self_collision = enabled
         return
     if mode != "off":
-        settings.self_collision_interval = 2
-        settings.max_self_collision_neighbors = 16
-        settings.self_probe_interval = 8
-        settings.self_surface_pair_interval = 8
+        settings.self_collision_interval = 1
+        settings.max_self_collision_neighbors = 64
+        settings.self_probe_interval = 1
+        settings.self_surface_pair_interval = 1
+        settings.substeps = max(int(getattr(settings, "substeps", 1)), 20)
         settings.self_sleep_enabled = True
         settings.self_sleep_still_frames = 10
         settings.self_sleep_full_scan_interval = 30
@@ -47,6 +48,21 @@ def _apply_self_collision_mode(settings, _context):
     else:
         settings.self_sleep_enabled = False
         settings.self_pair_compaction_enabled = False
+
+
+def _sync_self_collision_runtime_settings(settings) -> None:
+    mode = str(getattr(settings, "self_collision_mode", "off")).lower()
+    enabled = bool(getattr(settings, "self_collision", False)) or mode != "off"
+    if not enabled:
+        return
+    settings.self_collision = True
+    if mode == "off":
+        settings.self_collision_mode = "fast"
+    settings.self_collision_interval = 1
+    settings.max_self_collision_neighbors = max(int(getattr(settings, "max_self_collision_neighbors", 0)), 64)
+    settings.self_probe_interval = 1
+    settings.self_surface_pair_interval = 1
+    settings.substeps = max(int(getattr(settings, "substeps", 1)), 20)
 
 
 def _apply_self_collision_toggle(settings, _context):
@@ -169,12 +185,14 @@ def _initialize_hardness_for_scenes(_dummy=None):
     for scene in bpy.data.scenes:
         try:
             sync_hardness_settings(scene.ssbl_preview)
+            _sync_self_collision_runtime_settings(scene.ssbl_preview)
         except Exception:
             pass
     if hasattr(bpy.types.Object, "ssbl_cloth"):
         for obj in bpy.data.objects:
             try:
                 sync_hardness_settings(obj.ssbl_cloth)
+                _sync_self_collision_runtime_settings(obj.ssbl_cloth)
             except Exception:
                 pass
     return None
@@ -489,28 +507,28 @@ class SSBL_PreviewSettings(PropertyGroup):
     )
     self_collision_interval: IntProperty(
         name="自碰撞间隔",
-        default=2,
+        default=1,
         min=1,
         soft_max=8,
         description="每 N 个子步运行一次自碰撞；快速模式通常用 2 即可",
     )
     max_self_collision_neighbors: IntProperty(
         name="最大自碰撞邻居数",
-        default=16,
+        default=64,
         min=4,
         soft_max=256,
         description="每个顶点或边在自碰撞中允许处理的最大邻居候选数",
     )
     self_probe_interval: IntProperty(
         name="Self probe interval",
-        default=8,
+        default=1,
         min=1,
         soft_max=8,
         description="Run expensive self-collision probe/recovery every N self-collision passes; 1 preserves the original behavior",
     )
     self_surface_pair_interval: IntProperty(
         name="Surface pair interval",
-        default=8,
+        default=1,
         min=1,
         soft_max=8,
         description="Run sample-sample self-collision every N self-collision passes; 1 preserves the original behavior",
