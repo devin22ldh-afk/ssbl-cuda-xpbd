@@ -26,51 +26,61 @@ from . import operators, solver, ui
 from .xpbd_core import DEFAULT_HARDNESS, sync_hardness_settings
 
 
+def _self_collision_mode_name(settings) -> str:
+    mode = str(getattr(settings, "self_collision_mode", "fast")).lower()
+    return "strict" if mode in {"strict", "quality"} else "fast"
+
+
+def _apply_fast_self_collision_defaults(settings) -> None:
+    settings.self_collision_interval = 2
+    settings.max_self_collision_neighbors = 32
+    settings.self_probe_interval = 4
+    settings.self_surface_pair_interval = 4
+    settings.self_sleep_enabled = True
+    settings.self_sleep_still_frames = 6
+    settings.self_sleep_full_scan_interval = 60
+    settings.self_compaction_enabled = True
+    settings.self_pair_compaction_enabled = True
+    settings.self_sleep_motion_scale = 1.5
+    settings.self_compaction_active_fraction_threshold = 0.90
+
+
+def _apply_strict_self_collision_defaults(settings) -> None:
+    settings.self_collision_interval = 1
+    settings.max_self_collision_neighbors = 64
+    settings.self_probe_interval = 1
+    settings.self_surface_pair_interval = 1
+    settings.self_sleep_enabled = True
+    settings.self_sleep_still_frames = 10
+    settings.self_sleep_full_scan_interval = 30
+    settings.self_compaction_enabled = True
+    settings.self_pair_compaction_enabled = True
+    settings.self_sleep_motion_scale = 1.0
+    settings.self_compaction_active_fraction_threshold = 0.75
+
+
 def _apply_self_collision_mode(settings, _context):
-    mode = settings.self_collision_mode
-    enabled = mode != "off"
-    if bool(getattr(settings, "self_collision", False)) != enabled:
-        settings.self_collision = enabled
+    if not bool(getattr(settings, "self_collision", False)):
         return
-    if mode != "off":
-        settings.self_collision_interval = 1
-        settings.max_self_collision_neighbors = 64
-        settings.self_probe_interval = 1
-        settings.self_surface_pair_interval = 1
-        settings.substeps = max(int(getattr(settings, "substeps", 1)), 20)
-        settings.self_sleep_enabled = True
-        settings.self_sleep_still_frames = 10
-        settings.self_sleep_full_scan_interval = 30
-        settings.self_compaction_enabled = True
-        settings.self_pair_compaction_enabled = True
-        settings.self_sleep_motion_scale = 1.0
-        settings.self_compaction_active_fraction_threshold = 0.75
+    if _self_collision_mode_name(settings) == "strict":
+        _apply_strict_self_collision_defaults(settings)
     else:
-        settings.self_sleep_enabled = False
-        settings.self_pair_compaction_enabled = False
+        _apply_fast_self_collision_defaults(settings)
 
 
 def _sync_self_collision_runtime_settings(settings) -> None:
-    mode = str(getattr(settings, "self_collision_mode", "off")).lower()
-    enabled = bool(getattr(settings, "self_collision", False)) or mode != "off"
+    enabled = bool(getattr(settings, "self_collision", False))
     if not enabled:
         return
     settings.self_collision = True
-    if mode == "off":
-        settings.self_collision_mode = "fast"
-    settings.self_collision_interval = 1
-    settings.max_self_collision_neighbors = max(int(getattr(settings, "max_self_collision_neighbors", 0)), 64)
-    settings.self_probe_interval = 1
-    settings.self_surface_pair_interval = 1
-    settings.substeps = max(int(getattr(settings, "substeps", 1)), 20)
+    if _self_collision_mode_name(settings) == "strict":
+        _apply_strict_self_collision_defaults(settings)
+    else:
+        _apply_fast_self_collision_defaults(settings)
 
 
 def _apply_self_collision_toggle(settings, _context):
     enabled = bool(getattr(settings, "self_collision", False))
-    target_mode = "fast" if enabled else "off"
-    if str(getattr(settings, "self_collision_mode", "off")) != target_mode:
-        settings.self_collision_mode = target_mode
-        return
     if enabled:
         _apply_self_collision_mode(settings, _context)
     else:
@@ -487,13 +497,12 @@ class SSBL_PreviewSettings(PropertyGroup):
         description="兼容旧选项；启用后会映射到“快速”自碰撞",
     )
     self_collision_mode: EnumProperty(
-        options={"HIDDEN"},
         name="自碰撞模式",
         items=[
-            ("off", "关闭", "关闭布料自碰撞"),
-            ("fast", "快速", "使用受限顶点空间哈希自碰撞"),
+            ("fast", "快速", "使用预览优先的自碰撞快速路径"),
+            ("strict", "严格", "使用完整 probe/recovery 的零相交优先自碰撞路径"),
         ],
-        default="off",
+        default="fast",
         update=_apply_self_collision_mode,
         description="面向大规模布料网格调优的自碰撞模式",
     )

@@ -66,6 +66,8 @@ class SSBL_PT_physics_panel(bpy.types.Panel):
         collision_box.label(text="碰撞")
         collision_box.prop(settings, "collision_margin")
         collision_box.prop(settings, "self_collision")
+        if settings.self_collision:
+            collision_box.prop(settings, "self_collision_mode")
         collision_box.prop(settings, "cloth_thickness")
         collision_box.prop(settings, "use_ground")
         if settings.use_ground:

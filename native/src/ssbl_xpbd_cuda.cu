@@ -19,6 +19,8 @@ constexpr float kEps = 1.0e-8f;
 constexpr float kProjectionRelaxation = 0.35f;
 constexpr float kSelfProjectionRelaxation = 0.40f;
 constexpr float kSelfRecoveryProjectionRelaxation = 0.55f;
+constexpr float kFastSelfProjectionRelaxation = 0.85f;
+constexpr float kFastSelfRecoveryProjectionRelaxation = 0.90f;
 constexpr float kSelfRecoveryVelocityDamping = 0.65f;
 constexpr float kSelfCorrectionMaxDisplacementScale = 0.45f;
 constexpr float kSelfRecoveryMaxDisplacementScale = 0.50f;
@@ -33,11 +35,14 @@ constexpr int kLargeMeshSelfTriangleThreshold = 150000;
 constexpr float kSelfCoarseDistanceMultiplier = 2.5f;
 constexpr float kSelfApproachEps = 1.0e-5f;
 constexpr float kSelfContactDistanceEdgeP10Scale = 0.60f;
+constexpr int kFastSelfCollisionPasses = 2;
 constexpr int kSelfSleepTargetVerticesPerRegion = 512;
 constexpr int kSelfSleepMaxRegions = 1024;
 constexpr int kSelfSourceFull = 0;
 constexpr int kSelfSourceActive = 1;
 constexpr int kSelfSourceSuspect = 2;
+constexpr int kSelfCollisionModeFast = 1;
+constexpr int kSelfCollisionModeStrict = 2;
 constexpr int kSelfCompactionCountSlots = 6;
 constexpr int kSelfCompactionActiveVertices = 0;
 constexpr int kSelfCompactionSuspectVertices = 1;
@@ -50,6 +55,10 @@ constexpr int kSelfVsPairCount = 0;
 constexpr int kSelfVsPairOverflow = 1;
 constexpr int kSelfVsPairCapacityMin = 262144;
 constexpr int kSelfVsPairCapacityMax = 8388608;
+constexpr int kMaxSelfTriangleHashCells = 32;
+constexpr int kMaxSelfVertexTriangleQueryCells = 64;
+constexpr int kMaxSelfVertexTriangleCandidates = 128;
+constexpr int kSelfTriangleEntryCapacityMax = 8388608;
 constexpr int kJitterCountSlots = 2;
 constexpr int kJitterStabilizedCount = 0;
 constexpr int kJitterRejectedCount = 1;
@@ -228,6 +237,12 @@ struct Solver {
     int* self_sample_heads = nullptr;
     int* self_sample_next = nullptr;
     int* self_sample_hash_dirty = nullptr;
+    int* self_tri_heads = nullptr;
+    int* self_tri_entry_next = nullptr;
+    int* self_tri_entry_index = nullptr;
+    int* self_tri_entry_count = nullptr;
+    int self_tri_hash_table_size = 0;
+    int self_tri_entry_capacity = 0;
     int* self_recovery_touched = nullptr;
     Vec3* self_recovery_delta = nullptr;
     int* self_sleep_vertex_regions = nullptr;
@@ -247,6 +262,8 @@ struct Solver {
     long long self_sleep_frame_count = 0;
     int* self_active_vertices = nullptr;
     int* self_suspect_vertices = nullptr;
+    int* self_active_vertex_flags = nullptr;
+    int* self_suspect_vertex_flags = nullptr;
     int* self_active_samples = nullptr;
     int* self_suspect_samples = nullptr;
     int* self_compaction_counts = nullptr;
@@ -269,6 +286,7 @@ struct Solver {
     int self_vs_pair_valid = 0;
     int self_sample_hash_table_size = 0;
     int self_sample_count = 0;
+    int self_sample_hash_valid = 0;
     int self_samples_per_triangle = kSelfSurfaceSamplesPerTriangleDefault;
     int self_recovery_mode = 0;
     long long self_collision_run_count = 0;
@@ -1646,12 +1664,55 @@ __device__ int self_vertex_source_index(Solver solver, int ordinal) {
     return ordinal;
 }
 
+__device__ bool self_source_vertex_flag(Solver solver, int vertex) {
+    if (vertex < 0 || vertex >= solver.cfg.vertex_count) {
+        return false;
+    }
+    if (!solver.cfg.self_compaction_enabled || !solver.self_compaction_used) {
+        return true;
+    }
+    if (solver.self_source_mode == kSelfSourceActive && solver.self_active_vertex_flags) {
+        return solver.self_active_vertex_flags[vertex] != 0;
+    }
+    if (solver.self_source_mode == kSelfSourceSuspect && solver.self_suspect_vertex_flags) {
+        return solver.self_suspect_vertex_flags[vertex] != 0;
+    }
+    return true;
+}
+
+__device__ bool self_source_edge_flag(Solver solver, Int2 edge) {
+    return self_source_vertex_flag(solver, edge.x) || self_source_vertex_flag(solver, edge.y);
+}
+
 __device__ int self_sample_source_index(Solver solver, int ordinal) {
     if (self_compaction_uses_sample_list(solver) && solver.self_source_mode == kSelfSourceActive && solver.self_active_samples) {
         return solver.self_active_samples[ordinal];
     }
     if (self_compaction_uses_sample_list(solver) && solver.self_source_mode == kSelfSourceSuspect && solver.self_suspect_samples) {
         return solver.self_suspect_samples[ordinal];
+    }
+    return ordinal;
+}
+
+__device__ int self_triangle_hash_source_count(Solver solver) {
+    if (self_compaction_uses_sample_list(solver)) {
+        return self_sample_source_count(solver);
+    }
+    return solver.cfg.triangle_count;
+}
+
+__device__ int self_triangle_hash_source_index(Solver solver, int ordinal) {
+    if (self_compaction_uses_sample_list(solver)) {
+        int sample = self_sample_source_index(solver, ordinal);
+        if (sample < 0 || sample >= solver.self_sample_count) {
+            return -1;
+        }
+        int samples_per_triangle = solver.self_samples_per_triangle > 0 ? solver.self_samples_per_triangle : 1;
+        int tri_index = sample / samples_per_triangle;
+        if (sample - tri_index * samples_per_triangle != 0) {
+            return -1;
+        }
+        return tri_index;
     }
     return ordinal;
 }
@@ -1690,6 +1751,17 @@ __device__ void apply_self_collision_correction(Solver solver, int index, Vec3 d
     note_self_collision_correction(solver, index, delta);
 }
 
+__device__ void apply_self_collision_correction_untracked(Solver solver, int index, Vec3 delta) {
+    if (index < 0 || index >= solver.cfg.vertex_count) {
+        return;
+    }
+    atomic_add(&solver.pos[index], delta);
+    if (!solver.self_recovery_mode) {
+        atomic_add(&solver.prev[index], delta);
+    }
+    note_self_region_touch(solver, index);
+}
+
 __device__ bool same_or_one_ring_neighbor(Solver solver, int a, int b) {
     if (a == b) {
         return true;
@@ -1705,6 +1777,37 @@ __device__ bool same_or_one_ring_neighbor(Solver solver, int a, int b) {
         }
     }
     return false;
+}
+
+__device__ bool self_fast_mode(Solver solver) {
+    return solver.cfg.self_collision_mode == kSelfCollisionModeFast;
+}
+
+__device__ bool self_contact_frontier_vertex(Solver solver, int vertex) {
+    if (!self_fast_mode(solver) || !solver.self_recovery_touched || vertex < 0 || vertex >= solver.cfg.vertex_count) {
+        return false;
+    }
+    if (solver.self_recovery_touched[vertex] != 0) {
+        return true;
+    }
+    if (!solver.vertex_neighbor_offsets || !solver.vertex_neighbors) {
+        return false;
+    }
+    int start = solver.vertex_neighbor_offsets[vertex];
+    int end = solver.vertex_neighbor_offsets[vertex + 1];
+    for (int idx = start; idx < end; ++idx) {
+        int neighbor = solver.vertex_neighbors[idx];
+        if (neighbor >= 0 && neighbor < solver.cfg.vertex_count && solver.self_recovery_touched[neighbor] != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+__device__ bool self_contact_frontier_triangle(Solver solver, Int3 tri) {
+    return self_contact_frontier_vertex(solver, tri.x)
+        || self_contact_frontier_vertex(solver, tri.y)
+        || self_contact_frontier_vertex(solver, tri.z);
 }
 
 __device__ void self_surface_sample_weights(int kind, float* wa, float* wb, float* wc) {
@@ -1802,6 +1905,9 @@ __device__ bool self_should_project_contact(float gap, Vec3 delta, Vec3 previous
 }
 
 __device__ float self_projection_relaxation(Solver solver) {
+    if (self_fast_mode(solver)) {
+        return solver.self_recovery_mode ? kFastSelfRecoveryProjectionRelaxation : kFastSelfProjectionRelaxation;
+    }
     return solver.self_recovery_mode ? kSelfRecoveryProjectionRelaxation : kSelfProjectionRelaxation;
 }
 
@@ -1834,18 +1940,26 @@ __global__ void build_self_compaction_vertices_kernel(Solver solver) {
         return;
     }
     int region = self_sleep_region_for_vertex(solver, vertex);
-    bool active = region < 0 || self_region_is_active(solver, region);
-    bool suspect = region < 0 || self_region_is_suspect(solver, region);
+    bool use_frontier = self_fast_mode(solver) && solver.self_recovery_touched;
+    bool frontier = use_frontier && self_contact_frontier_vertex(solver, vertex);
+    bool active = use_frontier ? frontier : (region < 0 || self_region_is_active(solver, region));
+    bool suspect = use_frontier ? frontier : (region < 0 || self_region_is_suspect(solver, region));
     if (active && solver.self_active_vertices) {
         int slot = atomicAdd(&solver.self_compaction_counts[kSelfCompactionActiveVertices], 1);
         if (slot < solver.cfg.vertex_count) {
             solver.self_active_vertices[slot] = vertex;
+        }
+        if (solver.self_active_vertex_flags) {
+            solver.self_active_vertex_flags[vertex] = 1;
         }
     }
     if (suspect && solver.self_suspect_vertices) {
         int slot = atomicAdd(&solver.self_compaction_counts[kSelfCompactionSuspectVertices], 1);
         if (slot < solver.cfg.vertex_count) {
             solver.self_suspect_vertices[slot] = vertex;
+        }
+        if (solver.self_suspect_vertex_flags) {
+            solver.self_suspect_vertex_flags[vertex] = 1;
         }
     }
 }
@@ -1872,8 +1986,11 @@ __global__ void build_self_compaction_samples_kernel(Solver solver) {
     }
     int tri_index = self_sample_triangle_index(solver, sample);
     int region = self_sleep_region_for_triangle(solver, tri_index);
-    bool active = region < 0 || self_region_is_active(solver, region);
-    bool suspect = region < 0 || self_region_is_suspect(solver, region);
+    Int3 tri = solver.triangles[tri_index];
+    bool use_frontier = self_fast_mode(solver) && solver.self_recovery_touched;
+    bool frontier = use_frontier && self_contact_frontier_triangle(solver, tri);
+    bool active = use_frontier ? frontier : (region < 0 || self_region_is_active(solver, region));
+    bool suspect = use_frontier ? frontier : (region < 0 || self_region_is_suspect(solver, region));
     if (active && solver.self_active_samples) {
         int slot = atomicAdd(&solver.self_compaction_counts[kSelfCompactionActiveSamples], 1);
         if (slot < solver.self_sample_count) {
@@ -3395,6 +3512,13 @@ __global__ void self_edge_edge_collision_kernel(Solver solver) {
         || edge_a.y < 0 || edge_a.y >= solver.cfg.vertex_count) {
         return;
     }
+    const bool compacted_fast_source = self_fast_mode(solver)
+        && solver.self_compaction_used
+        && (solver.self_source_mode == kSelfSourceActive || solver.self_source_mode == kSelfSourceSuspect);
+    const bool edge_a_in_source = self_source_edge_flag(solver, edge_a);
+    if (compacted_fast_source && !edge_a_in_source) {
+        return;
+    }
     float wx0 = solver.inv_mass[edge_a.x];
     float wx1 = solver.inv_mass[edge_a.y];
     if (wx0 <= 0.0f && wx1 <= 0.0f) {
@@ -3416,7 +3540,7 @@ __global__ void self_edge_edge_collision_kernel(Solver solver) {
     }
     int candidates = 0;
     int scanned = 0;
-    int scan_limit = max_neighbors * 32;
+    int scan_limit = max_neighbors * (self_fast_mode(solver) ? 8 : 32);
     int base_x = cell_coord(mid.x, cell_size);
     int base_y = cell_coord(mid.y, cell_size);
     int base_z = cell_coord(mid.z, cell_size);
@@ -3428,8 +3552,14 @@ __global__ void self_edge_edge_collision_kernel(Solver solver) {
                 int other = solver.self_edge_heads[hash];
                 while (other >= 0 && candidates < max_neighbors && scanned < scan_limit) {
                     ++scanned;
-                    if (other > e) {
+                    if (other != e) {
                         Int2 edge_b = solver.edges[other];
+                        const bool edge_b_in_source = self_source_edge_flag(solver, edge_b);
+                        const bool should_process_pair = other > e || (compacted_fast_source && edge_a_in_source && !edge_b_in_source);
+                        if (!should_process_pair) {
+                            other = solver.self_edge_next[other];
+                            continue;
+                        }
                         if (edge_b.x >= 0 && edge_b.x < solver.cfg.vertex_count
                             && edge_b.y >= 0 && edge_b.y < solver.cfg.vertex_count
                             && !rest_edges_neighbor(solver, edge_a, edge_b)) {
@@ -3650,6 +3780,57 @@ __global__ void build_self_surface_sample_hash_if_dirty_kernel(Solver solver) {
     build_self_surface_sample_hash_entry(solver, sample);
 }
 
+__global__ void build_self_triangle_hash_kernel(Solver solver) {
+    int ordinal = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ordinal >= self_triangle_hash_source_count(solver)
+        || !solver.self_tri_heads
+        || !solver.self_tri_entry_next
+        || !solver.self_tri_entry_index
+        || !solver.self_tri_entry_count) {
+        return;
+    }
+    int t = self_triangle_hash_source_index(solver, ordinal);
+    if (t < 0 || t >= solver.cfg.triangle_count) {
+        return;
+    }
+    Int3 tri = solver.triangles[t];
+    if (tri.x < 0 || tri.x >= solver.cfg.vertex_count
+        || tri.y < 0 || tri.y >= solver.cfg.vertex_count
+        || tri.z < 0 || tri.z >= solver.cfg.vertex_count) {
+        return;
+    }
+    Vec3 a = solver.pos[tri.x];
+    Vec3 b = solver.pos[tri.y];
+    Vec3 c = solver.pos[tri.z];
+    if (!finite_vec(a) || !finite_vec(b) || !finite_vec(c)) {
+        return;
+    }
+    float cell_size = self_cell_size(solver);
+    float contact_distance = self_contact_distance(solver);
+    float expand = fmaxf(contact_distance * 2.0f, cell_size * 0.5f);
+    int min_x = cell_coord(fminf(fminf(a.x, b.x), c.x) - expand, cell_size);
+    int min_y = cell_coord(fminf(fminf(a.y, b.y), c.y) - expand, cell_size);
+    int min_z = cell_coord(fminf(fminf(a.z, b.z), c.z) - expand, cell_size);
+    int max_x = cell_coord(fmaxf(fmaxf(a.x, b.x), c.x) + expand, cell_size);
+    int max_y = cell_coord(fmaxf(fmaxf(a.y, b.y), c.y) + expand, cell_size);
+    int max_z = cell_coord(fmaxf(fmaxf(a.z, b.z), c.z) + expand, cell_size);
+    int inserted = 0;
+    for (int z = min_z; z <= max_z && inserted < kMaxSelfTriangleHashCells; ++z) {
+        for (int y = min_y; y <= max_y && inserted < kMaxSelfTriangleHashCells; ++y) {
+            for (int x = min_x; x <= max_x && inserted < kMaxSelfTriangleHashCells; ++x) {
+                int entry = atomicAdd(solver.self_tri_entry_count, 1);
+                if (entry >= solver.self_tri_entry_capacity) {
+                    return;
+                }
+                int hash = hash_cell(x, y, z, solver.self_tri_hash_table_size);
+                solver.self_tri_entry_index[entry] = t;
+                solver.self_tri_entry_next[entry] = atomicExch(&solver.self_tri_heads[hash], entry);
+                ++inserted;
+            }
+        }
+    }
+}
+
 __global__ void self_edge_surface_collision_kernel(Solver solver) {
     int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= solver.cfg.edge_count || !solver.edges || !solver.self_sample_heads || !solver.self_sample_next) {
@@ -3658,6 +3839,12 @@ __global__ void self_edge_surface_collision_kernel(Solver solver) {
     Int2 edge = solver.edges[e];
     if (edge.x < 0 || edge.x >= solver.cfg.vertex_count
         || edge.y < 0 || edge.y >= solver.cfg.vertex_count) {
+        return;
+    }
+    if (self_fast_mode(solver)
+        && solver.self_compaction_used
+        && (solver.self_source_mode == kSelfSourceActive || solver.self_source_mode == kSelfSourceSuspect)
+        && !self_source_edge_flag(solver, edge)) {
         return;
     }
     float wx0 = solver.inv_mass[edge.x];
@@ -3855,7 +4042,7 @@ __global__ void build_self_vertex_surface_pairs_kernel(Solver solver, int store_
     }
     int candidates = 0;
     int scanned = 0;
-    int scan_limit = max_neighbors * 32;
+    int scan_limit = max_neighbors * (self_fast_mode(solver) ? 8 : 32);
     int base_x = cell_coord(p.x, cell_size);
     int base_y = cell_coord(p.y, cell_size);
     int base_z = cell_coord(p.z, cell_size);
@@ -4076,6 +4263,155 @@ __global__ void probe_self_vertex_surface_pairs_kernel(Solver solver) {
     }
 }
 
+__global__ void self_vertex_triangle_collision_kernel(Solver solver, int project_contacts) {
+    int ordinal = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ordinal >= self_vertex_source_count(solver)
+        || !solver.self_tri_heads
+        || !solver.self_tri_entry_next
+        || !solver.self_tri_entry_index) {
+        return;
+    }
+    int i = self_vertex_source_index(solver, ordinal);
+    if (i < 0 || i >= solver.cfg.vertex_count || solver.inv_mass[i] <= 0.0f) {
+        return;
+    }
+    if (!self_compaction_uses_vertex_list(solver) && self_sleep_source_vertex_skipped(solver, i)) {
+        diag_note_self_source_skipped(solver);
+        return;
+    }
+    Vec3 p = solver.pos[i];
+    Vec3 prev = solver.prev[i];
+    if (!finite_vec(p) || !finite_vec(prev)) {
+        diag_note_nonfinite(solver);
+        return;
+    }
+    float thickness = self_contact_distance(solver);
+    float cell_size = self_cell_size(solver);
+    float expand = fmaxf(thickness * 2.0f, 1.0e-4f);
+    int min_x = cell_coord(fminf(p.x, prev.x) - expand, cell_size);
+    int min_y = cell_coord(fminf(p.y, prev.y) - expand, cell_size);
+    int min_z = cell_coord(fminf(p.z, prev.z) - expand, cell_size);
+    int max_x = cell_coord(fmaxf(p.x, prev.x) + expand, cell_size);
+    int max_y = cell_coord(fmaxf(p.y, prev.y) + expand, cell_size);
+    int max_z = cell_coord(fmaxf(p.z, prev.z) + expand, cell_size);
+    int queried = 0;
+    int candidates = 0;
+    int max_neighbors = solver.cfg.max_self_collision_neighbors > 1 ? solver.cfg.max_self_collision_neighbors : 1;
+    if (solver.self_recovery_mode) {
+        max_neighbors = min(max_neighbors * 2, 256);
+    }
+    int visited[kMaxSelfVertexTriangleCandidates];
+    int visited_count = 0;
+
+    for (int z = min_z; z <= max_z && queried < kMaxSelfVertexTriangleQueryCells; ++z) {
+        for (int y = min_y; y <= max_y && queried < kMaxSelfVertexTriangleQueryCells; ++y) {
+            for (int x = min_x; x <= max_x && queried < kMaxSelfVertexTriangleQueryCells; ++x) {
+                int hash = hash_cell(x, y, z, solver.self_tri_hash_table_size);
+                int entry = solver.self_tri_heads[hash];
+                while (entry >= 0 && candidates < max_neighbors && visited_count < kMaxSelfVertexTriangleCandidates) {
+                    int t = solver.self_tri_entry_index[entry];
+                    bool duplicate = false;
+                    for (int j = 0; j < visited_count; ++j) {
+                        if (visited[j] == t) {
+                            duplicate = true;
+                            break;
+                        }
+                    }
+                    if (!duplicate) {
+                        visited[visited_count] = t;
+                        ++visited_count;
+                        if (t >= 0 && t < solver.cfg.triangle_count) {
+                            Int3 tri = solver.triangles[t];
+                            if (tri.x >= 0 && tri.x < solver.cfg.vertex_count
+                                && tri.y >= 0 && tri.y < solver.cfg.vertex_count
+                                && tri.z >= 0 && tri.z < solver.cfg.vertex_count) {
+                                Vec3 a = solver.pos[tri.x];
+                                Vec3 b = solver.pos[tri.y];
+                                Vec3 c = solver.pos[tri.z];
+                                if (finite_vec(a) && finite_vec(b) && finite_vec(c)) {
+                                    Vec3 closest = closest_point_on_triangle(p, a, b, c);
+                                    Vec3 barycentric = barycentric_on_triangle(closest, a, b, c);
+                                    float wa = barycentric.x;
+                                    float wb = barycentric.y;
+                                    float wc = barycentric.z;
+                                    if (!rest_surface_neighbor(solver, i, tri, wa, wb, wc)) {
+                                        Vec3 delta = sub(p, closest);
+                                        float d_linear = sqrtf(fmaxf(dot(delta, delta), 0.0f));
+                                        Vec3 surface_normal = stable_triangle_normal(
+                                            a,
+                                            b,
+                                            c,
+                                            solver.rest[tri.x],
+                                            solver.rest[tri.y],
+                                            solver.rest[tri.z]
+                                        );
+                                        Vec3 prev_sample = weighted_triangle_point(
+                                            solver.prev[tri.x],
+                                            solver.prev[tri.y],
+                                            solver.prev[tri.z],
+                                            wa,
+                                            wb,
+                                            wc
+                                        );
+                                        Vec3 previous_delta = sub(prev, prev_sample);
+                                        float contact_distance = 0.0f;
+                                        Vec3 normal = self_collision_normal(
+                                            delta,
+                                            surface_normal,
+                                            previous_delta,
+                                            thickness,
+                                            &contact_distance
+                                        );
+                                        float coarse_distance = solver.self_recovery_mode ? contact_distance : d_linear;
+                                        if (self_coarse_distance_ok(coarse_distance, thickness)) {
+                                            float gap = coarse_distance - thickness;
+                                            diag_note_gap(solver, gap);
+                                            if (self_should_project_contact(gap, delta, previous_delta, normal)) {
+                                                diag_note_effective_candidate(solver);
+                                                ++candidates;
+                                                if (gap < 0.0f && dot(previous_delta, surface_normal) * dot(delta, surface_normal) < 0.0f) {
+                                                    diag_note_ccd(solver);
+                                                }
+                                                if (project_contacts != 0 && gap < 0.0f) {
+                                                    float wi = solver.inv_mass[i];
+                                                    float wx = solver.inv_mass[tri.x];
+                                                    float wy = solver.inv_mass[tri.y];
+                                                    float wz = solver.inv_mass[tri.z];
+                                                    float tri_weight = weighted_inv_mass(solver, tri, wa, wb, wc);
+                                                    float total = wi + tri_weight;
+                                                    if (total > 0.0f) {
+                                                        Vec3 correction = mul(
+                                                            normal,
+                                                            self_projection_relaxation(solver) * (thickness - contact_distance) / total
+                                                        );
+                                                        Vec3 correction_i = mul(correction, wi);
+                                                        Vec3 correction_x = mul(correction, -wx * wa);
+                                                        Vec3 correction_y = mul(correction, -wy * wb);
+                                                        Vec3 correction_z = mul(correction, -wz * wc);
+                                                        apply_self_collision_correction(solver, i, correction_i);
+                                                        apply_self_collision_correction_untracked(solver, tri.x, correction_x);
+                                                        apply_self_collision_correction_untracked(solver, tri.y, correction_y);
+                                                        apply_self_collision_correction_untracked(solver, tri.z, correction_z);
+                                                        diag_note_resolved(solver);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    diag_note_nonfinite(solver);
+                                }
+                            }
+                        }
+                    }
+                    entry = solver.self_tri_entry_next[entry];
+                }
+                ++queried;
+            }
+        }
+    }
+}
+
 __global__ void self_vertex_surface_collision_kernel(Solver solver) {
     int ordinal = blockIdx.x * blockDim.x + threadIdx.x;
     if (ordinal >= self_vertex_source_count(solver)) {
@@ -4102,7 +4438,7 @@ __global__ void self_vertex_surface_collision_kernel(Solver solver) {
     }
     int candidates = 0;
     int scanned = 0;
-    int scan_limit = max_neighbors * 32;
+    int scan_limit = max_neighbors * (self_fast_mode(solver) ? 8 : 32);
     int base_x = cell_coord(p.x, cell_size);
     int base_y = cell_coord(p.y, cell_size);
     int base_z = cell_coord(p.z, cell_size);
@@ -4238,7 +4574,7 @@ __global__ void self_surface_sample_collision_kernel(Solver solver) {
     }
     int candidates = 0;
     int scanned = 0;
-    int scan_limit = max_neighbors * 32;
+    int scan_limit = max_neighbors * (self_fast_mode(solver) ? 8 : 32);
     int base_x = cell_coord(p.x, cell_size);
     int base_y = cell_coord(p.y, cell_size);
     int base_z = cell_coord(p.z, cell_size);
@@ -4434,7 +4770,7 @@ __global__ void probe_self_vertex_surface_collision_kernel(Solver solver) {
     int max_neighbors = solver.cfg.max_self_collision_neighbors > 1 ? solver.cfg.max_self_collision_neighbors : 1;
     int candidates = 0;
     int scanned = 0;
-    int scan_limit = max_neighbors * 32;
+    int scan_limit = max_neighbors * (self_fast_mode(solver) ? 8 : 32);
     int base_x = cell_coord(p.x, cell_size);
     int base_y = cell_coord(p.y, cell_size);
     int base_z = cell_coord(p.z, cell_size);
@@ -5255,6 +5591,7 @@ void reset_self_compaction_state(Solver* solver) {
     solver->self_vs_pair_current_overflow = 0;
     solver->self_vs_pair_compaction_used = 0;
     solver->self_vs_pair_valid = 0;
+    solver->self_sample_hash_valid = 0;
     if (solver->self_compaction_counts) {
         cudaMemset(solver->self_compaction_counts, 0, sizeof(int) * kSelfCompactionCountSlots);
     }
@@ -5267,15 +5604,22 @@ bool self_compaction_ready(const Solver* solver) {
     if (!solver) {
         return false;
     }
-    return solver->cfg.self_compaction_enabled
-        && solver->cfg.self_sleep_enabled
-        && solver->cfg.self_collision
-        && !solver->self_sleep_force_active
+    if (!solver->cfg.self_compaction_enabled
+        || !solver->cfg.self_collision
+        || solver->self_sleep_force_active
+        || !solver->self_compaction_counts
+        || !solver->self_active_vertices
+        || !solver->self_suspect_vertices
+        || !solver->self_active_vertex_flags
+        || !solver->self_suspect_vertex_flags) {
+        return false;
+    }
+    const bool sleep_ready = solver->cfg.self_sleep_enabled
         && solver->self_sleep_region_count > 0
-        && solver->self_sleep_frame_count >= std::max(solver->cfg.self_sleep_still_frames, 1)
-        && solver->self_compaction_counts
-        && solver->self_active_vertices
-        && solver->self_suspect_vertices;
+        && solver->self_sleep_frame_count >= std::max(solver->cfg.self_sleep_still_frames, 1);
+    const bool fast_frontier_ready = solver->cfg.self_collision_mode == kSelfCollisionModeFast
+        && solver->self_recovery_touched != nullptr;
+    return sleep_ready || fast_frontier_ready;
 }
 
 bool prepare_self_compaction_lists(Solver* solver, int v_blocks) {
@@ -5287,16 +5631,25 @@ bool prepare_self_compaction_lists(Solver* solver, int v_blocks) {
             "reset self compaction counts")) {
         return false;
     }
+    if (!set_cuda_error(
+            cudaMemset(solver->self_active_vertex_flags, 0, sizeof(int) * solver->cfg.vertex_count),
+            "reset self active vertex flags")) {
+        return false;
+    }
+    if (!set_cuda_error(
+            cudaMemset(solver->self_suspect_vertex_flags, 0, sizeof(int) * solver->cfg.vertex_count),
+            "reset self suspect vertex flags")) {
+        return false;
+    }
     Solver compact_solver = *solver;
     compact_solver.self_source_mode = kSelfSourceFull;
     compact_solver.self_samples_per_triangle = solver->self_samples_per_triangle;
     compact_solver.self_sample_count = solver->self_sample_count;
     compact_solver.self_compaction_samples_per_triangle = compact_solver.self_samples_per_triangle;
-    build_self_compaction_regions_kernel<<<block_count(compact_solver.self_sleep_region_count), 256>>>(compact_solver);
-    build_self_compaction_vertices_kernel<<<v_blocks, 256>>>(compact_solver);
-    if (compact_solver.self_sample_count > 0 && compact_solver.self_active_samples && compact_solver.self_suspect_samples) {
-        build_self_compaction_samples_kernel<<<block_count(compact_solver.self_sample_count), 256>>>(compact_solver);
+    if (compact_solver.self_sleep_region_count > 0) {
+        build_self_compaction_regions_kernel<<<block_count(compact_solver.self_sleep_region_count), 256>>>(compact_solver);
     }
+    build_self_compaction_vertices_kernel<<<v_blocks, 256>>>(compact_solver);
     if (!set_cuda_error(cudaGetLastError(), "launch self compaction")) {
         return false;
     }
@@ -5305,6 +5658,20 @@ bool prepare_self_compaction_lists(Solver* solver, int v_blocks) {
             cudaMemcpy(counts, solver->self_compaction_counts, sizeof(counts), cudaMemcpyDeviceToHost),
             "download self compaction counts")) {
         return false;
+    }
+    if (counts[kSelfCompactionActiveVertices] > 0
+        && compact_solver.self_sample_count > 0
+        && compact_solver.self_active_samples
+        && compact_solver.self_suspect_samples) {
+        build_self_compaction_samples_kernel<<<block_count(compact_solver.self_sample_count), 256>>>(compact_solver);
+        if (!set_cuda_error(cudaGetLastError(), "launch self sample compaction")) {
+            return false;
+        }
+        if (!set_cuda_error(
+                cudaMemcpy(counts, solver->self_compaction_counts, sizeof(counts), cudaMemcpyDeviceToHost),
+                "download self sample compaction counts")) {
+            return false;
+        }
     }
     solver->self_active_vertex_count = counts[kSelfCompactionActiveVertices];
     solver->self_suspect_vertex_count = counts[kSelfCompactionSuspectVertices];
@@ -5318,7 +5685,7 @@ bool prepare_self_compaction_lists(Solver* solver, int v_blocks) {
     }
     threshold = std::clamp(threshold, 0.01f, 1.0f);
     bool active_list_used = solver->cfg.vertex_count > 0
-        && solver->self_active_vertex_count >= 0
+        && solver->self_active_vertex_count > 0
         && solver->self_active_vertex_count < solver->cfg.vertex_count
         && static_cast<float>(solver->self_active_vertex_count) < static_cast<float>(solver->cfg.vertex_count) * threshold;
     solver->self_compaction_used = active_list_used ? 1 : 0;
@@ -5357,12 +5724,12 @@ bool fetch_self_compaction_diagnostics(Solver* solver) {
     threshold = std::clamp(threshold, 0.01f, 1.0f);
     bool active_list_used = solver->self_compaction_used
         && solver->cfg.vertex_count > 0
-        && solver->self_active_vertex_count >= 0
+        && solver->self_active_vertex_count > 0
         && solver->self_active_vertex_count < solver->cfg.vertex_count
         && static_cast<float>(solver->self_active_vertex_count) < static_cast<float>(solver->cfg.vertex_count) * threshold;
     bool suspect_list_used = solver->self_compaction_used
         && solver->cfg.vertex_count > 0
-        && solver->self_suspect_vertex_count >= 0
+        && solver->self_suspect_vertex_count > 0
         && solver->self_suspect_vertex_count < solver->cfg.vertex_count
         && static_cast<float>(solver->self_suspect_vertex_count) < static_cast<float>(solver->cfg.vertex_count) * threshold;
     solver->diag.self_compaction_used = (active_list_used || suspect_list_used) ? 1ll : 0ll;
@@ -5392,7 +5759,7 @@ bool host_self_uses_vertex_list(const Solver* solver, int source_mode) {
     } else {
         return false;
     }
-    return count >= 0
+    return count > 0
         && count < solver->cfg.vertex_count
         && static_cast<float>(count) < static_cast<float>(solver->cfg.vertex_count) * host_self_compaction_threshold(solver);
 }
@@ -5413,7 +5780,7 @@ bool host_self_uses_sample_list(const Solver* solver, int source_mode, int sampl
     } else {
         return false;
     }
-    return count >= 0
+    return count > 0
         && count < sample_count
         && static_cast<float>(count) < static_cast<float>(sample_count) * host_self_compaction_threshold(solver);
 }
@@ -5485,6 +5852,35 @@ bool reset_self_vs_pair_counts(Solver* solver) {
         cudaMemset(solver->self_vs_pair_counts, 0, sizeof(int) * kSelfVsPairCountSlots),
         "reset self vertex-surface pair counters"
     );
+}
+
+bool build_self_triangle_hash(
+    Solver* solver,
+    const Solver& triangle_solver,
+    int triangle_source_blocks,
+    std::vector<TimedSegment>* timings,
+    const char* label
+) {
+    if (!solver
+        || !solver->self_tri_heads
+        || !solver->self_tri_entry_next
+        || !solver->self_tri_entry_index
+        || !solver->self_tri_entry_count
+        || solver->self_tri_hash_table_size <= 0
+        || solver->self_tri_entry_capacity <= 0) {
+        return set_error("self triangle hash is not allocated");
+    }
+    TimedSegment segment;
+    if (!begin_timed_segment(timings, kTimingSelfHash, &segment, label)) {
+        return false;
+    }
+    cudaMemset(solver->self_tri_heads, 0xff, sizeof(int) * solver->self_tri_hash_table_size);
+    cudaMemset(solver->self_tri_entry_count, 0, sizeof(int));
+    build_self_triangle_hash_kernel<<<triangle_source_blocks, 256>>>(triangle_solver);
+    if (!end_timed_segment(timings, &segment, label)) {
+        return false;
+    }
+    return set_cuda_error(cudaGetLastError(), label);
 }
 
 bool build_self_vs_pairs(
@@ -5730,13 +6126,43 @@ bool run_self_collision_pass(
         return false;
     }
     self_particle_collision_kernel<<<vertex_source_blocks, 256>>>(collision_solver);
-    if (solver->self_edge_heads && solver->self_edge_next && solver->cfg.edge_count > 0) {
+    if (solver->self_edge_heads
+        && solver->self_edge_next
+        && solver->cfg.edge_count > 0
+        && collision_solver.cfg.self_collision_mode != kSelfCollisionModeFast) {
         self_edge_edge_collision_kernel<<<edge_blocks, 256>>>(collision_solver);
     }
     if (!end_timed_segment(timings, &solve_segment, "end self solve timing")) {
         return false;
     }
-    if (solver->self_sample_heads
+    const bool use_fast_triangle_path = recovery_mode
+        && collision_solver.cfg.self_collision_mode == kSelfCollisionModeFast
+        && solver->self_tri_heads
+        && solver->self_tri_entry_next
+        && solver->self_tri_entry_index
+        && solver->self_tri_entry_count
+        && solver->cfg.triangle_count > 0;
+    if (use_fast_triangle_path) {
+        const int triangle_source_count = solver->cfg.triangle_count;
+        const int triangle_source_blocks = block_count(std::max(triangle_source_count, 1));
+        Solver triangle_solver = collision_solver;
+        triangle_solver.self_source_mode = kSelfSourceFull;
+        if (!build_self_triangle_hash(
+                solver,
+                triangle_solver,
+                triangle_source_blocks,
+                timings,
+                "build fast self triangle hash")) {
+            return false;
+        }
+        if (!begin_timed_segment(timings, solve_slot, &solve_segment, "start fast self vertex-triangle timing")) {
+            return false;
+        }
+        self_vertex_triangle_collision_kernel<<<vertex_source_blocks, 256>>>(collision_solver, 1);
+        if (!end_timed_segment(timings, &solve_segment, "end fast self vertex-triangle timing")) {
+            return false;
+        }
+    } else if (solver->self_sample_heads
         && solver->self_sample_next
         && collision_solver.self_sample_count > 0) {
         if (solver->self_sample_hash_dirty) {
@@ -5747,11 +6173,13 @@ bool run_self_collision_pass(
         }
         cudaMemset(solver->self_sample_heads, 0xff, sizeof(int) * solver->self_sample_hash_table_size);
         build_self_surface_sample_hash_kernel<<<block_count(collision_solver.self_sample_count), 256>>>(collision_solver);
+        solver->self_sample_hash_valid = 1;
         if (!end_timed_segment(timings, &hash_segment, "end self sample hash timing")) {
             return false;
         }
         bool used_pair_path = false;
-        bool use_vs_pair_path = solver->self_compaction_used
+        bool use_vs_pair_path = collision_solver.cfg.self_collision_mode != kSelfCollisionModeFast
+            && solver->self_compaction_used
             && host_self_pair_compaction_ready(solver, collision_solver.self_source_mode);
         if (use_vs_pair_path) {
             Solver pair_solver = collision_solver;
@@ -5797,6 +6225,7 @@ bool run_self_collision_pass(
             }
             clear_self_surface_sample_hash_if_dirty_kernel<<<block_count(solver->self_sample_hash_table_size), 256>>>(collision_solver);
             build_self_surface_sample_hash_if_dirty_kernel<<<block_count(collision_solver.self_sample_count), 256>>>(collision_solver);
+            solver->self_sample_hash_valid = 1;
             if (solver->self_sample_hash_dirty) {
                 cudaMemset(solver->self_sample_hash_dirty, 0, sizeof(int));
             }
@@ -5866,6 +6295,12 @@ bool probe_self_collision(
     probe_solver.self_sample_count = solver->cfg.triangle_count * probe_solver.self_samples_per_triangle;
     const int vertex_source_count = host_self_vertex_source_count(&probe_solver, probe_solver.self_source_mode);
     const int vertex_source_blocks = block_count(std::max(vertex_source_count, 1));
+    const int sample_source_count = host_self_sample_source_count(
+        &probe_solver,
+        probe_solver.self_source_mode,
+        probe_solver.self_samples_per_triangle,
+        probe_solver.self_sample_count
+    );
     if (!reset_probe_diagnostics(solver)) {
         return false;
     }
@@ -5876,19 +6311,43 @@ bool probe_self_collision(
     cudaMemset(solver->self_vert_heads, 0xff, sizeof(int) * solver->self_vert_hash_table_size);
     build_self_vertex_hash_kernel<<<v_blocks, 256>>>(probe_solver);
     probe_self_particle_collision_kernel<<<vertex_source_blocks, 256>>>(probe_solver);
-    if (solver->self_sample_heads
+    const bool use_fast_triangle_path = false
+        && probe_solver.cfg.self_collision_mode == kSelfCollisionModeFast
+        && solver->self_tri_heads
+        && solver->self_tri_entry_next
+        && solver->self_tri_entry_index
+        && solver->self_tri_entry_count
+        && solver->cfg.triangle_count > 0;
+    if (use_fast_triangle_path) {
+        const int triangle_source_count = solver->cfg.triangle_count;
+        const int triangle_source_blocks = block_count(std::max(triangle_source_count, 1));
+        Solver triangle_solver = probe_solver;
+        triangle_solver.self_source_mode = kSelfSourceFull;
+        if (!build_self_triangle_hash(
+                solver,
+                triangle_solver,
+                triangle_source_blocks,
+                timings,
+                "build fast probe self triangle hash")) {
+            return false;
+        }
+        self_vertex_triangle_collision_kernel<<<vertex_source_blocks, 256>>>(probe_solver, 0);
+    } else if (solver->self_sample_heads
         && solver->self_sample_next
         && probe_solver.self_sample_count > 0) {
-        if (solver->self_sample_hash_dirty) {
+        if (solver->self_sample_hash_valid && solver->self_sample_hash_dirty) {
             clear_self_surface_sample_hash_if_dirty_kernel<<<block_count(solver->self_sample_hash_table_size), 256>>>(probe_solver);
             build_self_surface_sample_hash_if_dirty_kernel<<<block_count(probe_solver.self_sample_count), 256>>>(probe_solver);
+            solver->self_sample_hash_valid = 1;
             cudaMemset(solver->self_sample_hash_dirty, 0, sizeof(int));
-        } else {
+        } else if (!solver->self_sample_hash_valid) {
             cudaMemset(solver->self_sample_heads, 0xff, sizeof(int) * solver->self_sample_hash_table_size);
             build_self_surface_sample_hash_kernel<<<block_count(probe_solver.self_sample_count), 256>>>(probe_solver);
+            solver->self_sample_hash_valid = 1;
         }
         bool used_pair_probe = false;
-        bool use_vs_pair_probe = solver->self_compaction_used
+        bool use_vs_pair_probe = probe_solver.cfg.self_collision_mode != kSelfCollisionModeFast
+            && solver->self_compaction_used
             && host_self_pair_compaction_ready(solver, probe_solver.self_source_mode);
         if (use_vs_pair_probe) {
             if (!build_self_vs_pairs(
@@ -5971,7 +6430,11 @@ bool run_substep(
     if (!solver) {
         return set_error("invalid solver");
     }
-    if (allow_retry && run_self_collision) {
+    const bool strict_self_collision = run_self_collision
+        && solver->cfg.self_collision_mode >= kSelfCollisionModeStrict;
+    const bool fast_self_collision = run_self_collision
+        && solver->cfg.self_collision_mode == kSelfCollisionModeFast;
+    if (allow_retry && strict_self_collision) {
         if (!backup_solver_state(solver) || !backup_step_diagnostics_state(solver)) {
             return false;
         }
@@ -6126,9 +6589,10 @@ bool run_substep(
             const int probe_source_mode = use_source_compaction ? kSelfSourceSuspect : kSelfSourceFull;
             int surface_pair_interval = std::max(solver->cfg.self_surface_pair_interval, 1);
             bool run_surface_pairs = (solver->self_collision_run_count % surface_pair_interval) == 0;
+            const int self_collision_passes = fast_self_collision ? kFastSelfCollisionPasses : kSelfCollisionPasses;
             solver->self_source_mode = solve_source_mode;
-            for (int self_pass = 0; self_pass < kSelfCollisionPasses; ++self_pass) {
-                bool run_surface_sample_pairs = run_surface_pairs && (self_pass == kSelfCollisionPasses - 1);
+            for (int self_pass = 0; self_pass < self_collision_passes; ++self_pass) {
+                bool run_surface_sample_pairs = run_surface_pairs && (self_pass == self_collision_passes - 1);
                 if (!run_self_collision_pass(solver, v_blocks, false, run_surface_sample_pairs, timings)) {
                     solver->self_source_mode = kSelfSourceFull;
                     return false;
@@ -6158,7 +6622,8 @@ bool run_substep(
             }
             float cloth_thickness = std::max(solver->cfg.cloth_thickness, 1.0e-4f);
             int extra_recovery_passes = 0;
-            while (extra_recovery_passes < kSelfRecoveryPassLimit
+            const int recovery_pass_limit = fast_self_collision ? 1 : kSelfRecoveryPassLimit;
+            while (extra_recovery_passes < recovery_pass_limit
                 && self_probe_triggers_recovery(probe_diag, cloth_thickness)) {
                 if (!clear_self_recovery_tracking(solver, "clear self recovery tracking")) {
                     return false;
@@ -6183,12 +6648,15 @@ bool run_substep(
                     ++(*recovery_passes_total);
                 }
                 solver->self_source_mode = probe_source_mode;
+                if (fast_self_collision) {
+                    break;
+                }
                 if (!probe_self_collision(solver, v_blocks, &probe_diag, timings)) {
                     solver->self_source_mode = kSelfSourceFull;
                     return false;
                 }
             }
-            if (use_source_compaction && self_probe_triggers_retry(probe_diag, cloth_thickness)) {
+            if (!fast_self_collision && use_source_compaction && self_probe_triggers_retry(probe_diag, cloth_thickness)) {
                 if (!clear_self_recovery_tracking(solver, "clear full self recovery tracking")) {
                     return false;
                 }
@@ -6225,7 +6693,7 @@ bool run_substep(
                 }
             }
 
-            if (allow_retry && self_probe_triggers_retry(probe_diag, cloth_thickness)) {
+            if (allow_retry && strict_self_collision && self_probe_triggers_retry(probe_diag, cloth_thickness)) {
                 if (local_retry_total) {
                     ++(*local_retry_total);
                 }
@@ -6349,6 +6817,10 @@ void free_solver(Solver* solver) {
     cudaFree(solver->self_sample_heads);
     cudaFree(solver->self_sample_next);
     cudaFree(solver->self_sample_hash_dirty);
+    cudaFree(solver->self_tri_heads);
+    cudaFree(solver->self_tri_entry_next);
+    cudaFree(solver->self_tri_entry_index);
+    cudaFree(solver->self_tri_entry_count);
     cudaFree(solver->self_recovery_touched);
     cudaFree(solver->self_recovery_delta);
     cudaFree(solver->self_sleep_vertex_regions);
@@ -6362,6 +6834,8 @@ void free_solver(Solver* solver) {
     cudaFree(solver->self_sleep_has_sleeping);
     cudaFree(solver->self_active_vertices);
     cudaFree(solver->self_suspect_vertices);
+    cudaFree(solver->self_active_vertex_flags);
+    cudaFree(solver->self_suspect_vertex_flags);
     cudaFree(solver->self_active_samples);
     cudaFree(solver->self_suspect_samples);
     cudaFree(solver->self_compaction_counts);
@@ -6657,10 +7131,10 @@ extern "C" SSBL_API void* ssbl_create_solver(const SsblXpbdConfig* config, const
     Solver* solver = new Solver();
     solver->cfg = *config;
     solver->self_contact_distance_value = compute_self_contact_distance(config, mesh);
-    // Removed self-collision modes above fast. Clamp stale callers to the
-    // remaining particle-hash path.
+    // Off is controlled by self_collision=false. Enabled self-collision has
+    // two solver modes: fast preview and strict no-intersection.
     solver->cfg.self_collision_mode = solver->cfg.self_collision
-        ? std::min(std::max(solver->cfg.self_collision_mode, 0), 1)
+        ? std::min(std::max(solver->cfg.self_collision_mode, 0), kSelfCollisionModeStrict)
         : 0;
     solver->cfg.self_sleep_enabled = (solver->cfg.self_collision && solver->cfg.self_collision_mode > 0 && solver->cfg.self_sleep_enabled)
         ? 1
@@ -6880,12 +7354,24 @@ extern "C" SSBL_API void* ssbl_create_solver(const SsblXpbdConfig* config, const
             ok = ok && set_cuda_error(err, "self active vertex allocation");
             err = cudaMalloc(reinterpret_cast<void**>(&solver->self_suspect_vertices), sizeof(int) * config->vertex_count);
             ok = ok && set_cuda_error(err, "self suspect vertex allocation");
+            err = cudaMalloc(reinterpret_cast<void**>(&solver->self_active_vertex_flags), sizeof(int) * config->vertex_count);
+            ok = ok && set_cuda_error(err, "self active vertex flag allocation");
+            err = cudaMalloc(reinterpret_cast<void**>(&solver->self_suspect_vertex_flags), sizeof(int) * config->vertex_count);
+            ok = ok && set_cuda_error(err, "self suspect vertex flag allocation");
             err = cudaMalloc(reinterpret_cast<void**>(&solver->self_compaction_counts), sizeof(int) * kSelfCompactionCountSlots);
             ok = ok && set_cuda_error(err, "self compaction count allocation");
             if (ok) {
                 ok = ok && set_cuda_error(
                     cudaMemset(solver->self_compaction_counts, 0, sizeof(int) * kSelfCompactionCountSlots),
                     "self compaction count reset"
+                );
+                ok = ok && set_cuda_error(
+                    cudaMemset(solver->self_active_vertex_flags, 0, sizeof(int) * config->vertex_count),
+                    "self active vertex flag reset"
+                );
+                ok = ok && set_cuda_error(
+                    cudaMemset(solver->self_suspect_vertex_flags, 0, sizeof(int) * config->vertex_count),
+                    "self suspect vertex flag reset"
                 );
             }
         }
@@ -6899,6 +7385,26 @@ extern "C" SSBL_API void* ssbl_create_solver(const SsblXpbdConfig* config, const
             err = cudaMalloc(reinterpret_cast<void**>(&solver->self_sample_hash_dirty), sizeof(int));
             ok = ok && set_cuda_error(err, "self surface sample dirty allocation");
             ok = ok && set_cuda_error(cudaMemset(solver->self_sample_hash_dirty, 0, sizeof(int)), "self surface sample dirty reset");
+            solver->self_tri_hash_table_size = next_power_of_two(std::max(1024, config->triangle_count * 4));
+            solver->self_tri_entry_capacity = static_cast<int>(std::min(
+                static_cast<long long>(config->triangle_count) * static_cast<long long>(kMaxSelfTriangleHashCells),
+                static_cast<long long>(kSelfTriangleEntryCapacityMax)
+            ));
+            err = cudaMalloc(reinterpret_cast<void**>(&solver->self_tri_heads), sizeof(int) * solver->self_tri_hash_table_size);
+            ok = ok && set_cuda_error(err, "self triangle hash allocation");
+            err = cudaMalloc(reinterpret_cast<void**>(&solver->self_tri_entry_next), sizeof(int) * solver->self_tri_entry_capacity);
+            ok = ok && set_cuda_error(err, "self triangle hash link allocation");
+            err = cudaMalloc(reinterpret_cast<void**>(&solver->self_tri_entry_index), sizeof(int) * solver->self_tri_entry_capacity);
+            ok = ok && set_cuda_error(err, "self triangle hash index allocation");
+            err = cudaMalloc(reinterpret_cast<void**>(&solver->self_tri_entry_count), sizeof(int));
+            ok = ok && set_cuda_error(err, "self triangle hash count allocation");
+            if (ok) {
+                ok = ok && set_cuda_error(
+                    cudaMemset(solver->self_tri_heads, 0xff, sizeof(int) * solver->self_tri_hash_table_size),
+                    "self triangle hash reset"
+                );
+                ok = ok && set_cuda_error(cudaMemset(solver->self_tri_entry_count, 0, sizeof(int)), "self triangle hash count reset");
+            }
             if (ok && solver->cfg.self_compaction_enabled) {
                 err = cudaMalloc(reinterpret_cast<void**>(&solver->self_active_samples), sizeof(int) * solver->self_sample_count);
                 ok = ok && set_cuda_error(err, "self active sample allocation");

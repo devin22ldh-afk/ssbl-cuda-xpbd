@@ -13,6 +13,7 @@ import numpy as np
 _EPS = 1.0e-8
 SELF_COLLISION_OFF = 0
 SELF_COLLISION_FAST = 1
+SELF_COLLISION_STRICT = 2
 DEFAULT_HARDNESS = 0.4
 _SOFT_STRETCH_COMPLIANCE = 8.0e-6
 _HARD_STRETCH_COMPLIANCE = 1.0e-9
@@ -822,15 +823,18 @@ def settings_to_options(settings, runtime_mode_override: str | None = None) -> S
     else:
         wall_normal = wall_normal / norm
 
-    mode_name = str(getattr(settings, "self_collision_mode", "off")).lower()
-    if mode_name == "quality":
-        # Legacy scenes/scripts may still store the removed Quality mode.
-        # Keep them usable by running the remaining fast self-collision path.
-        mode_name = "fast"
+    mode_name = str(getattr(settings, "self_collision_mode", "fast")).lower()
+    if mode_name in {"off", "quality"}:
+        # Legacy scenes/scripts may still store removed mode names. Off is now
+        # controlled by self_collision=false; Quality maps to the strict solver.
+        mode_name = "strict" if mode_name == "quality" else "fast"
     self_collision_enabled = bool(getattr(settings, "self_collision", False))
-    if mode_name != "off":
-        self_collision_enabled = True
-    mode_value = SELF_COLLISION_FAST if self_collision_enabled else SELF_COLLISION_OFF
+    if not self_collision_enabled:
+        mode_value = SELF_COLLISION_OFF
+    elif mode_name == "strict":
+        mode_value = SELF_COLLISION_STRICT
+    else:
+        mode_value = SELF_COLLISION_FAST
 
     run_mode = (
         str(runtime_mode_override).lower()
