@@ -55,7 +55,7 @@ class SSBL_PT_physics_panel(bpy.types.Panel):
         if settings.use_volume_pressure:
             sim_box.prop(settings, "pressure_strength")
             sim_box.prop(settings, "volume_target_scale")
-        sim_box.prop(settings, "gravity")
+        sim_box.label(text="Gravity: uses Scene setting", icon="SCENE_DATA")
         sim_box.prop(settings, "use_blender_force_fields")
         if settings.use_blender_force_fields:
             sim_box.prop(settings, "force_field_collection")

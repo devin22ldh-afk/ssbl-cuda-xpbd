@@ -67,6 +67,56 @@ def _apply_hardness(settings, _context):
     sync_hardness_settings(settings)
 
 
+def _scene_for_settings(settings, context=None):
+    if context is not None:
+        scene = getattr(context, "scene", None)
+        if scene is not None:
+            return scene
+
+    owner = getattr(settings, "id_data", None)
+    if owner is not None and isinstance(owner, bpy.types.Scene):
+        return owner
+
+    context_scene = getattr(bpy.context, "scene", None)
+    if owner is not None and isinstance(owner, bpy.types.Object):
+        if context_scene is not None:
+            try:
+                if context_scene.objects.get(owner.name) is owner:
+                    return context_scene
+            except Exception:
+                pass
+        for scene in getattr(bpy.data, "scenes", ()):
+            try:
+                if scene.objects.get(owner.name) is owner:
+                    return scene
+            except Exception:
+                pass
+    return context_scene
+
+
+def _get_scene_gravity(settings):
+    scene = _scene_for_settings(settings)
+    if scene is None:
+        return (0.0, 0.0, -9.8)
+    if hasattr(scene, "use_gravity") and not bool(scene.use_gravity):
+        return (0.0, 0.0, 0.0)
+    gravity = getattr(scene, "gravity", None)
+    if gravity is None:
+        return (0.0, 0.0, -9.8)
+    return tuple(float(component) for component in gravity)
+
+
+def _set_scene_gravity(settings, value):
+    scene = _scene_for_settings(settings)
+    if scene is None or not hasattr(scene, "gravity"):
+        return
+    scene.gravity = tuple(float(component) for component in value)
+    if hasattr(scene, "use_gravity"):
+        has_non_zero_component = any(abs(float(component)) > 1.0e-8 for component in value)
+        if has_non_zero_component and not bool(scene.use_gravity):
+            scene.use_gravity = True
+
+
 _OBJECT_SETTING_COPY_SKIP = {
     "rna_type",
     "enabled",
@@ -372,11 +422,14 @@ class SSBL_PreviewSettings(PropertyGroup):
         description="Run global volume projection every N substeps; 1 preserves the original behavior",
     )
     gravity: FloatVectorProperty(
-        name="重力",
+        name="Gravity",
         default=(0.0, 0.0, -9.8),
         size=3,
         subtype="ACCELERATION",
-        description="世界空间中的重力向量",
+        get=_get_scene_gravity,
+        set=_set_scene_gravity,
+        options={"HIDDEN"},
+        description="Legacy proxy to Blender scene gravity; SSBL now reads scene gravity automatically",
     )
     use_blender_force_fields: BoolProperty(
         name="使用 Blender 力场",
