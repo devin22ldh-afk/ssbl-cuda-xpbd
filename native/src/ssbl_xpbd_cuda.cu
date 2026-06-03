@@ -20,6 +20,7 @@ constexpr float kProjectionRelaxation = 0.35f;
 constexpr float kSelfProjectionRelaxation = 0.40f;
 constexpr float kSelfRecoveryProjectionRelaxation = 0.55f;
 constexpr float kFastSelfProjectionRelaxation = 0.85f;
+constexpr float kFastSelfCleanupProjectionRelaxation = 1.35f;
 constexpr float kFastSelfRecoveryProjectionRelaxation = 0.90f;
 constexpr float kSelfRecoveryVelocityDamping = 0.65f;
 constexpr float kSelfCorrectionMaxDisplacementScale = 0.45f;
@@ -36,6 +37,7 @@ constexpr float kSelfCoarseDistanceMultiplier = 2.5f;
 constexpr float kSelfApproachEps = 1.0e-5f;
 constexpr float kSelfContactDistanceEdgeP10Scale = 0.60f;
 constexpr int kFastSelfCollisionPasses = 2;
+constexpr int kFastSelfTriangleCleanupRuns = 0;
 constexpr int kSelfSleepTargetVerticesPerRegion = 512;
 constexpr int kSelfSleepMaxRegions = 1024;
 constexpr int kSelfSourceFull = 0;
@@ -289,6 +291,7 @@ struct Solver {
     int self_sample_hash_valid = 0;
     int self_samples_per_triangle = kSelfSurfaceSamplesPerTriangleDefault;
     int self_recovery_mode = 0;
+    int self_cleanup_mode = 0;
     long long self_collision_run_count = 0;
     float self_contact_distance_value = 0.0f;
     Vec3* jitter_frame_start_pos = nullptr;
@@ -1762,6 +1765,20 @@ __device__ void apply_self_collision_correction_untracked(Solver solver, int ind
     note_self_region_touch(solver, index);
 }
 
+__device__ void apply_self_collision_correction_without_frontier(Solver solver, int index, Vec3 delta) {
+    if (index < 0 || index >= solver.cfg.vertex_count) {
+        return;
+    }
+    atomic_add(&solver.pos[index], delta);
+    if (!solver.self_recovery_mode) {
+        atomic_add(&solver.prev[index], delta);
+    }
+    note_self_region_touch(solver, index);
+    if (solver.self_recovery_delta) {
+        atomic_add(&solver.self_recovery_delta[index], delta);
+    }
+}
+
 __device__ bool same_or_one_ring_neighbor(Solver solver, int a, int b) {
     if (a == b) {
         return true;
@@ -1906,6 +1923,9 @@ __device__ bool self_should_project_contact(float gap, Vec3 delta, Vec3 previous
 
 __device__ float self_projection_relaxation(Solver solver) {
     if (self_fast_mode(solver)) {
+        if (!solver.self_recovery_mode && solver.self_cleanup_mode) {
+            return kFastSelfCleanupProjectionRelaxation;
+        }
         return solver.self_recovery_mode ? kFastSelfRecoveryProjectionRelaxation : kFastSelfProjectionRelaxation;
     }
     return solver.self_recovery_mode ? kSelfRecoveryProjectionRelaxation : kSelfProjectionRelaxation;
@@ -4362,7 +4382,7 @@ __global__ void self_vertex_triangle_collision_kernel(Solver solver, int project
                                             thickness,
                                             &contact_distance
                                         );
-                                        float coarse_distance = solver.self_recovery_mode ? contact_distance : d_linear;
+                                        float coarse_distance = contact_distance;
                                         if (self_coarse_distance_ok(coarse_distance, thickness)) {
                                             float gap = coarse_distance - thickness;
                                             diag_note_gap(solver, gap);
@@ -4388,7 +4408,11 @@ __global__ void self_vertex_triangle_collision_kernel(Solver solver, int project
                                                         Vec3 correction_x = mul(correction, -wx * wa);
                                                         Vec3 correction_y = mul(correction, -wy * wb);
                                                         Vec3 correction_z = mul(correction, -wz * wc);
-                                                        apply_self_collision_correction(solver, i, correction_i);
+                                                        if (self_fast_mode(solver) && !solver.self_recovery_mode) {
+                                                            apply_self_collision_correction_without_frontier(solver, i, correction_i);
+                                                        } else {
+                                                            apply_self_collision_correction(solver, i, correction_i);
+                                                        }
                                                         apply_self_collision_correction_untracked(solver, tri.x, correction_x);
                                                         apply_self_collision_correction_untracked(solver, tri.y, correction_y);
                                                         apply_self_collision_correction_untracked(solver, tri.z, correction_z);
@@ -6081,6 +6105,7 @@ bool run_self_collision_pass(
     int v_blocks,
     bool recovery_mode,
     bool run_surface_sample_pairs,
+    bool force_full_fast_triangle_source,
     std::vector<TimedSegment>* timings
 ) {
     if (!solver || !solver->self_vert_heads || !solver->self_vert_next) {
@@ -6088,6 +6113,10 @@ bool run_self_collision_pass(
     }
     Solver collision_solver = *solver;
     collision_solver.self_recovery_mode = recovery_mode ? 1 : 0;
+    collision_solver.self_cleanup_mode = force_full_fast_triangle_source ? 1 : 0;
+    if (force_full_fast_triangle_source && collision_solver.cfg.self_collision_mode == kSelfCollisionModeFast) {
+        collision_solver.self_source_mode = kSelfSourceFull;
+    }
     if (!recovery_mode) {
         collision_solver.self_samples_per_triangle = self_fast_surface_sample_count_per_triangle(solver);
         collision_solver.self_sample_count = solver->cfg.triangle_count * collision_solver.self_samples_per_triangle;
@@ -6135,13 +6164,7 @@ bool run_self_collision_pass(
     if (!end_timed_segment(timings, &solve_segment, "end self solve timing")) {
         return false;
     }
-    const bool use_fast_triangle_path = recovery_mode
-        && collision_solver.cfg.self_collision_mode == kSelfCollisionModeFast
-        && solver->self_tri_heads
-        && solver->self_tri_entry_next
-        && solver->self_tri_entry_index
-        && solver->self_tri_entry_count
-        && solver->cfg.triangle_count > 0;
+    const bool use_fast_triangle_path = false;
     if (use_fast_triangle_path) {
         const int triangle_source_count = solver->cfg.triangle_count;
         const int triangle_source_blocks = block_count(std::max(triangle_source_count, 1));
@@ -6424,6 +6447,7 @@ bool run_substep(
     long long* recovery_passes_total,
     long long* local_retry_total,
     bool allow_retry,
+    bool fast_cleanup_substep,
     bool run_jitter_filter,
     std::vector<TimedSegment>* timings
 ) {
@@ -6586,14 +6610,20 @@ bool run_substep(
             ++solver->self_collision_run_count;
             const bool use_source_compaction = solver->self_compaction_used != 0;
             const int solve_source_mode = use_source_compaction ? kSelfSourceActive : kSelfSourceFull;
-            const int probe_source_mode = use_source_compaction ? kSelfSourceSuspect : kSelfSourceFull;
+            const int probe_source_mode = (fast_self_collision && fast_cleanup_substep)
+                ? kSelfSourceFull
+                : (use_source_compaction ? kSelfSourceSuspect : kSelfSourceFull);
             int surface_pair_interval = std::max(solver->cfg.self_surface_pair_interval, 1);
             bool run_surface_pairs = (solver->self_collision_run_count % surface_pair_interval) == 0;
             const int self_collision_passes = fast_self_collision ? kFastSelfCollisionPasses : kSelfCollisionPasses;
             solver->self_source_mode = solve_source_mode;
             for (int self_pass = 0; self_pass < self_collision_passes; ++self_pass) {
-                bool run_surface_sample_pairs = run_surface_pairs && (self_pass == self_collision_passes - 1);
-                if (!run_self_collision_pass(solver, v_blocks, false, run_surface_sample_pairs, timings)) {
+                const bool last_self_pass = self_pass == self_collision_passes - 1;
+                bool run_fast_triangle_slot = fast_self_collision
+                    && last_self_pass
+                    && fast_cleanup_substep;
+                bool run_surface_sample_pairs = (run_surface_pairs || run_fast_triangle_slot) && last_self_pass;
+                if (!run_self_collision_pass(solver, v_blocks, false, run_surface_sample_pairs, run_fast_triangle_slot, timings)) {
                     solver->self_source_mode = kSelfSourceFull;
                     return false;
                 }
@@ -6629,7 +6659,7 @@ bool run_substep(
                     return false;
                 }
                 solver->self_source_mode = probe_source_mode;
-                if (!run_self_collision_pass(solver, v_blocks, true, true, timings)) {
+                if (!run_self_collision_pass(solver, v_blocks, true, true, false, timings)) {
                     solver->self_source_mode = kSelfSourceFull;
                     return false;
                 }
@@ -6661,7 +6691,7 @@ bool run_substep(
                     return false;
                 }
                 solver->self_source_mode = kSelfSourceFull;
-                if (!run_self_collision_pass(solver, v_blocks, true, true, timings)) {
+                if (!run_self_collision_pass(solver, v_blocks, true, true, false, timings)) {
                     return false;
                 }
                 if (!clamp_self_recovery_displacement(
@@ -6692,7 +6722,6 @@ bool run_substep(
                     return false;
                 }
             }
-
             if (allow_retry && strict_self_collision && self_probe_triggers_retry(probe_diag, cloth_thickness)) {
                 if (local_retry_total) {
                     ++(*local_retry_total);
@@ -6717,6 +6746,7 @@ bool run_substep(
                         local_retry_total,
                         false,
                         false,
+                        false,
                         timings)) {
                     return false;
                 }
@@ -6734,6 +6764,7 @@ bool run_substep(
                     p_blocks,
                     recovery_passes_total,
                     local_retry_total,
+                    false,
                     false,
                     false,
                     timings
@@ -7683,6 +7714,7 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
         bool run_volume_pressure = solver->cfg.use_volume_pressure
             && (((s + 1) % volume_interval) == 0 || s == substeps - 1);
         bool run_jitter_filter = solver->cfg.jitter_stabilizer_enabled && s == substeps - 1;
+        bool fast_triangle_cleanup_substep = s >= std::max(0, substeps - interval * kFastSelfTriangleCleanupRuns);
         if (!run_substep(
                 solver,
                 sub_dt,
@@ -7698,6 +7730,7 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
                 &recovery_passes_total,
                 &local_retry_total,
                 true,
+                fast_triangle_cleanup_substep,
                 run_jitter_filter,
                 timing_ptr)) {
             destroy_timing_records(timing_ptr);

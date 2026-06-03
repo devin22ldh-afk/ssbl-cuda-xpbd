@@ -1,0 +1,14 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project>
+  <ProjectOutputs>
+    <ProjectOutput>
+      <FullPath>C:\Users\Administrator\AppData\Roaming\Blender Foundation\Blender\5.0\scripts\addons\ssbl\native\build_candidate\x64\Release\ZERO_CHECK</FullPath>
+    </ProjectOutput>
+    <ProjectOutput>
+      <FullPath>C:\Users\Administrator\AppData\Roaming\Blender Foundation\Blender\5.0\scripts\addons\ssbl\native\bin_candidate\ssbl_xpbd_cuda_abi36_candidate.dll</FullPath>
+    </ProjectOutput>
+  </ProjectOutputs>
+  <ContentFiles />
+  <SatelliteDlls />
+  <NonRecipeFileRefs />
+</Project>
