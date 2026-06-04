@@ -112,6 +112,8 @@ class SSBL_PT_physics_panel(bpy.types.Panel):
             if settings.self_collision:
                 tuning_box.prop(settings, "self_collision_interval")
                 tuning_box.prop(settings, "max_self_collision_neighbors")
+                if str(getattr(settings, "self_collision_mode", "fast")).lower() == "fast":
+                    tuning_box.prop(settings, "fast_self_collision_passes")
                 tuning_box.prop(settings, "self_probe_interval")
                 tuning_box.prop(settings, "self_surface_pair_interval")
                 tuning_box.prop(settings, "self_sleep_enabled")

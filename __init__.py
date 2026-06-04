@@ -34,6 +34,7 @@ def _self_collision_mode_name(settings) -> str:
 def _apply_fast_self_collision_defaults(settings) -> None:
     settings.self_collision_interval = 2
     settings.max_self_collision_neighbors = 32
+    settings.fast_self_collision_passes = 4
     settings.self_probe_interval = 4
     settings.self_surface_pair_interval = 4
     settings.self_sleep_enabled = True
@@ -527,6 +528,14 @@ class SSBL_PreviewSettings(PropertyGroup):
         min=4,
         soft_max=256,
         description="每个顶点或边在自碰撞中允许处理的最大邻居候选数",
+    )
+    fast_self_collision_passes: IntProperty(
+        name="快速自碰撞步数",
+        default=4,
+        min=1,
+        max=8,
+        soft_max=8,
+        description="仅用于 fast 自碰撞模式的 native 自碰撞 pass 数；strict 模式不受影响",
     )
     self_probe_interval: IntProperty(
         name="Self probe interval",

@@ -59,6 +59,7 @@ typedef struct SsblXpbdConfig {
     float contact_friction;
     float contact_tangent_damping;
     float contact_compliance;
+    int fast_self_collision_passes;
 } SsblXpbdConfig;
 
 typedef struct SsblXpbdDiagnostics {
@@ -113,6 +114,42 @@ typedef struct SsblXpbdDiagnostics {
     long long dynamic_triangle_count;
     long long static_triangle_count;
     int finite_flag;
+    long long fast_exact_vt_candidates;
+    long long fast_exact_vt_projected;
+    long long fast_exact_vt_guarded;
+    long long fast_exact_vt_skipped_rest;
+    long long fast_soft_repulsion_candidates;
+    long long fast_soft_repulsion_applied;
+    float fast_soft_repulsion_max_push;
+    long long fast_hard_projection_count;
+    long long fast_manifold_contacts;
+    long long fast_manifold_reused;
+    long long fast_barrier_projected;
+    long long fast_barrier_smoothed_vertices;
+    long long fast_barrier_overflow;
+    float fast_barrier_max_delta;
+    long long fast_edge_edge_candidates;
+    long long fast_edge_edge_contacts;
+    long long fast_triangle_pair_candidates;
+    long long fast_triangle_pair_contacts;
+    long long fast_triangle_pair_skipped_rest;
+    long long fast_contact_classification_guarded;
+    long long fast_region_cluster_candidates;
+    long long fast_region_cluster_contacts;
+    long long fast_region_cluster_guarded;
+    long long fast_overlap_island_candidates;
+    long long fast_overlap_island_clusters;
+    long long fast_overlap_island_vertex_refs;
+    long long fast_overlap_island_applied_vertices;
+    long long fast_overlap_island_guarded;
+    float fast_overlap_island_max_delta;
+    long long fast_cc_overlap_components;
+    long long fast_cc_overlap_seed_triangles;
+    long long fast_cc_overlap_owned_vertices;
+    long long fast_cc_overlap_union_edges;
+    long long fast_cc_overlap_guarded;
+    long long fast_cc_overlap_applied_vertices;
+    float fast_cc_overlap_max_delta;
 } SsblXpbdDiagnostics;
 
 typedef struct SsblXpbdMesh {

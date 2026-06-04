@@ -119,6 +119,10 @@ def _apply_env_overrides(settings):
         if mode == "fast":
             settings.self_collision_interval = int(_float_env("SSBL_RECORD_SELF_COLLISION_INTERVAL", 2))
             settings.max_self_collision_neighbors = int(_float_env("SSBL_RECORD_MAX_SELF_NEIGHBORS", 32))
+            if hasattr(settings, "fast_self_collision_passes"):
+                settings.fast_self_collision_passes = int(
+                    _float_env("SSBL_RECORD_FAST_SELF_COLLISION_PASSES", float(settings.fast_self_collision_passes))
+                )
     if hasattr(settings, "use_volume_pressure"):
         settings.use_volume_pressure = _bool_env("SSBL_RECORD_VOLUME_PRESSURE", bool(settings.use_volume_pressure))
     if hasattr(settings, "volume_compliance"):
@@ -155,6 +159,42 @@ def _snapshot(obj, label, diagnostics):
             "min_gap": None if session_diag.min_gap is None else float(session_diag.min_gap),
             "penetration_depth": float(session_diag.penetration_depth),
             "ccd_clamp_count": int(session_diag.ccd_clamp_count),
+            "fast_exact_vt_candidates": int(session_diag.fast_exact_vt_candidates),
+            "fast_exact_vt_projected": int(session_diag.fast_exact_vt_projected),
+            "fast_exact_vt_guarded": int(session_diag.fast_exact_vt_guarded),
+            "fast_exact_vt_skipped_rest": int(session_diag.fast_exact_vt_skipped_rest),
+            "fast_soft_repulsion_candidates": int(session_diag.fast_soft_repulsion_candidates),
+            "fast_soft_repulsion_applied": int(session_diag.fast_soft_repulsion_applied),
+            "fast_soft_repulsion_max_push": float(session_diag.fast_soft_repulsion_max_push),
+            "fast_hard_projection_count": int(session_diag.fast_hard_projection_count),
+            "fast_manifold_contacts": int(session_diag.fast_manifold_contacts),
+            "fast_manifold_reused": int(session_diag.fast_manifold_reused),
+            "fast_barrier_projected": int(session_diag.fast_barrier_projected),
+            "fast_barrier_smoothed_vertices": int(session_diag.fast_barrier_smoothed_vertices),
+            "fast_barrier_overflow": int(session_diag.fast_barrier_overflow),
+            "fast_barrier_max_delta": float(session_diag.fast_barrier_max_delta),
+            "fast_edge_edge_candidates": int(session_diag.fast_edge_edge_candidates),
+            "fast_edge_edge_contacts": int(session_diag.fast_edge_edge_contacts),
+            "fast_triangle_pair_candidates": int(session_diag.fast_triangle_pair_candidates),
+            "fast_triangle_pair_contacts": int(session_diag.fast_triangle_pair_contacts),
+            "fast_triangle_pair_skipped_rest": int(session_diag.fast_triangle_pair_skipped_rest),
+            "fast_contact_classification_guarded": int(session_diag.fast_contact_classification_guarded),
+            "fast_region_cluster_candidates": int(session_diag.fast_region_cluster_candidates),
+            "fast_region_cluster_contacts": int(session_diag.fast_region_cluster_contacts),
+            "fast_region_cluster_guarded": int(session_diag.fast_region_cluster_guarded),
+            "fast_overlap_island_candidates": int(session_diag.fast_overlap_island_candidates),
+            "fast_overlap_island_clusters": int(session_diag.fast_overlap_island_clusters),
+            "fast_overlap_island_vertex_refs": int(session_diag.fast_overlap_island_vertex_refs),
+            "fast_overlap_island_applied_vertices": int(session_diag.fast_overlap_island_applied_vertices),
+            "fast_overlap_island_guarded": int(session_diag.fast_overlap_island_guarded),
+            "fast_overlap_island_max_delta": float(session_diag.fast_overlap_island_max_delta),
+            "fast_cc_overlap_components": int(session_diag.fast_cc_overlap_components),
+            "fast_cc_overlap_seed_triangles": int(session_diag.fast_cc_overlap_seed_triangles),
+            "fast_cc_overlap_owned_vertices": int(session_diag.fast_cc_overlap_owned_vertices),
+            "fast_cc_overlap_union_edges": int(session_diag.fast_cc_overlap_union_edges),
+            "fast_cc_overlap_guarded": int(session_diag.fast_cc_overlap_guarded),
+            "fast_cc_overlap_applied_vertices": int(session_diag.fast_cc_overlap_applied_vertices),
+            "fast_cc_overlap_max_delta": float(session_diag.fast_cc_overlap_max_delta),
             "recovery_passes": int(session_diag.recovery_passes),
             "local_retry_count": int(session_diag.local_retry_count),
             "finite_flag": int(session_diag.finite),
@@ -231,6 +271,7 @@ def main():
         "created_pin_group_for_test": created_pin,
         "output_dir": str(output_dir),
         "frames_dir": str(frames_dir),
+        "fast_self_collision_passes": int(getattr(settings, "fast_self_collision_passes", 4)),
         "diagnostics": diagnostics,
         "frame_paths": [str(path) for path in sorted(frames_dir.glob("*.*")) if path.suffix.lower() in {".png", ".jpg", ".jpeg"}],
     }

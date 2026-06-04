@@ -19,7 +19,7 @@ constexpr float kEps = 1.0e-8f;
 constexpr float kProjectionRelaxation = 0.35f;
 constexpr float kSelfProjectionRelaxation = 0.40f;
 constexpr float kSelfRecoveryProjectionRelaxation = 0.55f;
-constexpr float kFastSelfProjectionRelaxation = 0.85f;
+constexpr float kFastSelfProjectionRelaxation = 0.45f;
 constexpr float kFastSelfCleanupProjectionRelaxation = 1.35f;
 constexpr float kFastSelfRecoveryProjectionRelaxation = 0.90f;
 constexpr float kSelfRecoveryVelocityDamping = 0.65f;
@@ -36,7 +36,7 @@ constexpr int kLargeMeshSelfTriangleThreshold = 150000;
 constexpr float kSelfCoarseDistanceMultiplier = 2.5f;
 constexpr float kSelfApproachEps = 1.0e-5f;
 constexpr float kSelfContactDistanceEdgeP10Scale = 0.60f;
-constexpr int kFastSelfCollisionPasses = 2;
+constexpr int kFastSelfCollisionPasses = 4;
 constexpr int kFastSelfTriangleCleanupRuns = 0;
 constexpr int kSelfSleepTargetVerticesPerRegion = 512;
 constexpr int kSelfSleepMaxRegions = 1024;
@@ -3625,21 +3625,37 @@ __global__ void self_edge_edge_collision_kernel(Solver solver) {
                                         }
                                         contact_distance = 0.0f;
                                     }
-                                    if (self_should_project_contact(gap, delta, previous_delta, normal)) {
+                                    float onset = thickness * 1.8f;
+                                    bool allow_soft = self_fast_mode(solver) && (contact_distance < onset);
+                                    bool allow_exact = (gap < 0.0f) && self_should_project_contact(gap, delta, previous_delta, normal);
+                                    
+                                    if (allow_soft || allow_exact) {
                                         diag_note_effective_candidate(solver);
                                         ++candidates;
-                                        if (gap < 0.0f) {
-                                            float ca0 = 1.0f - s;
-                                            float ca1 = s;
-                                            float cb0 = 1.0f - t;
-                                            float cb1 = t;
-                                            float wb0_mass = solver.inv_mass[edge_b.x];
-                                            float wb1_mass = solver.inv_mass[edge_b.y];
-                                            float total = ca0 * ca0 * wx0
-                                                + ca1 * ca1 * wx1
-                                                + cb0 * cb0 * wb0_mass
-                                                + cb1 * cb1 * wb1_mass;
-                                            if (total > 0.0f) {
+                                        float ca0 = 1.0f - s;
+                                        float ca1 = s;
+                                        float cb0 = 1.0f - t;
+                                        float cb1 = t;
+                                        float wb0_mass = solver.inv_mass[edge_b.x];
+                                        float wb1_mass = solver.inv_mass[edge_b.y];
+                                        float total = ca0 * ca0 * wx0
+                                            + ca1 * ca1 * wx1
+                                            + cb0 * cb0 * wb0_mass
+                                            + cb1 * cb1 * wb1_mass;
+                                            
+                                        if (total > 0.0f) {
+                                            if (allow_soft) {
+                                                float x = 1.0f - (contact_distance / onset);
+                                                float push_mag = thickness * 0.12f * x * x;
+                                                if (push_mag > kEps) {
+                                                    Vec3 impulse = mul(normal, push_mag / total);
+                                                    atomic_add(&solver.prev[edge_a.x], mul(impulse, -wx0 * ca0));
+                                                    atomic_add(&solver.prev[edge_a.y], mul(impulse, -wx1 * ca1));
+                                                    atomic_add(&solver.prev[edge_b.x], mul(impulse, wb0_mass * cb0));
+                                                    atomic_add(&solver.prev[edge_b.y], mul(impulse, wb1_mass * cb1));
+                                                }
+                                            }
+                                            if (allow_exact) {
                                                 Vec3 correction = mul(normal, self_projection_relaxation(solver) * (thickness - contact_distance) / total);
                                                 apply_self_collision_correction(solver, edge_a.x, mul(correction, wx0 * ca0));
                                                 apply_self_collision_correction(solver, edge_a.y, mul(correction, wx1 * ca1));
@@ -4467,6 +4483,9 @@ __global__ void self_vertex_surface_collision_kernel(Solver solver) {
     int base_y = cell_coord(p.y, cell_size);
     int base_z = cell_coord(p.z, cell_size);
 
+    Vec3 local_pos_correction_sum = {0.0f, 0.0f, 0.0f};
+    int local_pos_correction_count = 0;
+
     for (int dz = -1; dz <= 1; ++dz) {
         for (int dy = -1; dy <= 1; ++dy) {
             for (int dx = -1; dx <= 1; ++dx) {
@@ -4520,7 +4539,11 @@ __global__ void self_vertex_surface_collision_kernel(Solver solver) {
                             thickness,
                             &d
                         );
-                        if (!self_should_project_contact(gap, delta, previous_delta, normal)) {
+                        float onset = thickness * 1.8f;
+                        bool allow_soft = self_fast_mode(solver) && (d < onset);
+                        bool allow_exact = (gap < 0.0f) && self_should_project_contact(gap, delta, previous_delta, normal);
+                        
+                        if (!allow_soft && !allow_exact) {
                             sample = solver.self_sample_next[sample];
                             continue;
                         }
@@ -4529,13 +4552,26 @@ __global__ void self_vertex_surface_collision_kernel(Solver solver) {
                         if (gap < 0.0f && dot(previous_delta, surface_normal) * dot(delta, surface_normal) < 0.0f) {
                             diag_note_ccd(solver);
                         }
-                        if (gap < 0.0f) {
-                            float wx = solver.inv_mass[tri.x];
-                            float wy = solver.inv_mass[tri.y];
-                            float wz = solver.inv_mass[tri.z];
-                            float sample_weight = weighted_inv_mass(solver, tri, wa, wb, wc);
-                            float total = wi + sample_weight;
-                            if (total > 0.0f) {
+                        
+                        float wx = solver.inv_mass[tri.x];
+                        float wy = solver.inv_mass[tri.y];
+                        float wz = solver.inv_mass[tri.z];
+                        float sample_weight = weighted_inv_mass(solver, tri, wa, wb, wc);
+                        float total = wi + sample_weight;
+                        
+                        if (total > 0.0f) {
+                            if (allow_soft) {
+                                float x = 1.0f - (d / onset);
+                                float push_mag = thickness * 0.12f * x * x;
+                                if (push_mag > kEps) {
+                                    Vec3 impulse = mul(normal, push_mag / total);
+                                    atomic_add(&solver.prev[i], mul(impulse, -wi));
+                                    atomic_add(&solver.prev[tri.x], mul(impulse, wx * wa));
+                                    atomic_add(&solver.prev[tri.y], mul(impulse, wy * wb));
+                                    atomic_add(&solver.prev[tri.z], mul(impulse, wz * wc));
+                                }
+                            }
+                            if (allow_exact) {
                                 Vec3 correction = mul(normal, self_projection_relaxation(solver) * (thickness - d) / total);
                                 if (solver.self_sample_hash_dirty) {
                                     atomicExch(solver.self_sample_hash_dirty, 1);
@@ -4544,7 +4580,8 @@ __global__ void self_vertex_surface_collision_kernel(Solver solver) {
                                 Vec3 correction_x = mul(correction, -wx * wa);
                                 Vec3 correction_y = mul(correction, -wy * wb);
                                 Vec3 correction_z = mul(correction, -wz * wc);
-                                apply_self_collision_correction(solver, i, correction_i);
+                                local_pos_correction_sum = add(local_pos_correction_sum, correction_i);
+                                local_pos_correction_count++;
                                 apply_self_collision_correction(solver, tri.x, correction_x);
                                 apply_self_collision_correction(solver, tri.y, correction_y);
                                 apply_self_collision_correction(solver, tri.z, correction_z);
@@ -4556,6 +4593,9 @@ __global__ void self_vertex_surface_collision_kernel(Solver solver) {
                 }
             }
         }
+    }
+    if (local_pos_correction_count > 0) {
+        apply_self_collision_correction(solver, i, mul(local_pos_correction_sum, 1.0f / local_pos_correction_count));
     }
 }
 
@@ -4665,7 +4705,11 @@ __global__ void self_surface_sample_collision_kernel(Solver solver) {
                                 thickness,
                                 &d
                             );
-                            if (!self_should_project_contact(gap, delta, previous_delta, normal)) {
+                            float onset = thickness * 1.8f;
+                            bool allow_soft = self_fast_mode(solver) && (d < onset);
+                            bool allow_exact = (gap < 0.0f) && self_should_project_contact(gap, delta, previous_delta, normal);
+                            
+                            if (!allow_soft && !allow_exact) {
                                 sample_b = solver.self_sample_next[sample_b];
                                 continue;
                             }
@@ -4674,10 +4718,25 @@ __global__ void self_surface_sample_collision_kernel(Solver solver) {
                             if (gap < 0.0f && dot(previous_delta, surface_normal) * dot(delta, surface_normal) < 0.0f) {
                                 diag_note_ccd(solver);
                             }
-                            if (gap < 0.0f) {
-                                float sample_weight_b = weighted_inv_mass(solver, tri_b, ba, bb, bc);
-                                float total = sample_weight_a + sample_weight_b;
-                                if (total > 0.0f) {
+                            
+                            float sample_weight_b = weighted_inv_mass(solver, tri_b, ba, bb, bc);
+                            float total = sample_weight_a + sample_weight_b;
+                            
+                            if (total > 0.0f) {
+                                if (allow_soft) {
+                                    float x = 1.0f - (d / onset);
+                                    float push_mag = thickness * 0.12f * x * x;
+                                    if (push_mag > kEps) {
+                                        Vec3 impulse = mul(normal, push_mag / total);
+                                        atomic_add(&solver.prev[tri_a.x], mul(impulse, -solver.inv_mass[tri_a.x] * aa));
+                                        atomic_add(&solver.prev[tri_a.y], mul(impulse, -solver.inv_mass[tri_a.y] * ab));
+                                        atomic_add(&solver.prev[tri_a.z], mul(impulse, -solver.inv_mass[tri_a.z] * ac));
+                                        atomic_add(&solver.prev[tri_b.x], mul(impulse, solver.inv_mass[tri_b.x] * ba));
+                                        atomic_add(&solver.prev[tri_b.y], mul(impulse, solver.inv_mass[tri_b.y] * bb));
+                                        atomic_add(&solver.prev[tri_b.z], mul(impulse, solver.inv_mass[tri_b.z] * bc));
+                                    }
+                                }
+                                if (allow_exact) {
                                     Vec3 correction = mul(normal, self_projection_relaxation(solver) * (thickness - d) / total);
                                     Vec3 correction_ax = mul(correction, solver.inv_mass[tri_a.x] * aa);
                                     Vec3 correction_ay = mul(correction, solver.inv_mass[tri_a.y] * ab);

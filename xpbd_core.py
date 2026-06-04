@@ -52,6 +52,7 @@ class SolverOptions:
     cloth_thickness: float
     self_collision_interval: int
     max_self_collision_neighbors: int
+    fast_self_collision_passes: int
     use_volume_pressure: bool
     volume_compliance: float
     pressure_strength: float
@@ -882,6 +883,7 @@ def settings_to_options(settings, runtime_mode_override: str | None = None) -> S
         cloth_thickness=float(getattr(settings, "cloth_thickness", 0.02)),
         self_collision_interval=max(int(getattr(settings, "self_collision_interval", 2)), 1),
         max_self_collision_neighbors=max(int(getattr(settings, "max_self_collision_neighbors", 32)), 4),
+        fast_self_collision_passes=min(max(int(getattr(settings, "fast_self_collision_passes", 4)), 1), 8),
         use_volume_pressure=bool(getattr(settings, "use_volume_pressure", False)),
         volume_compliance=float(getattr(settings, "volume_compliance", 1e-6)),
         pressure_strength=max(float(getattr(settings, "pressure_strength", 1.0)), 0.0),

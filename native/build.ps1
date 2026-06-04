@@ -1,7 +1,9 @@
 param(
     [ValidateSet("Release", "Debug")]
     [string]$Config = "Release",
-    [string]$CudaRoot = ""
+    [string]$CudaRoot = "",
+    [string]$OutputName = "ssbl_xpbd_cuda_abi36",
+    [string]$OutputDir = "bin"
 )
 
 $ErrorActionPreference = "Stop"
@@ -130,13 +132,14 @@ if (-not $vsDevCmd) {
 $cudaBin = Join-Path $cudaRoot "bin"
 $cudaToolkitDir = $cudaRoot.TrimEnd('\') + "\"
 $tempCmd = Join-Path ([System.IO.Path]::GetTempPath()) ("ssbl_cuda_build_{0}.cmd" -f ([System.Guid]::NewGuid().ToString("N")))
+$outputDirPath = Join-Path $Root $OutputDir
 $lines = @(
     "@echo off",
     "call ""$vsDevCmd"" -arch=x64 -host_arch=x64 || exit /b 1",
     "set ""PATH=$(Split-Path -Parent $cmake);$cudaBin;%PATH%""",
     "set ""CUDA_PATH=$cudaRoot""",
     "set ""CudaToolkitDir=$cudaToolkitDir""",
-    """$cmake"" -S ""$Root"" -B ""$BuildDir"" -G ""Visual Studio 17 2022"" -A x64 -T ""cuda=$cudaRoot"" -DCMAKE_CUDA_COMPILER=""$cudaBin\nvcc.exe"" -DSSBL_CUDA_OUTPUT_NAME=ssbl_xpbd_cuda_abi36 || exit /b 1",
+    """$cmake"" -S ""$Root"" -B ""$BuildDir"" -G ""Visual Studio 17 2022"" -A x64 -T ""cuda=$cudaRoot"" -DCMAKE_CUDA_COMPILER=""$cudaBin\nvcc.exe"" -DSSBL_CUDA_OUTPUT_NAME=""$OutputName"" -DSSBL_CUDA_OUTPUT_DIR=""$outputDirPath"" || exit /b 1",
     """$cmake"" --build ""$BuildDir"" --config $Config || exit /b 1"
 )
 
@@ -150,7 +153,7 @@ try {
     Remove-Item -LiteralPath $tempCmd -Force -ErrorAction SilentlyContinue
 }
 
-$dllPath = Join-Path $Root "bin\ssbl_xpbd_cuda_abi36.dll"
+$dllPath = Join-Path $outputDirPath "$OutputName.dll"
 if (-not (Test-Path -LiteralPath $dllPath)) {
     throw "Build completed but DLL was not found at $dllPath."
 }

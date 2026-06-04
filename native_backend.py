@@ -67,6 +67,7 @@ class _NativeConfig(ctypes.Structure):
         ("contact_friction", ctypes.c_float),
         ("contact_tangent_damping", ctypes.c_float),
         ("contact_compliance", ctypes.c_float),
+        ("fast_self_collision_passes", ctypes.c_int),
     ]
 
 
@@ -212,6 +213,42 @@ class _NativeDiagnostics(ctypes.Structure):
         ("dynamic_triangle_count", ctypes.c_longlong),
         ("static_triangle_count", ctypes.c_longlong),
         ("finite_flag", ctypes.c_int),
+        ("fast_exact_vt_candidates", ctypes.c_longlong),
+        ("fast_exact_vt_projected", ctypes.c_longlong),
+        ("fast_exact_vt_guarded", ctypes.c_longlong),
+        ("fast_exact_vt_skipped_rest", ctypes.c_longlong),
+        ("fast_soft_repulsion_candidates", ctypes.c_longlong),
+        ("fast_soft_repulsion_applied", ctypes.c_longlong),
+        ("fast_soft_repulsion_max_push", ctypes.c_float),
+        ("fast_hard_projection_count", ctypes.c_longlong),
+        ("fast_manifold_contacts", ctypes.c_longlong),
+        ("fast_manifold_reused", ctypes.c_longlong),
+        ("fast_barrier_projected", ctypes.c_longlong),
+        ("fast_barrier_smoothed_vertices", ctypes.c_longlong),
+        ("fast_barrier_overflow", ctypes.c_longlong),
+        ("fast_barrier_max_delta", ctypes.c_float),
+        ("fast_edge_edge_candidates", ctypes.c_longlong),
+        ("fast_edge_edge_contacts", ctypes.c_longlong),
+        ("fast_triangle_pair_candidates", ctypes.c_longlong),
+        ("fast_triangle_pair_contacts", ctypes.c_longlong),
+        ("fast_triangle_pair_skipped_rest", ctypes.c_longlong),
+        ("fast_contact_classification_guarded", ctypes.c_longlong),
+        ("fast_region_cluster_candidates", ctypes.c_longlong),
+        ("fast_region_cluster_contacts", ctypes.c_longlong),
+        ("fast_region_cluster_guarded", ctypes.c_longlong),
+        ("fast_overlap_island_candidates", ctypes.c_longlong),
+        ("fast_overlap_island_clusters", ctypes.c_longlong),
+        ("fast_overlap_island_vertex_refs", ctypes.c_longlong),
+        ("fast_overlap_island_applied_vertices", ctypes.c_longlong),
+        ("fast_overlap_island_guarded", ctypes.c_longlong),
+        ("fast_overlap_island_max_delta", ctypes.c_float),
+        ("fast_cc_overlap_components", ctypes.c_longlong),
+        ("fast_cc_overlap_seed_triangles", ctypes.c_longlong),
+        ("fast_cc_overlap_owned_vertices", ctypes.c_longlong),
+        ("fast_cc_overlap_union_edges", ctypes.c_longlong),
+        ("fast_cc_overlap_guarded", ctypes.c_longlong),
+        ("fast_cc_overlap_applied_vertices", ctypes.c_longlong),
+        ("fast_cc_overlap_max_delta", ctypes.c_float),
     ]
 
 
@@ -275,6 +312,42 @@ class NativeStepDiagnostics:
     dynamic_triangle_count: int = 0
     static_triangle_count: int = 0
     finite: bool = True
+    fast_exact_vt_candidates: int = 0
+    fast_exact_vt_projected: int = 0
+    fast_exact_vt_guarded: int = 0
+    fast_exact_vt_skipped_rest: int = 0
+    fast_soft_repulsion_candidates: int = 0
+    fast_soft_repulsion_applied: int = 0
+    fast_soft_repulsion_max_push: float = 0.0
+    fast_hard_projection_count: int = 0
+    fast_manifold_contacts: int = 0
+    fast_manifold_reused: int = 0
+    fast_barrier_projected: int = 0
+    fast_barrier_smoothed_vertices: int = 0
+    fast_barrier_overflow: int = 0
+    fast_barrier_max_delta: float = 0.0
+    fast_edge_edge_candidates: int = 0
+    fast_edge_edge_contacts: int = 0
+    fast_triangle_pair_candidates: int = 0
+    fast_triangle_pair_contacts: int = 0
+    fast_triangle_pair_skipped_rest: int = 0
+    fast_contact_classification_guarded: int = 0
+    fast_region_cluster_candidates: int = 0
+    fast_region_cluster_contacts: int = 0
+    fast_region_cluster_guarded: int = 0
+    fast_overlap_island_candidates: int = 0
+    fast_overlap_island_clusters: int = 0
+    fast_overlap_island_vertex_refs: int = 0
+    fast_overlap_island_applied_vertices: int = 0
+    fast_overlap_island_guarded: int = 0
+    fast_overlap_island_max_delta: float = 0.0
+    fast_cc_overlap_components: int = 0
+    fast_cc_overlap_seed_triangles: int = 0
+    fast_cc_overlap_owned_vertices: int = 0
+    fast_cc_overlap_union_edges: int = 0
+    fast_cc_overlap_guarded: int = 0
+    fast_cc_overlap_applied_vertices: int = 0
+    fast_cc_overlap_max_delta: float = 0.0
     frame_ms: float = 0.0
     frame_set_ms: float = 0.0
     input_refresh_ms: float = 0.0
@@ -468,6 +541,7 @@ def _config_from_options(
     cfg.contact_friction = float(getattr(options, "contact_friction", 0.35))
     cfg.contact_tangent_damping = float(getattr(options, "contact_tangent_damping", 0.2))
     cfg.contact_compliance = float(getattr(options, "contact_compliance", 0.0))
+    cfg.fast_self_collision_passes = int(getattr(options, "fast_self_collision_passes", 4))
     return cfg
 
 
@@ -826,6 +900,42 @@ class NativeXpbdSolver:
             dynamic_triangle_count=int(raw.dynamic_triangle_count),
             static_triangle_count=int(raw.static_triangle_count),
             finite=bool(raw.finite_flag),
+            fast_exact_vt_candidates=int(raw.fast_exact_vt_candidates),
+            fast_exact_vt_projected=int(raw.fast_exact_vt_projected),
+            fast_exact_vt_guarded=int(raw.fast_exact_vt_guarded),
+            fast_exact_vt_skipped_rest=int(raw.fast_exact_vt_skipped_rest),
+            fast_soft_repulsion_candidates=int(raw.fast_soft_repulsion_candidates),
+            fast_soft_repulsion_applied=int(raw.fast_soft_repulsion_applied),
+            fast_soft_repulsion_max_push=float(raw.fast_soft_repulsion_max_push),
+            fast_hard_projection_count=int(raw.fast_hard_projection_count),
+            fast_manifold_contacts=int(raw.fast_manifold_contacts),
+            fast_manifold_reused=int(raw.fast_manifold_reused),
+            fast_barrier_projected=int(raw.fast_barrier_projected),
+            fast_barrier_smoothed_vertices=int(raw.fast_barrier_smoothed_vertices),
+            fast_barrier_overflow=int(raw.fast_barrier_overflow),
+            fast_barrier_max_delta=float(raw.fast_barrier_max_delta),
+            fast_edge_edge_candidates=int(raw.fast_edge_edge_candidates),
+            fast_edge_edge_contacts=int(raw.fast_edge_edge_contacts),
+            fast_triangle_pair_candidates=int(raw.fast_triangle_pair_candidates),
+            fast_triangle_pair_contacts=int(raw.fast_triangle_pair_contacts),
+            fast_triangle_pair_skipped_rest=int(raw.fast_triangle_pair_skipped_rest),
+            fast_contact_classification_guarded=int(raw.fast_contact_classification_guarded),
+            fast_region_cluster_candidates=int(raw.fast_region_cluster_candidates),
+            fast_region_cluster_contacts=int(raw.fast_region_cluster_contacts),
+            fast_region_cluster_guarded=int(raw.fast_region_cluster_guarded),
+            fast_overlap_island_candidates=int(raw.fast_overlap_island_candidates),
+            fast_overlap_island_clusters=int(raw.fast_overlap_island_clusters),
+            fast_overlap_island_vertex_refs=int(raw.fast_overlap_island_vertex_refs),
+            fast_overlap_island_applied_vertices=int(raw.fast_overlap_island_applied_vertices),
+            fast_overlap_island_guarded=int(raw.fast_overlap_island_guarded),
+            fast_overlap_island_max_delta=float(raw.fast_overlap_island_max_delta),
+            fast_cc_overlap_components=int(raw.fast_cc_overlap_components),
+            fast_cc_overlap_seed_triangles=int(raw.fast_cc_overlap_seed_triangles),
+            fast_cc_overlap_owned_vertices=int(raw.fast_cc_overlap_owned_vertices),
+            fast_cc_overlap_union_edges=int(raw.fast_cc_overlap_union_edges),
+            fast_cc_overlap_guarded=int(raw.fast_cc_overlap_guarded),
+            fast_cc_overlap_applied_vertices=int(raw.fast_cc_overlap_applied_vertices),
+            fast_cc_overlap_max_delta=float(raw.fast_cc_overlap_max_delta),
         )
         self._last_diagnostics = diag
         return diag
