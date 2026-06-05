@@ -172,6 +172,13 @@ typedef struct SsblXpbdDiagnostics {
     float static_sdf_build_ms;
     long long static_sdf_contact_count;
     long long static_sdf_unsigned_fallback_count;
+    long long abi41_pcg_iterations;
+    long long abi41_pcg_guarded;
+    long long abi41_pcg_csr_nnz;
+    long long abi41_pcg_texture_ready;
+    float abi41_pcg_initial_residual;
+    float abi41_pcg_final_residual;
+    float abi41_pcg_max_delta;
 } SsblXpbdDiagnostics;
 
 typedef struct SsblXpbdMesh {

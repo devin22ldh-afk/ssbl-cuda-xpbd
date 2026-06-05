@@ -297,6 +297,13 @@ def record_viewport_tag_ms(object_name: str, elapsed_ms: float) -> None:
         static_sdf_build_ms=diag.static_sdf_build_ms,
         static_sdf_contact_count=diag.static_sdf_contact_count,
         static_sdf_unsigned_fallback_count=diag.static_sdf_unsigned_fallback_count,
+        abi41_pcg_iterations=diag.abi41_pcg_iterations,
+        abi41_pcg_guarded=diag.abi41_pcg_guarded,
+        abi41_pcg_csr_nnz=diag.abi41_pcg_csr_nnz,
+        abi41_pcg_texture_ready=diag.abi41_pcg_texture_ready,
+        abi41_pcg_initial_residual=diag.abi41_pcg_initial_residual,
+        abi41_pcg_final_residual=diag.abi41_pcg_final_residual,
+        abi41_pcg_max_delta=diag.abi41_pcg_max_delta,
         frame_ms=diag.frame_ms,
         frame_set_ms=diag.frame_set_ms,
         input_refresh_ms=diag.input_refresh_ms,
@@ -2244,6 +2251,13 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
     static_sdf_build_ms = 0.0
     static_sdf_contact_count = 0
     static_sdf_unsigned_fallback_count = 0
+    abi41_pcg_iterations = 0
+    abi41_pcg_guarded = 0
+    abi41_pcg_csr_nnz = 0
+    abi41_pcg_texture_ready = 0
+    abi41_pcg_initial_residual = 0.0
+    abi41_pcg_final_residual = 0.0
+    abi41_pcg_max_delta = 0.0
     finite = True
     writeback_performed = False
     diag_started = time.perf_counter()
@@ -2348,6 +2362,13 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
         static_sdf_build_ms += float(diag.static_sdf_build_ms)
         static_sdf_contact_count += int(diag.static_sdf_contact_count)
         static_sdf_unsigned_fallback_count += int(diag.static_sdf_unsigned_fallback_count)
+        abi41_pcg_iterations += int(diag.abi41_pcg_iterations)
+        abi41_pcg_guarded += int(diag.abi41_pcg_guarded)
+        abi41_pcg_csr_nnz = max(abi41_pcg_csr_nnz, int(diag.abi41_pcg_csr_nnz))
+        abi41_pcg_texture_ready = max(abi41_pcg_texture_ready, int(diag.abi41_pcg_texture_ready))
+        abi41_pcg_initial_residual = max(abi41_pcg_initial_residual, float(diag.abi41_pcg_initial_residual))
+        abi41_pcg_final_residual = max(abi41_pcg_final_residual, float(diag.abi41_pcg_final_residual))
+        abi41_pcg_max_delta = max(abi41_pcg_max_delta, float(diag.abi41_pcg_max_delta))
         finite = finite and bool(diag.finite)
         writeback_performed = writeback_performed or bool(diag.writeback_performed)
         if diag.min_gap is not None:
@@ -2455,6 +2476,13 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
         static_sdf_build_ms=static_sdf_build_ms,
         static_sdf_contact_count=static_sdf_contact_count,
         static_sdf_unsigned_fallback_count=static_sdf_unsigned_fallback_count,
+        abi41_pcg_iterations=abi41_pcg_iterations,
+        abi41_pcg_guarded=abi41_pcg_guarded,
+        abi41_pcg_csr_nnz=abi41_pcg_csr_nnz,
+        abi41_pcg_texture_ready=abi41_pcg_texture_ready,
+        abi41_pcg_initial_residual=abi41_pcg_initial_residual,
+        abi41_pcg_final_residual=abi41_pcg_final_residual,
+        abi41_pcg_max_delta=abi41_pcg_max_delta,
         finite=finite,
         frame_ms=perf.frame_ms if perf is not None else 0.0,
         frame_set_ms=perf.frame_set_ms if perf is not None else 0.0,

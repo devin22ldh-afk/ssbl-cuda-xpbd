@@ -105,6 +105,19 @@ def _run_case(hardness: float):
         raise RuntimeError("preview did not write back vertex movement")
     if restore_delta > 1.0e-7:
         raise RuntimeError(f"preview did not restore source mesh: {restore_delta}")
+    if options.stretch_optimization_enabled:
+        if int(getattr(diagnostics, "abi41_pcg_csr_nnz", 0)) <= 0:
+            raise RuntimeError("PCG stretch optimization produced an empty CSR")
+        if int(getattr(diagnostics, "abi41_pcg_texture_ready", 0)) != 1:
+            raise RuntimeError("PCG stretch optimization texture was not ready")
+        initial = float(getattr(diagnostics, "abi41_pcg_initial_residual", 0.0))
+        final = float(getattr(diagnostics, "abi41_pcg_final_residual", 0.0))
+        if initial > 0.0 and int(getattr(diagnostics, "abi41_pcg_iterations", 0)) <= 0:
+            raise RuntimeError("PCG stretch optimization had residual but did not iterate")
+        if initial > 0.0 and not (final < initial):
+            raise RuntimeError(
+                f"PCG residual did not decrease: initial={initial:.8f} final={final:.8f}"
+            )
 
     return {
         "hardness": float(hardness),
@@ -114,6 +127,12 @@ def _run_case(hardness: float):
         "preview_delta": preview_delta,
         "restore_delta": restore_delta,
         "step_ms": float(diagnostics.step_ms),
+        "pcg_iterations": int(getattr(diagnostics, "abi41_pcg_iterations", 0)),
+        "pcg_csr_nnz": int(getattr(diagnostics, "abi41_pcg_csr_nnz", 0)),
+        "pcg_texture_ready": int(getattr(diagnostics, "abi41_pcg_texture_ready", 0)),
+        "pcg_initial_residual": float(getattr(diagnostics, "abi41_pcg_initial_residual", 0.0)),
+        "pcg_final_residual": float(getattr(diagnostics, "abi41_pcg_final_residual", 0.0)),
+        "pcg_max_delta": float(getattr(diagnostics, "abi41_pcg_max_delta", 0.0)),
     }
 
 

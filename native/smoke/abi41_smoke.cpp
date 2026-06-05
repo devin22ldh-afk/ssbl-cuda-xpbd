@@ -601,7 +601,8 @@ int run_hard_stretch_case(
     const std::vector<float>& inv_mass,
     const std::vector<float>& start_positions,
     bool enabled,
-    std::vector<float>* out_positions
+    std::vector<float>* out_positions,
+    SsblXpbdDiagnostics* out_diag = nullptr
 ) {
     std::vector<int> edges = {0, 1};
     std::vector<float> rest_lengths = {1.0f};
@@ -656,6 +657,106 @@ int run_hard_stretch_case(
         std::fprintf(stderr, "SSBL_ABI41_HARD_STRETCH_ERROR non-finite output\n");
         return 55;
     }
+    if (out_diag) {
+        *out_diag = diag;
+    }
+    return 0;
+}
+
+int run_hard_stretch_chain_pcg_smoke() {
+    const std::vector<float> rest_positions = {
+        0.0f, 0.0f, 0.0f,
+        1.0f, 0.0f, 0.0f,
+        2.0f, 0.0f, 0.0f,
+        3.0f, 0.0f, 0.0f,
+    };
+    const std::vector<float> start_positions = {
+        0.0f, 0.0f, 0.0f,
+        1.0f, 0.0f, 0.0f,
+        2.0f, 0.0f, 0.0f,
+        5.0f, 0.0f, 0.0f,
+    };
+    const std::vector<float> inv_mass = {0.0f, 1.0f, 1.0f, 1.0f};
+    std::vector<int> edges = {
+        0, 1,
+        1, 2,
+        2, 3,
+    };
+    std::vector<float> rest_lengths = {1.0f, 1.0f, 1.0f};
+
+    SsblXpbdConfig cfg{};
+    cfg.vertex_count = 4;
+    cfg.edge_count = 3;
+    cfg.dt = 1.0f / 60.0f;
+    cfg.damping = 1.0f;
+    cfg.stretch_compliance = 1.0e6f;
+    cfg.stretch_optimization_enabled = 1;
+    cfg.stretch_optimization_strength = 1.0f;
+
+    SsblXpbdMesh mesh{};
+    mesh.positions = rest_positions.data();
+    mesh.inv_mass = inv_mass.data();
+    mesh.edges = edges.data();
+    mesh.edge_rest_lengths = rest_lengths.data();
+
+    void* solver = ssbl_create_solver(&cfg, &mesh);
+    if (!solver) {
+        std::fprintf(stderr, "SSBL_ABI41_HARD_STRETCH_CHAIN_ERROR create: %s\n", ssbl_last_error());
+        return 60;
+    }
+    if (!ssbl_update_positions(solver, start_positions.data(), static_cast<int>(start_positions.size()))) {
+        std::fprintf(stderr, "SSBL_ABI41_HARD_STRETCH_CHAIN_ERROR upload: %s\n", ssbl_last_error());
+        ssbl_destroy_solver(solver);
+        return 61;
+    }
+    if (!ssbl_step_solver_ex(solver, 1, 1, 1, 1)) {
+        std::fprintf(stderr, "SSBL_ABI41_HARD_STRETCH_CHAIN_ERROR step: %s\n", ssbl_last_error());
+        ssbl_destroy_solver(solver);
+        return 62;
+    }
+    std::vector<float> out(start_positions.size(), 0.0f);
+    if (!ssbl_download_positions(solver, out.data(), static_cast<int>(out.size()))) {
+        std::fprintf(stderr, "SSBL_ABI41_HARD_STRETCH_CHAIN_ERROR download: %s\n", ssbl_last_error());
+        ssbl_destroy_solver(solver);
+        return 63;
+    }
+    SsblXpbdDiagnostics diag{};
+    if (!ssbl_get_diagnostics(solver, &diag)) {
+        std::fprintf(stderr, "SSBL_ABI41_HARD_STRETCH_CHAIN_ERROR diagnostics: %s\n", ssbl_last_error());
+        ssbl_destroy_solver(solver);
+        return 64;
+    }
+    ssbl_destroy_solver(solver);
+    if (!finite_positions(out) || !diag.finite_flag) {
+        std::fprintf(stderr, "SSBL_ABI41_HARD_STRETCH_CHAIN_ERROR non-finite output\n");
+        return 65;
+    }
+    if (diag.abi41_pcg_csr_nnz != 6 || diag.abi41_pcg_texture_ready != 1 || diag.abi41_pcg_iterations <= 0) {
+        std::fprintf(
+            stderr,
+            "SSBL_ABI41_HARD_STRETCH_CHAIN_ERROR PCG not active nnz=%lld texture=%lld iterations=%lld\n",
+            diag.abi41_pcg_csr_nnz,
+            diag.abi41_pcg_texture_ready,
+            diag.abi41_pcg_iterations
+        );
+        return 66;
+    }
+    if (!(diag.abi41_pcg_initial_residual > 0.0f
+        && diag.abi41_pcg_final_residual < diag.abi41_pcg_initial_residual
+        && diag.abi41_pcg_max_delta > 0.0f)) {
+        std::fprintf(
+            stderr,
+            "SSBL_ABI41_HARD_STRETCH_CHAIN_ERROR residual/max mismatch initial=%.8f final=%.8f max_delta=%.8f\n",
+            diag.abi41_pcg_initial_residual,
+            diag.abi41_pcg_final_residual,
+            diag.abi41_pcg_max_delta
+        );
+        return 67;
+    }
+    if (!(out[9] < start_positions[9] - 0.02f)) {
+        std::fprintf(stderr, "SSBL_ABI41_HARD_STRETCH_CHAIN_ERROR chain end did not move left %.6f\n", out[9]);
+        return 68;
+    }
     return 0;
 }
 
@@ -675,11 +776,12 @@ int run_hard_stretch_optimization_smoke() {
     };
     std::vector<float> off_out;
     std::vector<float> on_out;
+    SsblXpbdDiagnostics on_diag{};
     int result = run_hard_stretch_case(rest_positions, {1.0f, 1.0f}, stretched_positions, false, &off_out);
     if (result != 0) {
         return result;
     }
-    result = run_hard_stretch_case(rest_positions, {1.0f, 1.0f}, stretched_positions, true, &on_out);
+    result = run_hard_stretch_case(rest_positions, {1.0f, 1.0f}, stretched_positions, true, &on_out, &on_diag);
     if (result != 0) {
         return result;
     }
@@ -693,6 +795,24 @@ int run_hard_stretch_optimization_smoke() {
             on_distance
         );
         return 57;
+    }
+    if (!(on_diag.abi41_pcg_csr_nnz == 2
+        && on_diag.abi41_pcg_texture_ready == 1
+        && on_diag.abi41_pcg_iterations > 0
+        && on_diag.abi41_pcg_initial_residual > 0.0f
+        && on_diag.abi41_pcg_final_residual < on_diag.abi41_pcg_initial_residual
+        && on_diag.abi41_pcg_max_delta > 0.0f)) {
+        std::fprintf(
+            stderr,
+            "SSBL_ABI41_HARD_STRETCH_ERROR bad PCG diagnostics nnz=%lld texture=%lld iterations=%lld initial=%.8f final=%.8f max_delta=%.8f\n",
+            on_diag.abi41_pcg_csr_nnz,
+            on_diag.abi41_pcg_texture_ready,
+            on_diag.abi41_pcg_iterations,
+            on_diag.abi41_pcg_initial_residual,
+            on_diag.abi41_pcg_final_residual,
+            on_diag.abi41_pcg_max_delta
+        );
+        return 60;
     }
 
     std::vector<float> pinned_out;
@@ -738,12 +858,19 @@ int run_hard_stretch_optimization_smoke() {
     if (result != 0) {
         return result;
     }
+    result = run_hard_stretch_chain_pcg_smoke();
+    if (result != 0) {
+        return result;
+    }
     std::printf(
-        "SSBL_ABI41_HARD_STRETCH_OK free=%.5f->%.5f pinned_free=%.5f both_pinned=%.5f\n",
+        "SSBL_ABI41_HARD_STRETCH_OK free=%.5f->%.5f pinned_free=%.5f both_pinned=%.5f pcg_iters=%lld residual=%.6f->%.6f\n",
         off_distance,
         on_distance,
         pinned_out[3],
-        both_pinned_distance
+        both_pinned_distance,
+        on_diag.abi41_pcg_iterations,
+        on_diag.abi41_pcg_initial_residual,
+        on_diag.abi41_pcg_final_residual
     );
     return 0;
 }

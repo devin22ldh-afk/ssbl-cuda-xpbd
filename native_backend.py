@@ -267,6 +267,13 @@ class _NativeDiagnostics(ctypes.Structure):
         ("static_sdf_build_ms", ctypes.c_float),
         ("static_sdf_contact_count", ctypes.c_longlong),
         ("static_sdf_unsigned_fallback_count", ctypes.c_longlong),
+        ("abi41_pcg_iterations", ctypes.c_longlong),
+        ("abi41_pcg_guarded", ctypes.c_longlong),
+        ("abi41_pcg_csr_nnz", ctypes.c_longlong),
+        ("abi41_pcg_texture_ready", ctypes.c_longlong),
+        ("abi41_pcg_initial_residual", ctypes.c_float),
+        ("abi41_pcg_final_residual", ctypes.c_float),
+        ("abi41_pcg_max_delta", ctypes.c_float),
     ]
 
 
@@ -379,6 +386,13 @@ class NativeStepDiagnostics:
     static_sdf_build_ms: float = 0.0
     static_sdf_contact_count: int = 0
     static_sdf_unsigned_fallback_count: int = 0
+    abi41_pcg_iterations: int = 0
+    abi41_pcg_guarded: int = 0
+    abi41_pcg_csr_nnz: int = 0
+    abi41_pcg_texture_ready: int = 0
+    abi41_pcg_initial_residual: float = 0.0
+    abi41_pcg_final_residual: float = 0.0
+    abi41_pcg_max_delta: float = 0.0
     frame_ms: float = 0.0
     frame_set_ms: float = 0.0
     input_refresh_ms: float = 0.0
@@ -1004,6 +1018,13 @@ class NativeXpbdSolver:
             static_sdf_build_ms=float(raw.static_sdf_build_ms),
             static_sdf_contact_count=int(raw.static_sdf_contact_count),
             static_sdf_unsigned_fallback_count=int(raw.static_sdf_unsigned_fallback_count),
+            abi41_pcg_iterations=int(raw.abi41_pcg_iterations),
+            abi41_pcg_guarded=int(raw.abi41_pcg_guarded),
+            abi41_pcg_csr_nnz=int(raw.abi41_pcg_csr_nnz),
+            abi41_pcg_texture_ready=int(raw.abi41_pcg_texture_ready),
+            abi41_pcg_initial_residual=float(raw.abi41_pcg_initial_residual),
+            abi41_pcg_final_residual=float(raw.abi41_pcg_final_residual),
+            abi41_pcg_max_delta=float(raw.abi41_pcg_max_delta),
         )
         self._last_diagnostics = diag
         return diag

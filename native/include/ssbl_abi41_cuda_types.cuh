@@ -27,12 +27,12 @@ struct CudaTriangle {
 };
 
 struct symMatCuda {
-    float m00;
     float m11;
-    float m22;
-    float m01;
-    float m02;
     float m12;
+    float m13;
+    float m22;
+    float m23;
+    float m33;
 };
 
 constexpr u32 kPinnedOrKinematicFlag = 0x4;

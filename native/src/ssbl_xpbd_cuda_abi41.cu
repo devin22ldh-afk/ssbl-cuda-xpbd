@@ -16,6 +16,7 @@
 namespace {
 
 using ReconSpring = ssbl_abi41::CudaSpringPBD;
+using ReconSymMat = ssbl_abi41::symMatCuda;
 using ReconTriangle = ssbl_abi41::CudaTriangle;
 
 constexpr int kThreads = 256;
@@ -51,6 +52,11 @@ constexpr int kAbi41CountStaticSdfContacts = 11;
 constexpr int kAbi41CountSlots = 12;
 constexpr float kAbi41SpringRelaxation = 0.18f;
 constexpr float kAbi41SelfAveragingClampScale = 0.35f;
+constexpr int kAbi41PcgMaxIterations = 1;
+constexpr int kAbi41PcgReductionDAD = 0;
+constexpr int kAbi41PcgReductionRZ = 1;
+constexpr int kAbi41PcgReductionRZNext = 2;
+constexpr int kAbi41PcgReductionSlots = 3;
 constexpr int kAbi41MaxForceFields = 64;
 constexpr int kAbi41ForceFieldWind = 1;
 constexpr int kAbi41ForceFieldForce = 2;
@@ -80,6 +86,23 @@ struct TriangleProximityPair {
     int source;
     int reserved;
     Vec3 delta;
+};
+
+struct ReconCSRTextureObject {
+    cudaTextureObject_t tex = 0;
+
+    __device__ __forceinline__ ReconSymMat getMatrixBlock(unsigned int index) const {
+        const float4 data1 = tex1Dfetch<float4>(tex, static_cast<int>(index * 2u));
+        const float4 data2 = tex1Dfetch<float4>(tex, static_cast<int>(index * 2u + 1u));
+        ReconSymMat mat{};
+        mat.m11 = data1.x;
+        mat.m12 = data1.y;
+        mat.m13 = data1.z;
+        mat.m22 = data1.w;
+        mat.m23 = data2.x;
+        mat.m33 = data2.y;
+        return mat;
+    }
 };
 
 struct Abi41Solver {
@@ -170,6 +193,25 @@ struct Abi41Solver {
     Vec3* pin_targets = nullptr;
     int pin_count = 0;
     int pin_capacity = 0;
+    unsigned int* pcg_row_offsets = nullptr;
+    unsigned int* pcg_col_indices = nullptr;
+    int* pcg_edge_entry_ij = nullptr;
+    int* pcg_edge_entry_ji = nullptr;
+    ReconSymMat* pcg_diag_values = nullptr;
+    ReconSymMat* pcg_preconditioner_inv = nullptr;
+    float4* pcg_offdiag_texels = nullptr;
+    Vec3* pcg_rhs = nullptr;
+    Vec3* pcg_solution = nullptr;
+    Vec3* pcg_residual = nullptr;
+    Vec3* pcg_z = nullptr;
+    Vec3* pcg_search_dir = nullptr;
+    Vec3* pcg_adir = nullptr;
+    float* pcg_reductions = nullptr;
+    float* pcg_max_delta_device = nullptr;
+    unsigned long long* pcg_guard_count = nullptr;
+    cudaTextureObject_t pcg_offdiag_texture = 0;
+    int pcg_csr_nnz = 0;
+    int pcg_texture_ready = 0;
     SsblXpbdRuntimeColliders runtime_colliders{};
     unsigned long long* abi41_counts = nullptr;
     SsblXpbdDiagnostics diag{};
@@ -214,8 +256,24 @@ __host__ __device__ Vec3 mul(Vec3 a, float s) {
     return make_vec3(a.x * s, a.y * s, a.z * s);
 }
 
+__host__ __device__ float fma_rn(float a, float b, float c) {
+#if defined(__CUDA_ARCH__)
+    return __fmaf_rn(a, b, c);
+#else
+    return std::fma(a, b, c);
+#endif
+}
+
+__host__ __device__ Vec3 fma_vec(Vec3 a, float s, Vec3 b) {
+    return make_vec3(
+        fma_rn(a.x, s, b.x),
+        fma_rn(a.y, s, b.y),
+        fma_rn(a.z, s, b.z)
+    );
+}
+
 __host__ __device__ float dot(Vec3 a, Vec3 b) {
-    return a.x * b.x + a.y * b.y + a.z * b.z;
+    return fma_rn(a.z, b.z, fma_rn(a.y, b.y, fma_rn(a.x, b.x, 0.0f)));
 }
 
 __host__ __device__ Vec3 cross(Vec3 a, Vec3 b) {
@@ -256,6 +314,101 @@ __device__ float length(Vec3 value) {
 
 __device__ bool finite_vec(Vec3 value) {
     return isfinite(value.x) && isfinite(value.y) && isfinite(value.z);
+}
+
+__host__ __device__ ReconSymMat make_sym_mat(
+    float m11,
+    float m12,
+    float m13,
+    float m22,
+    float m23,
+    float m33
+) {
+    ReconSymMat mat{m11, m12, m13, m22, m23, m33};
+    return mat;
+}
+
+__host__ __device__ ReconSymMat zero_sym_mat() {
+    return make_sym_mat(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+}
+
+__host__ __device__ ReconSymMat identity_sym_mat(float scale) {
+    return make_sym_mat(scale, 0.0f, 0.0f, scale, 0.0f, scale);
+}
+
+__host__ __device__ Vec3 sym_madd(ReconSymMat mat, Vec3 value, Vec3 acc) {
+    return make_vec3(
+        fma_rn(mat.m13, value.z, fma_rn(mat.m12, value.y, fma_rn(mat.m11, value.x, acc.x))),
+        fma_rn(mat.m23, value.z, fma_rn(mat.m22, value.y, fma_rn(mat.m12, value.x, acc.y))),
+        fma_rn(mat.m33, value.z, fma_rn(mat.m23, value.y, fma_rn(mat.m13, value.x, acc.z)))
+    );
+}
+
+__host__ __device__ Vec3 sym_mul(ReconSymMat mat, Vec3 value) {
+    return sym_madd(mat, value, make_vec3(0.0f, 0.0f, 0.0f));
+}
+
+__host__ __device__ ReconSymMat sym_outer(Vec3 normal, float scale) {
+    return make_sym_mat(
+        normal.x * normal.x * scale,
+        normal.x * normal.y * scale,
+        normal.x * normal.z * scale,
+        normal.y * normal.y * scale,
+        normal.y * normal.z * scale,
+        normal.z * normal.z * scale
+    );
+}
+
+__device__ void atomic_add_sym(ReconSymMat* dst, ReconSymMat value) {
+    atomicAdd(&dst->m11, value.m11);
+    atomicAdd(&dst->m12, value.m12);
+    atomicAdd(&dst->m13, value.m13);
+    atomicAdd(&dst->m22, value.m22);
+    atomicAdd(&dst->m23, value.m23);
+    atomicAdd(&dst->m33, value.m33);
+}
+
+__device__ ReconSymMat sym_inverse_or_diag(ReconSymMat mat, unsigned long long* guard_count) {
+    const float a = mat.m11;
+    const float b = mat.m12;
+    const float c = mat.m13;
+    const float d = mat.m22;
+    const float e = mat.m23;
+    const float f = mat.m33;
+    const float df_ee = fma_rn(d, f, -e * e);
+    const float bf_ce = fma_rn(b, f, -c * e);
+    const float be_cd = fma_rn(b, e, -c * d);
+    const float det = fma_rn(c, be_cd, fma_rn(-b, bf_ce, a * df_ee));
+    if (isfinite(det) && fabsf(det) > 1.0e-12f) {
+        const float inv_det = 1.0f / det;
+        return make_sym_mat(
+            df_ee * inv_det,
+            fma_rn(c, e, -b * f) * inv_det,
+            be_cd * inv_det,
+            fma_rn(a, f, -c * c) * inv_det,
+            fma_rn(b, c, -a * e) * inv_det,
+            fma_rn(a, d, -b * b) * inv_det
+        );
+    }
+    if (guard_count) {
+        atomicAdd(guard_count, 1ull);
+    }
+    return make_sym_mat(
+        1.0f / fmaxf(fabsf(a), 1.0e-4f),
+        0.0f,
+        0.0f,
+        1.0f / fmaxf(fabsf(d), 1.0e-4f),
+        0.0f,
+        1.0f / fmaxf(fabsf(f), 1.0e-4f)
+    );
+}
+
+__device__ void write_sym_texels(float4* texels, int entry, ReconSymMat value) {
+    if (!texels || entry < 0) {
+        return;
+    }
+    texels[entry * 2 + 0] = make_float4(value.m11, value.m12, value.m13, value.m22);
+    texels[entry * 2 + 1] = make_float4(value.m23, value.m33, 0.0f, 0.0f);
 }
 
 __device__ Vec3 array_vec3(const float values[3]) {
@@ -906,21 +1059,70 @@ __global__ void abi41_spring_project_kernel(Abi41Solver solver, float dt) {
     }
 }
 
-__global__ void abi41_hard_stretch_project_kernel(Abi41Solver solver) {
-    int s = blockIdx.x * blockDim.x + threadIdx.x;
-    if (!solver.cfg.stretch_optimization_enabled || s >= solver.cfg.edge_count) {
+__global__ void abi41_pcg_reset_vertex_kernel(Abi41Solver solver) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i == 0 && solver.pcg_reductions) {
+        solver.pcg_reductions[kAbi41PcgReductionDAD] = 0.0f;
+        solver.pcg_reductions[kAbi41PcgReductionRZ] = 0.0f;
+        solver.pcg_reductions[kAbi41PcgReductionRZNext] = 0.0f;
+    }
+    if (i >= solver.cfg.vertex_count) {
         return;
     }
-    float strength = clamp01(solver.cfg.stretch_optimization_strength);
-    if (strength <= 0.0f) {
+    if (solver.pcg_diag_values) {
+        solver.pcg_diag_values[i] = identity_sym_mat(1.0f);
+    }
+    if (solver.pcg_preconditioner_inv) {
+        solver.pcg_preconditioner_inv[i] = identity_sym_mat(1.0f);
+    }
+    if (solver.pcg_rhs) {
+        solver.pcg_rhs[i] = make_vec3(0.0f, 0.0f, 0.0f);
+    }
+    if (solver.pcg_solution) {
+        solver.pcg_solution[i] = make_vec3(0.0f, 0.0f, 0.0f);
+    }
+    if (solver.pcg_residual) {
+        solver.pcg_residual[i] = make_vec3(0.0f, 0.0f, 0.0f);
+    }
+    if (solver.pcg_z) {
+        solver.pcg_z[i] = make_vec3(0.0f, 0.0f, 0.0f);
+    }
+    if (solver.pcg_search_dir) {
+        solver.pcg_search_dir[i] = make_vec3(0.0f, 0.0f, 0.0f);
+    }
+    if (solver.pcg_adir) {
+        solver.pcg_adir[i] = make_vec3(0.0f, 0.0f, 0.0f);
+    }
+}
+
+__global__ void abi41_pcg_build_stretch_system_kernel(Abi41Solver solver) {
+    const int s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (!solver.cfg.stretch_optimization_enabled
+        || s >= solver.cfg.edge_count
+        || !solver.springs
+        || !solver.pcg_rhs
+        || !solver.pcg_diag_values
+        || !solver.pcg_offdiag_texels
+        || !solver.pcg_edge_entry_ij
+        || !solver.pcg_edge_entry_ji) {
         return;
     }
-    ReconSpring spring = solver.springs[s];
-    int i = static_cast<int>(spring.id0);
-    int j = static_cast<int>(spring.id1);
-    if (i < 0 || j < 0 || i >= solver.cfg.vertex_count || j >= solver.cfg.vertex_count) {
+
+    const ReconSpring spring = solver.springs[s];
+    const int i = static_cast<int>(spring.id0);
+    const int j = static_cast<int>(spring.id1);
+    if (i < 0 || j < 0 || i >= solver.cfg.vertex_count || j >= solver.cfg.vertex_count || i == j) {
         return;
     }
+    const int entry_ij = solver.pcg_edge_entry_ij[s];
+    const int entry_ji = solver.pcg_edge_entry_ji[s];
+    if (entry_ij < 0 || entry_ji < 0) {
+        return;
+    }
+    const ReconSymMat zero_block = zero_sym_mat();
+    write_sym_texels(solver.pcg_offdiag_texels, entry_ij, zero_block);
+    write_sym_texels(solver.pcg_offdiag_texels, entry_ji, zero_block);
+
     float wi = solver.inv_mass[i];
     float wj = solver.inv_mass[j];
     if (solver.state_flags) {
@@ -931,43 +1133,201 @@ __global__ void abi41_hard_stretch_project_kernel(Abi41Solver solver) {
             wj = 0.0f;
         }
     }
-    float weight = wi + wj;
+    const bool active_i = wi > 0.0f;
+    const bool active_j = wj > 0.0f;
+    const float weight = wi + wj;
     if (!isfinite(weight) || weight <= 0.0f) {
         return;
     }
-    float rest = spring.rest_length;
+
+    const float rest = spring.rest_length;
     if (!isfinite(rest) || rest <= kEps) {
         return;
     }
-    Vec3 pi = solver.pos[i];
-    Vec3 pj = solver.pos[j];
+    const Vec3 pi = solver.pos[i];
+    const Vec3 pj = solver.pos[j];
     if (!finite_vec(pi) || !finite_vec(pj)) {
         return;
     }
-    Vec3 delta = sub(pj, pi);
-    float len_sq = dot(delta, delta);
+    const Vec3 delta = sub(pj, pi);
+    const float len_sq = dot(delta, delta);
     if (!isfinite(len_sq) || len_sq <= kEps) {
         return;
     }
-    float len = sqrtf(len_sq);
-    float over = len - rest;
+    const float len = sqrtf(len_sq);
+    const float over = len - rest;
     if (!isfinite(over) || over <= 0.0f) {
         return;
     }
-    float max_delta = fmaxf(1.0e-5f, fminf(fmaxf(rest, solver.cfg.cloth_thickness) * 0.5f, 0.25f));
-    float projected = fminf(over * strength, max_delta);
+
+    const float strength = clamp01(solver.cfg.stretch_optimization_strength);
+    if (strength <= 0.0f) {
+        return;
+    }
+    const float max_edge_delta = fmaxf(
+        1.0e-5f,
+        fminf(fmaxf(rest, solver.cfg.cloth_thickness) * 0.5f, 0.25f)
+    );
+    const float projected = fminf(over * strength, max_edge_delta);
     if (!isfinite(projected) || projected <= 0.0f) {
         return;
     }
-    Vec3 corr = mul(delta, projected / (weight * len));
-    if (!finite_vec(corr)) {
-        return;
+
+    const Vec3 normal = mul(delta, 1.0f / len);
+    const Vec3 desired = mul(normal, projected / weight);
+    if (active_i) {
+        atomic_add(&solver.pcg_rhs[i], mul(desired, wi));
     }
-    if (wi > 0.0f) {
-        atomic_add(&solver.pos[i], mul(corr, wi));
+    if (active_j) {
+        atomic_add(&solver.pcg_rhs[j], mul(desired, -wj));
     }
-    if (wj > 0.0f) {
-        atomic_add(&solver.pos[j], mul(corr, -wj));
+
+    const float stiffness = fmaxf(strength, 1.0e-3f);
+    const ReconSymMat block = sym_outer(normal, stiffness);
+    if (active_i) {
+        atomic_add_sym(&solver.pcg_diag_values[i], block);
+    }
+    if (active_j) {
+        atomic_add_sym(&solver.pcg_diag_values[j], block);
+    }
+    if (active_i && active_j) {
+        const ReconSymMat offdiag = make_sym_mat(
+            -block.m11,
+            -block.m12,
+            -block.m13,
+            -block.m22,
+            -block.m23,
+            -block.m33
+        );
+        write_sym_texels(solver.pcg_offdiag_texels, entry_ij, offdiag);
+        write_sym_texels(solver.pcg_offdiag_texels, entry_ji, offdiag);
+    }
+}
+
+__global__ void abi41_pcg_finalize_preconditioner_kernel(Abi41Solver solver) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    float local_sum = 0.0f;
+    if (i < solver.cfg.vertex_count
+        && solver.pcg_diag_values
+        && solver.pcg_preconditioner_inv
+        && solver.pcg_rhs
+        && solver.pcg_residual
+        && solver.pcg_z
+        && solver.pcg_search_dir
+        && solver.pcg_solution) {
+        const bool pinned = solver.state_flags
+            && ((solver.state_flags[i] & ssbl_abi41::kPinnedOrKinematicFlag) != 0u);
+        if (solver.inv_mass[i] <= 0.0f || pinned) {
+            solver.pcg_rhs[i] = make_vec3(0.0f, 0.0f, 0.0f);
+            solver.pcg_residual[i] = make_vec3(0.0f, 0.0f, 0.0f);
+            solver.pcg_z[i] = make_vec3(0.0f, 0.0f, 0.0f);
+            solver.pcg_search_dir[i] = make_vec3(0.0f, 0.0f, 0.0f);
+            solver.pcg_solution[i] = make_vec3(0.0f, 0.0f, 0.0f);
+            solver.pcg_preconditioner_inv[i] = identity_sym_mat(1.0f);
+        } else {
+            const ReconSymMat inv = sym_inverse_or_diag(solver.pcg_diag_values[i], solver.pcg_guard_count);
+            const Vec3 r = solver.pcg_rhs[i];
+            const Vec3 z = sym_mul(inv, r);
+            solver.pcg_preconditioner_inv[i] = inv;
+            solver.pcg_residual[i] = r;
+            solver.pcg_z[i] = z;
+            solver.pcg_search_dir[i] = z;
+            solver.pcg_solution[i] = make_vec3(0.0f, 0.0f, 0.0f);
+            local_sum = dot(r, z);
+        }
+    }
+    for (int offset = 16; offset > 0; offset /= 2) {
+        local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
+    }
+    if ((threadIdx.x & 31) == 0 && solver.pcg_reductions) {
+        atomicAdd(&solver.pcg_reductions[kAbi41PcgReductionRZ], local_sum);
+    }
+}
+
+__global__ void abi41_pcg_compute_ad_kernel(Abi41Solver solver) {
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    float local_sum = 0.0f;
+    if (row < solver.cfg.vertex_count
+        && solver.pcg_adir
+        && solver.pcg_search_dir
+        && solver.pcg_row_offsets
+        && solver.pcg_col_indices
+        && solver.pcg_diag_values
+        && solver.pcg_texture_ready != 0) {
+        const bool pinned = solver.state_flags
+            && ((solver.state_flags[row] & ssbl_abi41::kPinnedOrKinematicFlag) != 0u);
+        if (solver.inv_mass[row] <= 0.0f || pinned) {
+            solver.pcg_adir[row] = make_vec3(0.0f, 0.0f, 0.0f);
+        } else {
+            Vec3 q = sym_mul(solver.pcg_diag_values[row], solver.pcg_search_dir[row]);
+            ReconCSRTextureObject texture;
+            texture.tex = solver.pcg_offdiag_texture;
+            const unsigned int start = solver.pcg_row_offsets[row];
+            const unsigned int end = solver.pcg_row_offsets[row + 1];
+            for (unsigned int cursor = start; cursor < end; ++cursor) {
+                const unsigned int col = solver.pcg_col_indices[cursor];
+                if (col < static_cast<unsigned int>(solver.cfg.vertex_count)) {
+                    q = sym_madd(texture.getMatrixBlock(cursor), solver.pcg_search_dir[col], q);
+                }
+            }
+            solver.pcg_adir[row] = q;
+            local_sum = dot(solver.pcg_search_dir[row], q);
+        }
+    }
+    for (int offset = 16; offset > 0; offset /= 2) {
+        local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
+    }
+    if ((threadIdx.x & 31) == 0 && solver.pcg_reductions) {
+        atomicAdd(&solver.pcg_reductions[kAbi41PcgReductionDAD], local_sum);
+    }
+}
+
+__global__ void abi41_pcg_update_solution_residual_z_kernel(Abi41Solver solver, float alpha, int apply_solution_now) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    float local_sum = 0.0f;
+    if (i < solver.cfg.vertex_count
+        && solver.pcg_solution
+        && solver.pcg_search_dir
+        && solver.pcg_residual
+        && solver.pcg_adir
+        && solver.pcg_z
+        && solver.pcg_preconditioner_inv) {
+        const bool pinned = solver.state_flags
+            && ((solver.state_flags[i] & ssbl_abi41::kPinnedOrKinematicFlag) != 0u);
+        if (solver.inv_mass[i] <= 0.0f || pinned) {
+            solver.pcg_solution[i] = make_vec3(0.0f, 0.0f, 0.0f);
+            solver.pcg_residual[i] = make_vec3(0.0f, 0.0f, 0.0f);
+            solver.pcg_z[i] = make_vec3(0.0f, 0.0f, 0.0f);
+        } else {
+            const Vec3 solution = fma_vec(solver.pcg_search_dir[i], alpha, solver.pcg_solution[i]);
+            const Vec3 residual = fma_vec(solver.pcg_adir[i], -alpha, solver.pcg_residual[i]);
+            const Vec3 safe_solution = finite_vec(solution) ? solution : make_vec3(0.0f, 0.0f, 0.0f);
+            const Vec3 safe_residual = finite_vec(residual) ? residual : make_vec3(0.0f, 0.0f, 0.0f);
+            const Vec3 z = sym_mul(solver.pcg_preconditioner_inv[i], safe_residual);
+            solver.pcg_solution[i] = safe_solution;
+            solver.pcg_residual[i] = safe_residual;
+            solver.pcg_z[i] = z;
+            local_sum = dot(safe_residual, z);
+
+            if (apply_solution_now != 0) {
+                Vec3 delta = safe_solution;
+                const float len = length(delta);
+                const float max_delta = 0.25f;
+                if (len > max_delta) {
+                    delta = mul(delta, max_delta / fmaxf(len, kEps));
+                }
+                solver.pos[i] = add(solver.pos[i], delta);
+                if (solver.pcg_max_delta_device) {
+                    atomic_max_float(solver.pcg_max_delta_device, length(delta));
+                }
+            }
+        }
+    }
+    for (int offset = 16; offset > 0; offset /= 2) {
+        local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
+    }
+    if ((threadIdx.x & 31) == 0 && solver.pcg_reductions) {
+        atomicAdd(&solver.pcg_reductions[kAbi41PcgReductionRZNext], local_sum);
     }
 }
 
@@ -2994,6 +3354,183 @@ bool build_surface_vertex_triangles(
     );
 }
 
+void destroy_pcg_texture(Abi41Solver* solver) {
+    if (solver && solver->pcg_offdiag_texture != 0) {
+        cudaDestroyTextureObject(solver->pcg_offdiag_texture);
+        solver->pcg_offdiag_texture = 0;
+        solver->pcg_texture_ready = 0;
+    }
+}
+
+bool prepare_pcg_stretch_buffers(
+    Abi41Solver* solver,
+    const std::vector<ReconSpring>& springs
+) {
+    if (!solver || !solver->cfg.stretch_optimization_enabled) {
+        return true;
+    }
+    const int vertex_count = solver->cfg.vertex_count;
+    const int edge_count = solver->cfg.edge_count;
+    if (vertex_count <= 0 || edge_count <= 0) {
+        return set_error("PCG stretch optimization requires vertices and edges");
+    }
+
+    std::vector<unsigned int> degrees(static_cast<size_t>(vertex_count), 0u);
+    std::vector<int> edge_entry_ij(static_cast<size_t>(edge_count), -1);
+    std::vector<int> edge_entry_ji(static_cast<size_t>(edge_count), -1);
+    for (int e = 0; e < edge_count; ++e) {
+        const int i = static_cast<int>(springs[e].id0);
+        const int j = static_cast<int>(springs[e].id1);
+        if (i >= 0 && i < vertex_count && j >= 0 && j < vertex_count && i != j) {
+            ++degrees[static_cast<size_t>(i)];
+            ++degrees[static_cast<size_t>(j)];
+        }
+    }
+
+    std::vector<unsigned int> row_offsets(static_cast<size_t>(vertex_count) + 1u, 0u);
+    for (int i = 0; i < vertex_count; ++i) {
+        row_offsets[static_cast<size_t>(i) + 1u] = row_offsets[static_cast<size_t>(i)] + degrees[static_cast<size_t>(i)];
+    }
+    const unsigned int nnz = row_offsets[static_cast<size_t>(vertex_count)];
+    if (nnz == 0u) {
+        return set_error("PCG stretch optimization found no valid CSR edges");
+    }
+
+    std::vector<unsigned int> cursor = row_offsets;
+    std::vector<unsigned int> col_indices(static_cast<size_t>(nnz), 0u);
+    for (int e = 0; e < edge_count; ++e) {
+        const int i = static_cast<int>(springs[e].id0);
+        const int j = static_cast<int>(springs[e].id1);
+        if (i < 0 || i >= vertex_count || j < 0 || j >= vertex_count || i == j) {
+            continue;
+        }
+        const unsigned int ij = cursor[static_cast<size_t>(i)]++;
+        const unsigned int ji = cursor[static_cast<size_t>(j)]++;
+        col_indices[static_cast<size_t>(ij)] = static_cast<unsigned int>(j);
+        col_indices[static_cast<size_t>(ji)] = static_cast<unsigned int>(i);
+        edge_entry_ij[static_cast<size_t>(e)] = static_cast<int>(ij);
+        edge_entry_ji[static_cast<size_t>(e)] = static_cast<int>(ji);
+    }
+
+    destroy_pcg_texture(solver);
+    solver->pcg_csr_nnz = static_cast<int>(nnz);
+    bool ok = alloc_and_copy(&solver->pcg_row_offsets, row_offsets.data(), vertex_count + 1, "PCG CSR row offset allocation")
+        && alloc_and_copy(&solver->pcg_col_indices, col_indices.data(), static_cast<int>(nnz), "PCG CSR column allocation")
+        && alloc_and_copy(&solver->pcg_edge_entry_ij, edge_entry_ij.data(), edge_count, "PCG edge ij map allocation")
+        && alloc_and_copy(&solver->pcg_edge_entry_ji, edge_entry_ji.data(), edge_count, "PCG edge ji map allocation")
+        && alloc_and_copy(&solver->pcg_diag_values, static_cast<const ReconSymMat*>(nullptr), vertex_count, "PCG diagonal block allocation")
+        && alloc_and_copy(&solver->pcg_preconditioner_inv, static_cast<const ReconSymMat*>(nullptr), vertex_count, "PCG preconditioner allocation")
+        && alloc_and_copy(&solver->pcg_offdiag_texels, static_cast<const float4*>(nullptr), static_cast<int>(nnz) * 2, "PCG offdiag texture allocation")
+        && alloc_and_copy(&solver->pcg_rhs, static_cast<const Vec3*>(nullptr), vertex_count, "PCG rhs allocation")
+        && alloc_and_copy(&solver->pcg_solution, static_cast<const Vec3*>(nullptr), vertex_count, "PCG solution allocation")
+        && alloc_and_copy(&solver->pcg_residual, static_cast<const Vec3*>(nullptr), vertex_count, "PCG residual allocation")
+        && alloc_and_copy(&solver->pcg_z, static_cast<const Vec3*>(nullptr), vertex_count, "PCG preconditioned residual allocation")
+        && alloc_and_copy(&solver->pcg_search_dir, static_cast<const Vec3*>(nullptr), vertex_count, "PCG search direction allocation")
+        && alloc_and_copy(&solver->pcg_adir, static_cast<const Vec3*>(nullptr), vertex_count, "PCG A*d allocation")
+        && alloc_and_copy(&solver->pcg_reductions, static_cast<const float*>(nullptr), kAbi41PcgReductionSlots, "PCG reduction allocation")
+        && alloc_and_copy(&solver->pcg_max_delta_device, static_cast<const float*>(nullptr), 1, "PCG max delta allocation")
+        && alloc_and_copy(&solver->pcg_guard_count, static_cast<const unsigned long long*>(nullptr), 1, "PCG guard counter allocation");
+    if (!ok) {
+        return false;
+    }
+
+    cudaResourceDesc resource_desc{};
+    resource_desc.resType = cudaResourceTypeLinear;
+    resource_desc.res.linear.devPtr = solver->pcg_offdiag_texels;
+    resource_desc.res.linear.desc = cudaCreateChannelDesc<float4>();
+    resource_desc.res.linear.sizeInBytes = sizeof(float4) * static_cast<size_t>(nnz) * 2u;
+    cudaTextureDesc texture_desc{};
+    texture_desc.readMode = cudaReadModeElementType;
+    cudaTextureObject_t texture = 0;
+    if (!set_cuda_error(
+            cudaCreateTextureObject(&texture, &resource_desc, &texture_desc, nullptr),
+            "create PCG CSR texture")) {
+        return false;
+    }
+    solver->pcg_offdiag_texture = texture;
+    solver->pcg_texture_ready = 1;
+    solver->diag.abi41_pcg_csr_nnz = solver->pcg_csr_nnz;
+    solver->diag.abi41_pcg_texture_ready = 1;
+    return true;
+}
+
+bool fetch_pcg_reduction(Abi41Solver* solver, int slot, float* out_value, const char* label) {
+    if (!solver || !solver->pcg_reductions || !out_value || slot < 0 || slot >= kAbi41PcgReductionSlots) {
+        return set_error("invalid PCG reduction fetch");
+    }
+    return set_cuda_error(cudaMemcpy(out_value, solver->pcg_reductions + slot, sizeof(float), cudaMemcpyDeviceToHost), label);
+}
+
+bool run_abi41_hard_stretch_pcg(Abi41Solver* solver, int v_blocks, int e_blocks) {
+    if (!solver || !solver->cfg.stretch_optimization_enabled || solver->cfg.stretch_optimization_strength <= 0.0f) {
+        return true;
+    }
+    if (solver->pcg_csr_nnz <= 0 || solver->pcg_texture_ready == 0 || solver->pcg_offdiag_texture == 0) {
+        return set_error("PCG stretch optimization is enabled without a ready CSR texture");
+    }
+
+    abi41_pcg_reset_vertex_kernel<<<v_blocks, kThreads>>>(*solver);
+    abi41_pcg_build_stretch_system_kernel<<<e_blocks, kThreads>>>(*solver);
+    abi41_pcg_finalize_preconditioner_kernel<<<v_blocks, kThreads>>>(*solver);
+    if (!set_cuda_error(cudaGetLastError(), "launch PCG stretch system build")) {
+        return false;
+    }
+
+    float rz_old = 0.0f;
+    if (!fetch_pcg_reduction(solver, kAbi41PcgReductionRZ, &rz_old, "fetch PCG initial residual")) {
+        return false;
+    }
+    if (!std::isfinite(rz_old) || rz_old < 0.0f) {
+        solver->diag.abi41_pcg_guarded += 1;
+        return true;
+    }
+
+    const float initial_residual = sqrtf(fmaxf(rz_old, 0.0f));
+    solver->diag.abi41_pcg_initial_residual = fmaxf(
+        solver->diag.abi41_pcg_initial_residual,
+        initial_residual
+    );
+    solver->diag.abi41_pcg_final_residual = initial_residual;
+    if (rz_old <= 1.0e-14f) {
+        return true;
+    }
+
+    abi41_pcg_compute_ad_kernel<<<v_blocks, kThreads>>>(*solver);
+    if (!set_cuda_error(cudaGetLastError(), "launch PCG dAd reduction")) {
+        return false;
+    }
+    float dad = 0.0f;
+    if (!fetch_pcg_reduction(solver, kAbi41PcgReductionDAD, &dad, "fetch PCG dAd")) {
+        return false;
+    }
+    if (!std::isfinite(dad) || dad <= 1.0e-14f) {
+        solver->diag.abi41_pcg_guarded += 1;
+        return true;
+    }
+
+    const float alpha = rz_old / dad;
+    if (!std::isfinite(alpha)) {
+        solver->diag.abi41_pcg_guarded += 1;
+        return true;
+    }
+    abi41_pcg_update_solution_residual_z_kernel<<<v_blocks, kThreads>>>(*solver, alpha, 1);
+    if (!set_cuda_error(cudaGetLastError(), "launch PCG residual update")) {
+        return false;
+    }
+    float rz_new = 0.0f;
+    if (!fetch_pcg_reduction(solver, kAbi41PcgReductionRZNext, &rz_new, "fetch PCG updated residual")) {
+        return false;
+    }
+    if (!std::isfinite(rz_new) || rz_new < 0.0f) {
+        solver->diag.abi41_pcg_guarded += 1;
+        return true;
+    }
+
+    solver->diag.abi41_pcg_iterations += kAbi41PcgMaxIterations;
+    solver->diag.abi41_pcg_final_residual = sqrtf(fmaxf(rz_new, 0.0f));
+    return true;
+}
+
 bool reset_abi41_counts(Abi41Solver* solver) {
     if (!solver->abi41_counts) {
         return true;
@@ -3003,6 +3540,18 @@ bool reset_abi41_counts(Abi41Solver* solver) {
     }
     if (solver->self_max_smoothed_delta_device
         && !set_cuda_error(cudaMemset(solver->self_max_smoothed_delta_device, 0, sizeof(float)), "reset self max smoothed delta")) {
+        return false;
+    }
+    if (solver->pcg_reductions
+        && !set_cuda_error(cudaMemset(solver->pcg_reductions, 0, sizeof(float) * kAbi41PcgReductionSlots), "reset PCG reductions")) {
+        return false;
+    }
+    if (solver->pcg_max_delta_device
+        && !set_cuda_error(cudaMemset(solver->pcg_max_delta_device, 0, sizeof(float)), "reset PCG max delta")) {
+        return false;
+    }
+    if (solver->pcg_guard_count
+        && !set_cuda_error(cudaMemset(solver->pcg_guard_count, 0, sizeof(unsigned long long)), "reset PCG guard count")) {
         return false;
     }
     return true;
@@ -3035,6 +3584,23 @@ bool fetch_abi41_counts(Abi41Solver* solver) {
         counts[kAbi41CountDynamicParticleCandidates] + counts[kAbi41CountTrianglePairs]
         + counts[kAbi41CountSelfCandidates] + counts[kAbi41CountStaticSdfContacts]
     );
+    solver->diag.abi41_pcg_csr_nnz = solver->pcg_csr_nnz;
+    solver->diag.abi41_pcg_texture_ready = solver->pcg_texture_ready;
+    if (solver->pcg_guard_count) {
+        unsigned long long guarded = 0;
+        if (!set_cuda_error(
+                cudaMemcpy(&guarded, solver->pcg_guard_count, sizeof(unsigned long long), cudaMemcpyDeviceToHost),
+                "fetch PCG guard count")) {
+            return false;
+        }
+        solver->diag.abi41_pcg_guarded += static_cast<long long>(guarded);
+    }
+    if (solver->pcg_max_delta_device
+        && !set_cuda_error(
+            cudaMemcpy(&solver->diag.abi41_pcg_max_delta, solver->pcg_max_delta_device, sizeof(float), cudaMemcpyDeviceToHost),
+            "fetch PCG max delta")) {
+        return false;
+    }
     populate_static_sdf_diagnostics(solver);
     return true;
 }
@@ -3043,6 +3609,7 @@ void free_solver(Abi41Solver* solver) {
     if (!solver) {
         return;
     }
+    destroy_pcg_texture(solver);
     cudaFree(solver->pos);
     cudaFree(solver->prev);
     cudaFree(solver->vel);
@@ -3082,9 +3649,25 @@ void free_solver(Abi41Solver* solver) {
     cudaFree(solver->dynamic_particle_cell_coords);
     cudaFree(solver->triangle_pairs);
     cudaFree(solver->triangle_pair_count);
-    cudaFree(solver->force_fields);
     cudaFree(solver->pin_indices);
     cudaFree(solver->pin_targets);
+    cudaFree(solver->pcg_row_offsets);
+    cudaFree(solver->pcg_col_indices);
+    cudaFree(solver->pcg_edge_entry_ij);
+    cudaFree(solver->pcg_edge_entry_ji);
+    cudaFree(solver->pcg_diag_values);
+    cudaFree(solver->pcg_preconditioner_inv);
+    cudaFree(solver->pcg_offdiag_texels);
+    cudaFree(solver->pcg_rhs);
+    cudaFree(solver->pcg_solution);
+    cudaFree(solver->pcg_residual);
+    cudaFree(solver->pcg_z);
+    cudaFree(solver->pcg_search_dir);
+    cudaFree(solver->pcg_adir);
+    cudaFree(solver->pcg_reductions);
+    cudaFree(solver->pcg_max_delta_device);
+    cudaFree(solver->pcg_guard_count);
+    cudaFree(solver->force_fields);
     cudaFree(solver->abi41_counts);
     delete solver;
 }
@@ -3329,6 +3912,9 @@ extern "C" SSBL_API void* ssbl_create_solver(const SsblXpbdConfig* config, const
     if (ok && !prepare_self_edge_hash_buffers(solver)) {
         ok = false;
     }
+    if (ok && !prepare_pcg_stretch_buffers(solver, springs)) {
+        ok = false;
+    }
     if (!ok || !reset_abi41_counts(solver)) {
         free_solver(solver);
         return nullptr;
@@ -3496,13 +4082,20 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
             return 0;
         }
         for (int it = 0; it < iterations; ++it) {
-            if (solver->cfg.edge_count > 0) {
+            const bool run_stretch_pcg = (
+                solver->cfg.edge_count > 0
+                && solver->cfg.stretch_optimization_enabled
+                && solver->cfg.stretch_optimization_strength > 0.0f
+                && s == substeps - 1
+                && it == iterations - 1
+            );
+            if (solver->cfg.edge_count > 0 && !run_stretch_pcg) {
                 abi41_spring_project_kernel<<<e_blocks, kThreads>>>(*solver, sub_dt);
             }
-            if (solver->cfg.edge_count > 0
-                && solver->cfg.stretch_optimization_enabled
-                && solver->cfg.stretch_optimization_strength > 0.0f) {
-                abi41_hard_stretch_project_kernel<<<e_blocks, kThreads>>>(*solver);
+            if (run_stretch_pcg) {
+                if (!run_abi41_hard_stretch_pcg(solver, v_blocks, e_blocks)) {
+                    return 0;
+                }
             }
             if (solver->pin_count > 0) {
                 abi41_pin_project_kernel<<<p_blocks, kThreads>>>(*solver);
