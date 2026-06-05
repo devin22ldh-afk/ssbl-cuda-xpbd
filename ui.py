@@ -123,3 +123,27 @@ class SSBL_PT_physics_panel(bpy.types.Panel):
             if settings.use_volume_pressure:
                 tuning_box.prop(settings, "volume_compliance")
                 tuning_box.prop(settings, "volume_solve_interval")
+
+
+class SSBL_PT_force_field_panel(bpy.types.Panel):
+    bl_label = "SSBL Force Field"
+    bl_idname = "SSBL_PT_force_field_panel"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context = "physics"
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        obj = context.active_object
+        field = getattr(obj, "field", None) if obj is not None else None
+        return obj is not None and field is not None and str(getattr(field, "type", "NONE")).upper() not in {"", "NONE"}
+
+    def draw(self, context: bpy.types.Context):
+        layout = self.layout
+        obj = context.active_object
+        field = obj.field
+        weight = float(getattr(obj, "ssbl_force_field_weight", 1.0))
+        strength = float(getattr(field, "strength", 0.0))
+        box = layout.box()
+        box.prop(obj, "ssbl_force_field_weight", slider=True)
+        box.label(text=f"Effective strength: {strength * weight:.3f}")

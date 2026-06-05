@@ -116,6 +116,15 @@ def main() -> None:
         on = _run_preview(scene, on_cloth)
 
         _clear_scene()
+        weighted_cloth = _make_cloth("SSBL_Force_Weighted")
+        weighted_cloth.ssbl_cloth.use_blender_force_fields = True
+        weighted_wind = _add_wind("SSBL_Wind_Weighted", 30.0)
+        weighted_wind.ssbl_force_field_weight = 0.25
+        weighted = _run_preview(scene, weighted_cloth)
+        weighted_batch = collect_force_fields(scene, bpy.context.evaluated_depsgraph_get(), weighted_cloth.ssbl_cloth)
+        weighted_strength = weighted_batch.fields[0].strength if weighted_batch.fields else 0.0
+
+        _clear_scene()
         key_cloth = _make_cloth("SSBL_Force_Key")
         key_cloth.ssbl_cloth.use_blender_force_fields = True
         key_wind = _add_wind("SSBL_Wind_Key", 1.0)
@@ -194,6 +203,9 @@ def main() -> None:
             "off": off,
             "on": on,
             "preview_delta_x": on["avg_x"] - off["avg_x"],
+            "weighted": weighted,
+            "weighted_strength": weighted_strength,
+            "weighted_preview_delta_x": weighted["avg_x"] - off["avg_x"],
             "key_strength_frame_5": key_strength,
             "transform_direction": transform_direction,
             "collection_count": len(collection_batch.fields),
@@ -212,6 +224,11 @@ def main() -> None:
             and on["force_field_count"] == 1
             and on["unsupported_force_field_count"] == 0
             and result["preview_delta_x"] > 0.02
+            and weighted["finite"]
+            and weighted["force_field_count"] == 1
+            and abs(result["weighted_strength"] - 7.5) < 1.0e-4
+            and result["weighted_preview_delta_x"] > 0.005
+            and result["weighted_preview_delta_x"] < result["preview_delta_x"]
             and 1.0 < key_strength < 9.0
             and transform_direction[0] > 0.85
             and result["collection_count"] == 1

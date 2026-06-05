@@ -685,6 +685,7 @@ CLASSES = (
     operators.SSBL_OT_bake_xpbd_cache,
     operators.SSBL_OT_clear_xpbd_cache,
     ui.SSBL_PT_physics_panel,
+    ui.SSBL_PT_force_field_panel,
 )
 
 
@@ -697,6 +698,14 @@ def register():
     if _initialize_hardness_for_scenes not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(_initialize_hardness_for_scenes)
     operators.register_playback_handlers()
+    bpy.types.Object.ssbl_force_field_weight = FloatProperty(
+        name="SSBL Weight",
+        default=1.0,
+        min=0.0,
+        max=1.0,
+        precision=3,
+        description="SSBL multiplies this object force field by the given weight before uploading it to the cloth solver",
+    )
     bpy.types.Object.ssbl_collision_layer = IntProperty(
         options={"HIDDEN"},
         name="碰撞层级",
@@ -726,6 +735,8 @@ def unregister():
         del bpy.types.Scene.ssbl_preview
     if hasattr(bpy.types.Object, "ssbl_cloth"):
         del bpy.types.Object.ssbl_cloth
+    if hasattr(bpy.types.Object, "ssbl_force_field_weight"):
+        del bpy.types.Object.ssbl_force_field_weight
     if hasattr(bpy.types.Object, "ssbl_collision_layer"):
         del bpy.types.Object.ssbl_collision_layer
     if hasattr(bpy.types.Object, "ssbl_enable_cross_cloth_collision"):

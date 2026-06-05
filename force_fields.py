@@ -72,6 +72,15 @@ class ForceFieldBatch:
 EMPTY_FORCE_FIELD_BATCH = ForceFieldBatch()
 
 
+def _field_weight(obj: bpy.types.Object) -> float:
+    weight = float(getattr(obj, "ssbl_force_field_weight", obj.get("ssbl_force_field_weight", 1.0)))
+    if weight < 0.0:
+        return 0.0
+    if weight > 1.0:
+        return 1.0
+    return weight
+
+
 def _safe_normalized(vec: Vector, fallback: tuple[float, float, float]) -> tuple[float, float, float]:
     if vec.length <= 1.0e-8:
         return fallback
@@ -146,10 +155,11 @@ def collect_force_fields(
         matrix = obj.matrix_world.copy()
         direction, axis = _matrix_axes(matrix)
         origin = matrix.translation
+        weight = _field_weight(source_obj)
         fields.append(
             ForceFieldSample(
                 field_type=field_type,
-                strength=float(getattr(field, "strength", 0.0)) * strength_scale,
+                strength=float(getattr(field, "strength", 0.0)) * strength_scale * weight,
                 origin=(float(origin.x), float(origin.y), float(origin.z)),
                 direction=direction,
                 axis=axis,

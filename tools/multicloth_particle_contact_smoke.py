@@ -17,6 +17,10 @@ import ssbl
 
 FRAME_COUNT = max(int(os.environ.get("SSBL_PARTICLE_CONTACT_FRAMES", "48")), 1)
 GRID_SUBDIVISIONS = max(int(os.environ.get("SSBL_PARTICLE_CONTACT_GRID", "24")), 4)
+EXPECT_LARGE_GRID = (
+    os.environ.get("SSBL_PARTICLE_CONTACT_EXPECT_LARGE", "").strip().lower() in {"1", "true", "yes", "on"}
+    or GRID_SUBDIVISIONS >= 96
+)
 
 
 def _clear_scene() -> None:
@@ -115,8 +119,10 @@ def main() -> None:
         result = {
             "slots": len(session.slots),
             "cross_mode": str(session.cross_cloth_mode),
+            "expect_large_grid": bool(EXPECT_LARGE_GRID),
             "frames": FRAME_COUNT,
             "finite": bool(finite),
+            "grid_subdivisions": int(GRID_SUBDIVISIONS),
             "max_dynamic_particle_count": int(max_dynamic_particles),
             "max_dynamic_particle_candidate_count": int(max_particle_candidates),
             "max_dynamic_particle_contacts": int(max_particle_contacts),
@@ -141,6 +147,15 @@ def main() -> None:
             and result["stopped"]
         ):
             raise RuntimeError(f"Multi-cloth particle contact smoke failed: {result}")
+        if EXPECT_LARGE_GRID and not (
+            result["max_dynamic_particle_count"] > 8192
+            and result["max_dynamic_triangle_count"] > 4096
+            and result["max_dynamic_particle_candidate_count"] > 0
+            and result["max_dynamic_particle_contacts"] > 0
+            and result["max_resolved_contacts"] > 0
+            and result["finite"]
+        ):
+            raise RuntimeError(f"Large multi-cloth particle contact smoke failed: {result}")
     finally:
         ssbl.unregister()
 

@@ -2765,14 +2765,14 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
                 abi41_build_static_triangle_pairs_kernel<<<v_blocks, kThreads>>>(*solver);
                 abi41_resolve_triangle_pairs_kernel<<<block_count(solver->triangle_pair_capacity), kThreads>>>(*solver);
             }
-            if (solver->dynamic_triangle_count > 0 && solver->dynamic_triangle_count <= 4096) {
+            if (solver->dynamic_triangle_count > 0) {
                 if (!set_cuda_error(cudaMemset(solver->triangle_pair_count, 0, sizeof(int)), "reset dynamic triangle pair count")) {
                     return 0;
                 }
                 abi41_build_dynamic_triangle_pairs_kernel<<<v_blocks, kThreads>>>(*solver);
                 abi41_resolve_triangle_pairs_kernel<<<block_count(solver->triangle_pair_capacity), kThreads>>>(*solver);
             }
-            if (solver->dynamic_particle_count > 0 && solver->dynamic_particle_count <= 8192) {
+            if (solver->dynamic_particle_count > 0) {
                 abi41_dynamic_particle_collision_kernel<<<v_blocks, kThreads>>>(*solver);
             }
             if (solver->cfg.self_collision) {
