@@ -11,6 +11,7 @@ native/build/
 native/lib/
 native/bin/*.dll
 !native/bin/ssbl_xpbd_cuda_abi16.dll
+native/bin/*.exe
 native/bin/*.exp
 native/bin/*.lib
 

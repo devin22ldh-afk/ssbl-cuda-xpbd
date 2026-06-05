@@ -63,7 +63,6 @@ def _configure() -> None:
     settings.use_evaluated_mesh = True
     settings.preview_writeback_interval = 0
     settings.preview_target_fps = 30.0
-    settings.self_collision_mode = "off"
     settings.use_volume_pressure = False
     settings.use_ground = False
     settings.use_wall = False

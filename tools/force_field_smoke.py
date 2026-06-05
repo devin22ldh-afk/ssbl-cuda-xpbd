@@ -33,7 +33,6 @@ def _make_cloth(name: str) -> bpy.types.Object:
     settings.enabled = True
     settings.pin_vertex_group = ""
     settings.use_evaluated_mesh = False
-    settings.self_collision_mode = "off"
     settings.use_volume_pressure = False
     settings.use_ground = False
     settings.gravity = (0.0, 0.0, 0.0)

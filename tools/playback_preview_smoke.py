@@ -57,7 +57,6 @@ def _make_cloth(name: str, location: tuple[float, float, float]) -> bpy.types.Ob
     settings.enabled = True
     settings.pin_vertex_group = "ssbl_pin"
     settings.use_evaluated_mesh = True
-    settings.self_collision_mode = "off"
     settings.use_volume_pressure = False
     settings.use_ground = False
     settings.use_wall = False

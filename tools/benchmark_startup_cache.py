@@ -56,7 +56,6 @@ def _make_default_cloth() -> bpy.types.Object:
     settings = bpy.context.scene.ssbl_preview
     settings.pin_vertex_group = "ssbl_pin"
     settings.use_evaluated_mesh = True
-    settings.self_collision_mode = "off"
     settings.use_volume_pressure = False
     settings.use_ground = False
     settings.use_wall = False

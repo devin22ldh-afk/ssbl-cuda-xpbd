@@ -150,6 +150,11 @@ typedef struct SsblXpbdDiagnostics {
     long long fast_cc_overlap_guarded;
     long long fast_cc_overlap_applied_vertices;
     float fast_cc_overlap_max_delta;
+    long long abi41_soft_contact_count;
+    long long abi41_exact_impulse_contact_count;
+    long long abi41_edge_edge_contact_count;
+    float abi41_max_smoothed_delta;
+    long long abi41_hard_projection_fallbacks;
 } SsblXpbdDiagnostics;
 
 typedef struct SsblXpbdMesh {

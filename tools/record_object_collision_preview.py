@@ -216,7 +216,6 @@ def _configure_common(settings):
     settings.stretch_compliance = 1e-6
     settings.bend_compliance = 1e-4
     settings.self_collision = False
-    settings.self_collision_mode = "off"
     settings.use_volume_pressure = False
     settings.collision_margin = MARGIN
     settings.use_ground = False

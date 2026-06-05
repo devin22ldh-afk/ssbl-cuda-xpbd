@@ -99,7 +99,6 @@ def main():
     settings.use_sphere = True
     settings.sphere_object = sphere
     settings.static_collider_collection = collider_collection
-    settings.self_collision_mode = "off"
     settings.bake_start = 1
     settings.bake_end = 10
 

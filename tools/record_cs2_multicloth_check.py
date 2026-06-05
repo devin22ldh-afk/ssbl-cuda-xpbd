@@ -279,7 +279,6 @@ def main() -> None:
         obj.ssbl_cloth.preview_writeback_interval = 0
         if DISABLE_SELF_COLLISION:
             obj.ssbl_cloth.self_collision = False
-            obj.ssbl_cloth.self_collision_mode = "off"
     cube.select_set(SELECT_CUBE)
     suzanne.select_set(SELECT_SUZANNE)
     active_obj.select_set(True)

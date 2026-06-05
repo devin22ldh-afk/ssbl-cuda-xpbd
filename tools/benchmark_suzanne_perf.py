@@ -119,7 +119,8 @@ def _configure(settings, *, self_collision: bool, volume: bool, optimized: bool)
     settings.use_ground = False
     settings.use_wall = False
     settings.use_sphere = False
-    settings.self_collision_mode = "fast" if self_collision else "off"
+    if self_collision:
+        settings.self_collision_mode = "fast"
     settings.self_collision_interval = (
         _int_env("SSBL_SUZANNE_SELF_COLLISION_INTERVAL", 4 if optimized and self_collision else 1)
         if self_collision

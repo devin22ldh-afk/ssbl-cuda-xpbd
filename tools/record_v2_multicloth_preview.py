@@ -131,7 +131,6 @@ def main() -> None:
     settings.use_ground = False
     settings.multi_cloth_preview = True
     settings.cross_cloth_collision = "lower_layers"
-    settings.self_collision_mode = "off"
     settings.collision_margin = 0.04
     settings.substeps = 4
     settings.iterations = 1

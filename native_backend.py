@@ -249,6 +249,11 @@ class _NativeDiagnostics(ctypes.Structure):
         ("fast_cc_overlap_guarded", ctypes.c_longlong),
         ("fast_cc_overlap_applied_vertices", ctypes.c_longlong),
         ("fast_cc_overlap_max_delta", ctypes.c_float),
+        ("abi41_soft_contact_count", ctypes.c_longlong),
+        ("abi41_exact_impulse_contact_count", ctypes.c_longlong),
+        ("abi41_edge_edge_contact_count", ctypes.c_longlong),
+        ("abi41_max_smoothed_delta", ctypes.c_float),
+        ("abi41_hard_projection_fallbacks", ctypes.c_longlong),
     ]
 
 
@@ -348,6 +353,11 @@ class NativeStepDiagnostics:
     fast_cc_overlap_guarded: int = 0
     fast_cc_overlap_applied_vertices: int = 0
     fast_cc_overlap_max_delta: float = 0.0
+    abi41_soft_contact_count: int = 0
+    abi41_exact_impulse_contact_count: int = 0
+    abi41_edge_edge_contact_count: int = 0
+    abi41_max_smoothed_delta: float = 0.0
+    abi41_hard_projection_fallbacks: int = 0
     frame_ms: float = 0.0
     frame_set_ms: float = 0.0
     input_refresh_ms: float = 0.0
@@ -375,6 +385,15 @@ class NativeStepDiagnostics:
 
 _LIB = None
 _LOAD_ERROR = ""
+_ABI41_DLL_NAME = "ssbl_xpbd_cuda_abi37.dll"
+_LEGACY_DLL_NAME = "ssbl_xpbd_cuda_abi36.dll"
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    return value.strip().lower() not in {"", "0", "false", "no", "off"}
 
 
 def dll_path() -> str:
@@ -382,7 +401,14 @@ def dll_path() -> str:
     if override:
         return override
     root = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(root, "native", "bin", "ssbl_xpbd_cuda_abi36.dll")
+    native_bin = os.path.join(root, "native", "bin")
+    legacy = os.path.join(native_bin, _LEGACY_DLL_NAME)
+    if _env_bool("SSBL_LEGACY_NATIVE", False):
+        return legacy
+    recon = os.path.join(native_bin, _ABI41_DLL_NAME)
+    if os.path.exists(recon):
+        return recon
+    return legacy
 
 
 def status() -> NativeStatus:
@@ -404,7 +430,7 @@ def _load_library():
     path = dll_path()
     if not os.path.exists(path):
         raise NativeBackendUnavailable(
-            "Missing CUDA solver DLL. Install CUDA Toolkit, CMake, and VS Build Tools, then run native/build.ps1."
+            "Missing CUDA solver DLL. Install CUDA Toolkit, CMake, and VS Build Tools, then run native/build_recon.ps1 or native/build.ps1."
         )
 
     try:
@@ -936,6 +962,11 @@ class NativeXpbdSolver:
             fast_cc_overlap_guarded=int(raw.fast_cc_overlap_guarded),
             fast_cc_overlap_applied_vertices=int(raw.fast_cc_overlap_applied_vertices),
             fast_cc_overlap_max_delta=float(raw.fast_cc_overlap_max_delta),
+            abi41_soft_contact_count=int(raw.abi41_soft_contact_count),
+            abi41_exact_impulse_contact_count=int(raw.abi41_exact_impulse_contact_count),
+            abi41_edge_edge_contact_count=int(raw.abi41_edge_edge_contact_count),
+            abi41_max_smoothed_delta=float(raw.abi41_max_smoothed_delta),
+            abi41_hard_projection_fallbacks=int(raw.abi41_hard_projection_fallbacks),
         )
         self._last_diagnostics = diag
         return diag

@@ -88,7 +88,6 @@ def _make_generated_scene() -> tuple[bpy.types.Object, bpy.types.Object]:
     sphere.ssbl_cloth.volume_compliance = 1.0e-6
     sphere.ssbl_cloth.pressure_strength = 0.25
     sphere.ssbl_cloth.self_collision = False
-    sphere.ssbl_cloth.self_collision_mode = "off"
     return sphere, monkey
 
 

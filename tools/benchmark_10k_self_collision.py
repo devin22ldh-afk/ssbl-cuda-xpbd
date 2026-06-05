@@ -32,8 +32,8 @@ def _configure(settings, mode, hardness):
     settings.pin_vertex_group = "ssbl_pin"
     settings.hardness = float(hardness)
     settings.hardness_initialized = True
-    settings.self_collision = False
-    settings.self_collision_mode = mode
+    settings.self_collision = mode != "off"
+    settings.self_collision_mode = "fast" if mode == "off" else mode
     settings.self_collision_interval = 2 if mode == "fast" else 1
     settings.max_self_collision_neighbors = 32
     settings.use_ground = True

@@ -280,6 +280,11 @@ def record_viewport_tag_ms(object_name: str, elapsed_ms: float) -> None:
         fast_cc_overlap_guarded=diag.fast_cc_overlap_guarded,
         fast_cc_overlap_applied_vertices=diag.fast_cc_overlap_applied_vertices,
         fast_cc_overlap_max_delta=diag.fast_cc_overlap_max_delta,
+        abi41_soft_contact_count=diag.abi41_soft_contact_count,
+        abi41_exact_impulse_contact_count=diag.abi41_exact_impulse_contact_count,
+        abi41_edge_edge_contact_count=diag.abi41_edge_edge_contact_count,
+        abi41_max_smoothed_delta=diag.abi41_max_smoothed_delta,
+        abi41_hard_projection_fallbacks=diag.abi41_hard_projection_fallbacks,
         frame_ms=diag.frame_ms,
         frame_set_ms=diag.frame_set_ms,
         input_refresh_ms=diag.input_refresh_ms,
@@ -2166,6 +2171,11 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
     fast_cc_overlap_guarded = 0
     fast_cc_overlap_applied_vertices = 0
     fast_cc_overlap_max_delta = 0.0
+    abi41_soft_contact_count = 0
+    abi41_exact_impulse_contact_count = 0
+    abi41_edge_edge_contact_count = 0
+    abi41_max_smoothed_delta = 0.0
+    abi41_hard_projection_fallbacks = 0
     finite = True
     writeback_performed = False
     diag_started = time.perf_counter()
@@ -2257,6 +2267,11 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
         fast_cc_overlap_guarded += int(diag.fast_cc_overlap_guarded)
         fast_cc_overlap_applied_vertices += int(diag.fast_cc_overlap_applied_vertices)
         fast_cc_overlap_max_delta = max(fast_cc_overlap_max_delta, float(diag.fast_cc_overlap_max_delta))
+        abi41_soft_contact_count += int(diag.abi41_soft_contact_count)
+        abi41_exact_impulse_contact_count += int(diag.abi41_exact_impulse_contact_count)
+        abi41_edge_edge_contact_count += int(diag.abi41_edge_edge_contact_count)
+        abi41_max_smoothed_delta = max(abi41_max_smoothed_delta, float(diag.abi41_max_smoothed_delta))
+        abi41_hard_projection_fallbacks += int(diag.abi41_hard_projection_fallbacks)
         finite = finite and bool(diag.finite)
         writeback_performed = writeback_performed or bool(diag.writeback_performed)
         if diag.min_gap is not None:
@@ -2351,6 +2366,11 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
         fast_cc_overlap_guarded=fast_cc_overlap_guarded,
         fast_cc_overlap_applied_vertices=fast_cc_overlap_applied_vertices,
         fast_cc_overlap_max_delta=fast_cc_overlap_max_delta,
+        abi41_soft_contact_count=abi41_soft_contact_count,
+        abi41_exact_impulse_contact_count=abi41_exact_impulse_contact_count,
+        abi41_edge_edge_contact_count=abi41_edge_edge_contact_count,
+        abi41_max_smoothed_delta=abi41_max_smoothed_delta,
+        abi41_hard_projection_fallbacks=abi41_hard_projection_fallbacks,
         finite=finite,
         frame_ms=perf.frame_ms if perf is not None else 0.0,
         frame_set_ms=perf.frame_set_ms if perf is not None else 0.0,

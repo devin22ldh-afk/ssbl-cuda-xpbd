@@ -38,7 +38,6 @@ def _configure_settings(settings) -> None:
     settings.gravity = (0.0, 0.0, 0.0)
     settings.hardness = 0.55
     settings.self_collision = False
-    settings.self_collision_mode = "off"
     settings.use_volume_pressure = False
     settings.collision_margin = 0.008
     settings.cloth_thickness = 0.05

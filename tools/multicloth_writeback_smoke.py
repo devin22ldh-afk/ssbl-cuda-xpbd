@@ -71,7 +71,6 @@ def _configure_cloth(obj: bpy.types.Object) -> None:
     settings.gravity = (0.0, 0.0, 0.0)
     settings.hardness = 0.45
     settings.self_collision = False
-    settings.self_collision_mode = "off"
     settings.use_volume_pressure = False
     settings.collision_margin = 0.004
     settings.cloth_thickness = 0.03

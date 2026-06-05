@@ -626,7 +626,6 @@ def _configure_cloth_settings(settings, *, frame_count: int, pin_group: str = ""
     settings.hardness = 0.55
     settings.hardness_initialized = True
     settings.self_collision = False
-    settings.self_collision_mode = "off"
     settings.use_volume_pressure = False
     settings.collision_margin = 0.01
     settings.cloth_thickness = 0.05

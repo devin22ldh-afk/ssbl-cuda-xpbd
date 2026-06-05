@@ -40,7 +40,6 @@ def _configure_common() -> None:
     settings.use_wall = False
     settings.static_collider_collection = None
     settings.collision_margin = 0.035
-    settings.self_collision_mode = "off"
     settings.substeps = 4
     settings.iterations = 1
     settings.frame_count = 80
