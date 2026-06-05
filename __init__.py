@@ -478,6 +478,102 @@ class SSBL_PreviewSettings(PropertyGroup):
         precision=3,
         description="SSBL 接收 Blender 力场时使用的整体强度倍率",
     )
+    force_field_weight_gravity: FloatProperty(
+        name="重力",
+        default=1.0,
+        min=0.0,
+        max=1.0,
+        precision=3,
+        description="Scale scene gravity for SSBL cloth",
+    )
+    force_field_weight_all: FloatProperty(
+        name="全部",
+        default=1.0,
+        min=0.0,
+        max=1.0,
+        precision=3,
+        description="Scale all non-gravity Blender force fields for SSBL cloth",
+    )
+    force_field_weight_force: FloatProperty(
+        name="常力",
+        default=1.0,
+        min=0.0,
+        max=1.0,
+        precision=3,
+        description="Scale Force effector influence for SSBL cloth",
+    )
+    force_field_weight_vortex: FloatProperty(
+        name="涡流",
+        default=1.0,
+        min=0.0,
+        max=1.0,
+        precision=3,
+        description="Scale Vortex effector influence for SSBL cloth",
+    )
+    force_field_weight_magnetic: FloatProperty(
+        name="磁力",
+        default=1.0,
+        min=0.0,
+        max=1.0,
+        precision=3,
+        description="Scale Magnetic effector influence for SSBL cloth",
+    )
+    force_field_weight_harmonic: FloatProperty(
+        name="谐振",
+        default=1.0,
+        min=0.0,
+        max=1.0,
+        precision=3,
+        description="Scale Harmonic effector influence for SSBL cloth",
+    )
+    force_field_weight_charge: FloatProperty(
+        name="电荷",
+        default=1.0,
+        min=0.0,
+        max=1.0,
+        precision=3,
+        description="Scale Charge effector influence for SSBL cloth",
+    )
+    force_field_weight_lennardjones: FloatProperty(
+        name="兰纳琼斯分子力",
+        default=1.0,
+        min=0.0,
+        max=1.0,
+        precision=3,
+        description="Scale Lennard-Jones effector influence for SSBL cloth",
+    )
+    force_field_weight_wind: FloatProperty(
+        name="风力",
+        default=1.0,
+        min=0.0,
+        max=1.0,
+        precision=3,
+        description="Scale Wind effector influence for SSBL cloth",
+    )
+    force_field_weight_texture: FloatProperty(
+        name="纹理",
+        default=1.0,
+        min=0.0,
+        max=1.0,
+        precision=3,
+        description="Scale Texture effector influence for SSBL cloth",
+    )
+    force_field_weight_turbulence: FloatProperty(
+        name="紊流",
+        default=1.0,
+        min=0.0,
+        max=1.0,
+        precision=3,
+        description="Scale Turbulence effector influence for SSBL cloth",
+    )
+    force_field_weight_drag: FloatProperty(
+        name="拖拽",
+        default=1.0,
+        min=0.0,
+        max=1.0,
+        precision=3,
+        description="Scale Drag effector influence for SSBL cloth",
+    )
     pin_vertex_group: StringProperty(
         name="固定点组",
         default="ssbl_pin",
@@ -685,7 +781,6 @@ CLASSES = (
     operators.SSBL_OT_bake_xpbd_cache,
     operators.SSBL_OT_clear_xpbd_cache,
     ui.SSBL_PT_physics_panel,
-    ui.SSBL_PT_force_field_panel,
 )
 
 

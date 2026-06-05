@@ -1515,7 +1515,7 @@ def _refresh_session_runtime_inputs(context: bpy.types.Context, session: SceneSe
                     depsgraph=depsgraph,
                     use_evaluated_mesh=slot.use_evaluated_mesh,
                 )
-            force_fields_enabled = bool(getattr(settings, "use_blender_force_fields", False))
+            force_fields_enabled = has_force_field_sources(context.scene, settings)
             force_fields = (
                 collect_force_fields(context.scene, depsgraph, settings)
                 if force_fields_enabled
@@ -1778,11 +1778,7 @@ def _refresh_bake_runtime_inputs(
         np.ascontiguousarray(world_positions[cloth.pin_indices], dtype=np.float32),
     )
     pin_targets = pin_attachment_batch.targets_world
-    force_fields = (
-        collect_force_fields(context.scene, depsgraph, settings)
-        if bool(getattr(settings, "use_blender_force_fields", False))
-        else None
-    )
+    force_fields = collect_force_fields(context.scene, depsgraph, settings) if has_force_field_sources(context.scene, settings) else None
     native.update_frame_inputs(
         pin_indices=cloth.pin_indices,
         pin_positions=pin_targets,

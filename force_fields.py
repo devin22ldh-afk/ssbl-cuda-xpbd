@@ -33,6 +33,42 @@ _SUPPORTED_TYPES = {
     "TEXTURE": FORCE_FIELD_TEXTURE,
 }
 
+_FIELD_TYPE_TO_WEIGHT_PROPERTY = {
+    "FORCE": "force_field_weight_force",
+    "WIND": "force_field_weight_wind",
+    "VORTEX": "force_field_weight_vortex",
+    "TURBULENCE": "force_field_weight_turbulence",
+    "CHARGE": "force_field_weight_charge",
+    "HARMONIC": "force_field_weight_harmonic",
+    "LENNARDJ": "force_field_weight_lennardjones",
+    "MAGNET": "force_field_weight_magnetic",
+    "DRAG": "force_field_weight_drag",
+    "TEXTURE": "force_field_weight_texture",
+}
+
+_VISIBLE_WEIGHT_PROPERTY_GROUPS = (
+    (
+        "force_field_weight_gravity",
+        "force_field_weight_all",
+        "force_field_weight_force",
+        "force_field_weight_vortex",
+    ),
+    (
+        "force_field_weight_magnetic",
+        "force_field_weight_harmonic",
+        "force_field_weight_charge",
+        "force_field_weight_lennardjones",
+    ),
+    (
+        "force_field_weight_wind",
+        "force_field_weight_texture",
+    ),
+    (
+        "force_field_weight_turbulence",
+        "force_field_weight_drag",
+    ),
+)
+
 
 @dataclass(frozen=True)
 class ForceFieldSample:
@@ -72,13 +108,39 @@ class ForceFieldBatch:
 EMPTY_FORCE_FIELD_BATCH = ForceFieldBatch()
 
 
-def _field_weight(obj: bpy.types.Object) -> float:
-    weight = float(getattr(obj, "ssbl_force_field_weight", obj.get("ssbl_force_field_weight", 1.0)))
-    if weight < 0.0:
+def visible_force_field_weight_groups() -> tuple[tuple[str, ...], ...]:
+    return _VISIBLE_WEIGHT_PROPERTY_GROUPS
+
+
+def visible_force_field_weight_properties() -> tuple[str, ...]:
+    return tuple(prop_name for group in _VISIBLE_WEIGHT_PROPERTY_GROUPS for prop_name in group)
+
+
+def _clamp_weight(value: float) -> float:
+    if value < 0.0:
         return 0.0
-    if weight > 1.0:
+    if value > 1.0:
         return 1.0
-    return weight
+    return value
+
+
+def _setting_weight(settings, identifier: str, default: float = 1.0) -> float:
+    return _clamp_weight(float(getattr(settings, identifier, default)))
+
+
+def gravity_weight(settings) -> float:
+    return _setting_weight(settings, "force_field_weight_gravity", 1.0)
+
+
+def all_force_field_weight(settings) -> float:
+    return _setting_weight(settings, "force_field_weight_all", 1.0)
+
+
+def field_type_weight(settings, field_type_name: str) -> float:
+    prop_name = _FIELD_TYPE_TO_WEIGHT_PROPERTY.get(str(field_type_name).upper())
+    if prop_name is None:
+        return 0.0
+    return _setting_weight(settings, prop_name, 1.0)
 
 
 def _safe_normalized(vec: Vector, fallback: tuple[float, float, float]) -> tuple[float, float, float]:
@@ -94,16 +156,21 @@ def _field_objects(scene: bpy.types.Scene, collection: bpy.types.Collection | No
     return scene.objects
 
 
-def has_force_field_sources(scene: bpy.types.Scene, settings) -> bool:
-    if not bool(getattr(settings, "use_blender_force_fields", False)):
-        return False
-    collection = getattr(settings, "force_field_collection", None)
-    for obj in _field_objects(scene, collection):
+def _iter_force_field_sources(objects: Iterable[bpy.types.Object]):
+    for obj in objects:
         field = getattr(obj, "field", None)
         if field is None:
             continue
         field_type_name = str(getattr(field, "type", "NONE")).upper()
-        if field_type_name not in {"", "NONE"}:
+        if field_type_name in {"", "NONE"}:
+            continue
+        yield obj, field, field_type_name
+
+
+def has_force_field_sources(scene: bpy.types.Scene, settings) -> bool:
+    collection = getattr(settings, "force_field_collection", None)
+    for _obj, _field, field_type_name in _iter_force_field_sources(_field_objects(scene, collection)):
+        if field_type_name in _SUPPORTED_TYPES:
             return True
     return False
 
@@ -129,22 +196,17 @@ def collect_force_fields(
     depsgraph: bpy.types.Depsgraph | None,
     settings,
 ) -> ForceFieldBatch:
-    if not bool(getattr(settings, "use_blender_force_fields", False)):
-        return EMPTY_FORCE_FIELD_BATCH
-
     collection = getattr(settings, "force_field_collection", None)
-    strength_scale = float(getattr(settings, "force_field_strength_scale", 1.0))
+    all_weight = all_force_field_weight(settings)
     fields: list[ForceFieldSample] = []
     unsupported_count = 0
 
-    for source_obj in _field_objects(scene, collection):
+    for source_obj, _source_field, field_type_name in _iter_force_field_sources(_field_objects(scene, collection)):
         obj = _evaluated_object(source_obj, depsgraph)
         field = getattr(obj, "field", None)
         if field is None:
             continue
-        field_type_name = str(getattr(field, "type", "NONE")).upper()
-        if field_type_name in {"", "NONE"}:
-            continue
+
         field_type = _SUPPORTED_TYPES.get(field_type_name)
         if field_type is None:
             unsupported_count += 1
@@ -155,11 +217,12 @@ def collect_force_fields(
         matrix = obj.matrix_world.copy()
         direction, axis = _matrix_axes(matrix)
         origin = matrix.translation
-        weight = _field_weight(source_obj)
+        type_weight = field_type_weight(settings, field_type_name)
+        strength = float(getattr(field, "strength", 0.0)) * all_weight * type_weight
         fields.append(
             ForceFieldSample(
                 field_type=field_type,
-                strength=float(getattr(field, "strength", 0.0)) * strength_scale * weight,
+                strength=strength,
                 origin=(float(origin.x), float(origin.y), float(origin.z)),
                 direction=direction,
                 axis=axis,

@@ -9,6 +9,8 @@ import bmesh
 import bpy
 import numpy as np
 
+from .force_fields import gravity_weight
+
 
 _EPS = 1.0e-8
 SELF_COLLISION_OFF = 0
@@ -903,7 +905,7 @@ def settings_to_options(settings, runtime_mode_override: str | None = None) -> S
     return SolverOptions(
         dt=float(settings.dt),
         damping=float(settings.damping),
-        gravity=np.asarray(settings.gravity, dtype=np.float32),
+        gravity=np.asarray(settings.gravity, dtype=np.float32) * gravity_weight(settings),
         stretch_compliance=float(derived.stretch_compliance),
         stretch_optimization_enabled=bool(derived.stretch_optimization_enabled),
         stretch_optimization_strength=float(derived.stretch_optimization_strength),

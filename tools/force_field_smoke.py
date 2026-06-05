@@ -14,7 +14,23 @@ if ADDONS_ROOT not in sys.path:
     sys.path.insert(0, ADDONS_ROOT)
 
 import ssbl
-from ssbl.force_fields import collect_force_fields
+from ssbl.force_fields import collect_force_fields, visible_force_field_weight_properties
+
+
+EXPECTED_VISIBLE_WEIGHT_ORDER = (
+    "force_field_weight_gravity",
+    "force_field_weight_all",
+    "force_field_weight_force",
+    "force_field_weight_vortex",
+    "force_field_weight_magnetic",
+    "force_field_weight_harmonic",
+    "force_field_weight_charge",
+    "force_field_weight_lennardjones",
+    "force_field_weight_wind",
+    "force_field_weight_texture",
+    "force_field_weight_turbulence",
+    "force_field_weight_drag",
+)
 
 
 def _clear_scene() -> None:
@@ -25,8 +41,17 @@ def _clear_scene() -> None:
             bpy.data.collections.remove(collection)
 
 
-def _make_cloth(name: str) -> bpy.types.Object:
-    bpy.ops.mesh.primitive_grid_add(x_subdivisions=9, y_subdivisions=9, size=1.0, location=(0.0, 0.0, 0.0))
+def _make_cloth(
+    name: str,
+    location: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    gravity: tuple[float, float, float] = (0.0, 0.0, 0.0),
+) -> bpy.types.Object:
+    bpy.ops.mesh.primitive_grid_add(
+        x_subdivisions=9,
+        y_subdivisions=9,
+        size=1.0,
+        location=location,
+    )
     obj = bpy.context.object
     obj.name = name
     settings = obj.ssbl_cloth
@@ -35,7 +60,7 @@ def _make_cloth(name: str) -> bpy.types.Object:
     settings.use_evaluated_mesh = False
     settings.use_volume_pressure = False
     settings.use_ground = False
-    settings.gravity = (0.0, 0.0, 0.0)
+    settings.gravity = gravity
     settings.substeps = 2
     settings.iterations = 1
     settings.preview_writeback_interval = 1
@@ -52,8 +77,8 @@ def _add_wind(name: str, strength: float, rotation=(0.0, math.pi / 2.0, 0.0)) ->
     return obj
 
 
-def _average_x(obj: bpy.types.Object) -> float:
-    return sum(float(vertex.co.x) for vertex in obj.data.vertices) / max(len(obj.data.vertices), 1)
+def _average_axis(obj: bpy.types.Object, axis_name: str) -> float:
+    return sum(float(getattr(vertex.co, axis_name)) for vertex in obj.data.vertices) / max(len(obj.data.vertices), 1)
 
 
 def _run_preview(scene: bpy.types.Scene, obj: bpy.types.Object, steps: int = 5) -> dict[str, object]:
@@ -66,7 +91,8 @@ def _run_preview(scene: bpy.types.Scene, obj: bpy.types.Object, steps: int = 5) 
         scene.frame_current = frame
         ssbl.solver.step_timeline_preview(bpy.context, scene)
     diag = ssbl.solver.session_diagnostics(obj)
-    avg_x = _average_x(obj)
+    avg_x = _average_axis(obj, "x")
+    avg_z = _average_axis(obj, "z")
     finite = all(
         math.isfinite(float(component))
         for vertex in obj.data.vertices
@@ -76,6 +102,7 @@ def _run_preview(scene: bpy.types.Scene, obj: bpy.types.Object, steps: int = 5) 
     return {
         "slots": len(session.slots) if session else 0,
         "avg_x": avg_x,
+        "avg_z": avg_z,
         "finite": bool(finite and diag.finite),
         "force_field_count": int(diag.force_field_count),
         "unsupported_force_field_count": int(diag.unsupported_force_field_count),
@@ -105,28 +132,48 @@ def main() -> None:
 
         _clear_scene()
         off_cloth = _make_cloth("SSBL_Force_Off")
-        default_force_fields_enabled = bool(off_cloth.ssbl_cloth.use_blender_force_fields)
-        off_cloth.ssbl_cloth.use_blender_force_fields = False
         off = _run_preview(scene, off_cloth)
 
         _clear_scene()
         on_cloth = _make_cloth("SSBL_Force_On")
-        on_cloth.ssbl_cloth.use_blender_force_fields = True
         _add_wind("SSBL_Wind_On", 30.0)
         on = _run_preview(scene, on_cloth)
 
         _clear_scene()
         weighted_cloth = _make_cloth("SSBL_Force_Weighted")
-        weighted_cloth.ssbl_cloth.use_blender_force_fields = True
-        weighted_wind = _add_wind("SSBL_Wind_Weighted", 30.0)
-        weighted_wind.ssbl_force_field_weight = 0.25
+        weighted_cloth.ssbl_cloth.force_field_weight_wind = 0.25
+        _add_wind("SSBL_Wind_Weighted", 30.0)
         weighted = _run_preview(scene, weighted_cloth)
         weighted_batch = collect_force_fields(scene, bpy.context.evaluated_depsgraph_get(), weighted_cloth.ssbl_cloth)
         weighted_strength = weighted_batch.fields[0].strength if weighted_batch.fields else 0.0
 
         _clear_scene()
+        all_zero_cloth = _make_cloth("SSBL_Force_AllZero")
+        all_zero_cloth.ssbl_cloth.force_field_weight_all = 0.0
+        _add_wind("SSBL_Wind_AllZero", 30.0)
+        all_zero = _run_preview(scene, all_zero_cloth)
+        all_zero_batch = collect_force_fields(scene, bpy.context.evaluated_depsgraph_get(), all_zero_cloth.ssbl_cloth)
+        all_zero_strength = all_zero_batch.fields[0].strength if all_zero_batch.fields else 0.0
+
+        _clear_scene()
+        gravity_zero_cloth = _make_cloth(
+            "SSBL_Gravity_Zero",
+            location=(0.0, 0.0, 1.0),
+            gravity=(0.0, 0.0, -9.8),
+        )
+        gravity_zero_cloth.ssbl_cloth.force_field_weight_gravity = 0.0
+        gravity_zero = _run_preview(scene, gravity_zero_cloth)
+
+        _clear_scene()
+        gravity_on_cloth = _make_cloth(
+            "SSBL_Gravity_On",
+            location=(0.0, 0.0, 1.0),
+            gravity=(0.0, 0.0, -9.8),
+        )
+        gravity_on = _run_preview(scene, gravity_on_cloth)
+
+        _clear_scene()
         key_cloth = _make_cloth("SSBL_Force_Key")
-        key_cloth.ssbl_cloth.use_blender_force_fields = True
         key_wind = _add_wind("SSBL_Wind_Key", 1.0)
         scene.frame_set(1)
         key_wind.field.strength = 1.0
@@ -141,14 +188,14 @@ def main() -> None:
 
         _clear_scene()
         transform_cloth = _make_cloth("SSBL_Force_Transform")
-        transform_cloth.ssbl_cloth.use_blender_force_fields = True
         _add_wind("SSBL_Wind_Transform", 1.0, rotation=(0.0, math.pi / 2.0, 0.0))
         transform_batch = collect_force_fields(scene, bpy.context.evaluated_depsgraph_get(), transform_cloth.ssbl_cloth)
         transform_direction = transform_batch.fields[0].direction if transform_batch.fields else (0.0, 0.0, 0.0)
 
         _clear_scene()
         collection_cloth = _make_cloth("SSBL_Force_Collection")
-        collection_cloth.ssbl_cloth.use_blender_force_fields = True
+        collection_cloth.ssbl_cloth.force_field_weight_all = 0.5
+        collection_cloth.ssbl_cloth.force_field_weight_wind = 0.5
         included = _add_wind("SSBL_Wind_Included", 3.0)
         _add_wind("SSBL_Wind_Excluded", 5.0)
         collection = bpy.data.collections.new("SSBL_Force_Collection_Filter")
@@ -187,10 +234,10 @@ def main() -> None:
             except Exception:
                 pass
         supported_batch = collect_force_fields(scene, bpy.context.evaluated_depsgraph_get(), supported_cloth.ssbl_cloth)
+        visible_weight_order = tuple(visible_force_field_weight_properties())
 
         _clear_scene()
         bake_cloth = _make_cloth("SSBL_Force_Bake")
-        bake_cloth.ssbl_cloth.use_blender_force_fields = True
         _add_wind("SSBL_Wind_Bake", 40.0)
         cache_path = ssbl.solver.bake_xpbd_cache(bpy.context, bake_cloth)
         first_sample_x = _read_pc2_average_x(cache_path, 0)
@@ -199,17 +246,23 @@ def main() -> None:
         ssbl.solver.clear_xpbd_cache(bake_cloth)
 
         result = {
-            "default_force_fields_enabled": default_force_fields_enabled,
             "off": off,
             "on": on,
             "preview_delta_x": on["avg_x"] - off["avg_x"],
             "weighted": weighted,
             "weighted_strength": weighted_strength,
             "weighted_preview_delta_x": weighted["avg_x"] - off["avg_x"],
+            "all_zero": all_zero,
+            "all_zero_strength": all_zero_strength,
+            "all_zero_preview_delta_x": all_zero["avg_x"] - off["avg_x"],
+            "gravity_zero": gravity_zero,
+            "gravity_on": gravity_on,
+            "gravity_delta_z": gravity_zero["avg_z"] - gravity_on["avg_z"],
             "key_strength_frame_5": key_strength,
             "transform_direction": transform_direction,
             "collection_count": len(collection_batch.fields),
             "collection_strength": collection_batch.fields[0].strength if collection_batch.fields else 0.0,
+            "visible_weight_order": visible_weight_order,
             "supported_field_count": len(supported_batch.fields),
             "unsupported_field_count": int(supported_batch.unsupported_count),
             "bake_first_sample_x": first_sample_x,
@@ -219,7 +272,6 @@ def main() -> None:
         print("SSBL_FORCE_FIELD_SMOKE", json.dumps(result, ensure_ascii=False, sort_keys=True))
         if not (
             off["finite"]
-            and result["default_force_fields_enabled"]
             and on["finite"]
             and on["force_field_count"] == 1
             and on["unsupported_force_field_count"] == 0
@@ -229,10 +281,18 @@ def main() -> None:
             and abs(result["weighted_strength"] - 7.5) < 1.0e-4
             and result["weighted_preview_delta_x"] > 0.005
             and result["weighted_preview_delta_x"] < result["preview_delta_x"]
+            and all_zero["finite"]
+            and all_zero["force_field_count"] == 1
+            and abs(result["all_zero_strength"]) < 1.0e-6
+            and abs(result["all_zero_preview_delta_x"]) < 1.0e-4
+            and gravity_zero["finite"]
+            and gravity_on["finite"]
+            and result["gravity_delta_z"] > 0.02
             and 1.0 < key_strength < 9.0
             and transform_direction[0] > 0.85
             and result["collection_count"] == 1
-            and abs(result["collection_strength"] - 3.0) < 1.0e-4
+            and abs(result["collection_strength"] - 0.75) < 1.0e-4
+            and result["visible_weight_order"] == EXPECTED_VISIBLE_WEIGHT_ORDER
             and result["supported_field_count"] == created_supported
             and result["unsupported_field_count"] == created_unsupported
             and result["bake_cache_exists"]

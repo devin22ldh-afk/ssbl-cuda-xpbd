@@ -3,6 +3,7 @@ from __future__ import annotations
 import bpy
 
 from . import solver
+from .force_fields import visible_force_field_weight_groups
 
 
 def _active_cloth_settings(context: bpy.types.Context):
@@ -65,14 +66,6 @@ def _draw_material_force_box(layout: bpy.types.UILayout, settings) -> None:
         volume_box.prop(settings, "pressure_strength")
         volume_box.prop(settings, "volume_target_scale")
 
-    force_box = box.box()
-    _panel_header(force_box, "Blender 力场", "FORCE_FORCE")
-    force_box.label(text="重力使用当前场景设置", icon="SCENE_DATA")
-    force_box.prop(settings, "use_blender_force_fields")
-    if settings.use_blender_force_fields:
-        force_box.prop(settings, "force_field_collection")
-        force_box.prop(settings, "force_field_strength_scale")
-
 
 def _draw_collision_box(layout: bpy.types.UILayout, settings) -> None:
     box = layout.box()
@@ -110,6 +103,23 @@ def _draw_bake_box(layout: bpy.types.UILayout, settings) -> None:
     action_row.enabled = not is_baking
     action_row.operator("ssbl.bake_xpbd_cache", text="烘焙 XPBD", icon="REC")
     action_row.operator("ssbl.clear_xpbd_cache", text="清除缓存", icon="TRASH")
+
+
+def _draw_force_field_box(layout: bpy.types.UILayout, settings) -> None:
+    box = layout.box()
+    box.prop(settings, "force_field_collection", text="效果器集合")
+
+    flow = box.grid_flow(
+        row_major=True,
+        columns=0,
+        even_columns=True,
+        even_rows=False,
+        align=True,
+    )
+    for group in visible_force_field_weight_groups():
+        col = flow.column()
+        for prop_name in group:
+            col.prop(settings, prop_name, slider=True)
 
 
 def _draw_advanced_box(layout: bpy.types.UILayout, settings) -> None:
@@ -178,31 +188,5 @@ class SSBL_PT_physics_panel(bpy.types.Panel):
         _draw_material_force_box(layout, settings)
         _draw_collision_box(layout, settings)
         _draw_bake_box(layout, settings)
+        _draw_force_field_box(layout, settings)
         _draw_advanced_box(layout, settings)
-
-
-class SSBL_PT_force_field_panel(bpy.types.Panel):
-    bl_label = "SSBL 力场权重"
-    bl_idname = "SSBL_PT_force_field_panel"
-    bl_space_type = "PROPERTIES"
-    bl_region_type = "WINDOW"
-    bl_context = "physics"
-
-    @classmethod
-    def poll(cls, context: bpy.types.Context) -> bool:
-        obj = context.active_object
-        field = getattr(obj, "field", None) if obj is not None else None
-        return obj is not None and field is not None and str(getattr(field, "type", "NONE")).upper() not in {"", "NONE"}
-
-    def draw(self, context: bpy.types.Context):
-        layout = self.layout
-        obj = context.active_object
-        field = obj.field
-        weight = float(getattr(obj, "ssbl_force_field_weight", 1.0))
-        strength = float(getattr(field, "strength", 0.0))
-        layout.use_property_split = True
-        layout.use_property_decorate = False
-        box = layout.box()
-        _panel_header(box, "当前力场", "FORCE_FORCE")
-        box.prop(obj, "ssbl_force_field_weight", text="SSBL 权重", slider=True)
-        box.label(text=f"有效强度: {strength * weight:.3f}", icon="DRIVER")
