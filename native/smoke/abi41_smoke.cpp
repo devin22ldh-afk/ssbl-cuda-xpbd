@@ -401,6 +401,158 @@ int run_self_edge_edge_smoke() {
     return 0;
 }
 
+int run_hard_stretch_case(
+    const std::vector<float>& rest_positions,
+    const std::vector<float>& inv_mass,
+    const std::vector<float>& start_positions,
+    bool enabled,
+    std::vector<float>* out_positions
+) {
+    std::vector<int> edges = {0, 1};
+    std::vector<float> rest_lengths = {1.0f};
+
+    SsblXpbdConfig cfg{};
+    cfg.vertex_count = 2;
+    cfg.edge_count = 1;
+    cfg.dt = 1.0f / 60.0f;
+    cfg.damping = 1.0f;
+    cfg.gravity[0] = 0.0f;
+    cfg.gravity[1] = 0.0f;
+    cfg.gravity[2] = 0.0f;
+    cfg.stretch_compliance = 1.0e6f;
+    cfg.stretch_optimization_enabled = enabled ? 1 : 0;
+    cfg.stretch_optimization_strength = 1.0f;
+
+    SsblXpbdMesh mesh{};
+    mesh.positions = rest_positions.data();
+    mesh.inv_mass = inv_mass.data();
+    mesh.edges = edges.data();
+    mesh.edge_rest_lengths = rest_lengths.data();
+
+    void* solver = ssbl_create_solver(&cfg, &mesh);
+    if (!solver) {
+        std::fprintf(stderr, "SSBL_ABI41_HARD_STRETCH_ERROR create: %s\n", ssbl_last_error());
+        return 50;
+    }
+    if (!ssbl_update_positions(solver, start_positions.data(), static_cast<int>(start_positions.size()))) {
+        std::fprintf(stderr, "SSBL_ABI41_HARD_STRETCH_ERROR upload: %s\n", ssbl_last_error());
+        ssbl_destroy_solver(solver);
+        return 51;
+    }
+    if (!ssbl_step_solver_ex(solver, 1, 1, 1, 1)) {
+        std::fprintf(stderr, "SSBL_ABI41_HARD_STRETCH_ERROR step: %s\n", ssbl_last_error());
+        ssbl_destroy_solver(solver);
+        return 52;
+    }
+    out_positions->assign(start_positions.size(), 0.0f);
+    if (!ssbl_download_positions(solver, out_positions->data(), static_cast<int>(out_positions->size()))) {
+        std::fprintf(stderr, "SSBL_ABI41_HARD_STRETCH_ERROR download: %s\n", ssbl_last_error());
+        ssbl_destroy_solver(solver);
+        return 53;
+    }
+    SsblXpbdDiagnostics diag{};
+    if (!ssbl_get_diagnostics(solver, &diag)) {
+        std::fprintf(stderr, "SSBL_ABI41_HARD_STRETCH_ERROR diagnostics: %s\n", ssbl_last_error());
+        ssbl_destroy_solver(solver);
+        return 54;
+    }
+    ssbl_destroy_solver(solver);
+    if (!finite_positions(*out_positions) || !diag.finite_flag) {
+        std::fprintf(stderr, "SSBL_ABI41_HARD_STRETCH_ERROR non-finite output\n");
+        return 55;
+    }
+    return 0;
+}
+
+int run_hard_stretch_optimization_smoke() {
+    if ((ssbl_capabilities() & SSBL_CAP_STRETCH_OPTIMIZATION) == 0u) {
+        std::fprintf(stderr, "SSBL_ABI41_HARD_STRETCH_ERROR missing capability bit\n");
+        return 56;
+    }
+
+    const std::vector<float> rest_positions = {
+        0.0f, 0.0f, 0.0f,
+        1.0f, 0.0f, 0.0f,
+    };
+    const std::vector<float> stretched_positions = {
+        0.0f, 0.0f, 0.0f,
+        2.5f, 0.0f, 0.0f,
+    };
+    std::vector<float> off_out;
+    std::vector<float> on_out;
+    int result = run_hard_stretch_case(rest_positions, {1.0f, 1.0f}, stretched_positions, false, &off_out);
+    if (result != 0) {
+        return result;
+    }
+    result = run_hard_stretch_case(rest_positions, {1.0f, 1.0f}, stretched_positions, true, &on_out);
+    if (result != 0) {
+        return result;
+    }
+    const float off_distance = distance3(off_out, 0, 1);
+    const float on_distance = distance3(on_out, 0, 1);
+    if (!(on_distance < off_distance - 0.05f)) {
+        std::fprintf(
+            stderr,
+            "SSBL_ABI41_HARD_STRETCH_ERROR free edge did not shrink off=%.6f on=%.6f\n",
+            off_distance,
+            on_distance
+        );
+        return 57;
+    }
+
+    std::vector<float> pinned_out;
+    result = run_hard_stretch_case(rest_positions, {0.0f, 1.0f}, stretched_positions, true, &pinned_out);
+    if (result != 0) {
+        return result;
+    }
+    if (std::fabs(pinned_out[0]) > 1.0e-5f || !(pinned_out[3] < stretched_positions[3] - 0.05f)) {
+        std::fprintf(
+            stderr,
+            "SSBL_ABI41_HARD_STRETCH_ERROR pinned case mismatch pinned=%.6f free=%.6f\n",
+            pinned_out[0],
+            pinned_out[3]
+        );
+        return 58;
+    }
+
+    const std::vector<float> pinned_rest = {
+        0.0f, 0.0f, 0.0f,
+        2.5f, 0.0f, 0.0f,
+    };
+    std::vector<float> both_pinned_out;
+    result = run_hard_stretch_case(pinned_rest, {0.0f, 0.0f}, pinned_rest, true, &both_pinned_out);
+    if (result != 0) {
+        return result;
+    }
+    const float both_pinned_distance = distance3(both_pinned_out, 0, 1);
+    if (std::fabs(both_pinned_distance - 2.5f) > 1.0e-4f) {
+        std::fprintf(
+            stderr,
+            "SSBL_ABI41_HARD_STRETCH_ERROR both-pinned distance changed %.6f\n",
+            both_pinned_distance
+        );
+        return 59;
+    }
+
+    const std::vector<float> zero_positions = {
+        0.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 0.0f,
+    };
+    std::vector<float> zero_out;
+    result = run_hard_stretch_case(rest_positions, {1.0f, 1.0f}, zero_positions, true, &zero_out);
+    if (result != 0) {
+        return result;
+    }
+    std::printf(
+        "SSBL_ABI41_HARD_STRETCH_OK free=%.5f->%.5f pinned_free=%.5f both_pinned=%.5f\n",
+        off_distance,
+        on_distance,
+        pinned_out[3],
+        both_pinned_distance
+    );
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -408,6 +560,11 @@ int main() {
     static_assert(sizeof(ssbl_abi41::CudaSpringPBD) == 12);
     static_assert(sizeof(ssbl_abi41::CudaTriangle) == 12);
     static_assert(sizeof(ssbl_abi41::symMatCuda) == 24);
+
+    int stretch_result = run_hard_stretch_optimization_smoke();
+    if (stretch_result != 0) {
+        return stretch_result;
+    }
 
     std::vector<float> positions = {
         0.0f, 0.2f, 0.0f,

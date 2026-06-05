@@ -138,7 +138,7 @@ $lines = @(
     "set ""PATH=$(Split-Path -Parent $cmake);$cudaBin;%PATH%""",
     "set ""CUDA_PATH=$cudaRoot""",
     "set ""CudaToolkitDir=$cudaToolkitDir""",
-    """$cmake"" -S ""$Root"" -B ""$BuildDir"" -G ""Visual Studio 17 2022"" -A x64 -T ""cuda=$cudaRoot"" -DCMAKE_CUDA_COMPILER=""$cudaBin\nvcc.exe"" -DSSBL_BUILD_LEGACY=OFF -DSSBL_BUILD_ABI41=ON -DSSBL_ABI41_OUTPUT_DIR=""$outputDirPath"" || exit /b 1",
+    """$cmake"" -S ""$Root"" -B ""$BuildDir"" -G ""Visual Studio 17 2022"" -A x64 -T ""cuda=$cudaRoot"" -DCMAKE_CUDA_COMPILER=""$cudaBin\nvcc.exe"" -DSSBL_BUILD_LEGACY=OFF -DSSBL_BUILD_ABI41=ON -DSSBL_ABI41_OUTPUT_NAME=""ssbl_xpbd_cuda_abi38"" -DSSBL_ABI41_OUTPUT_DIR=""$outputDirPath"" || exit /b 1",
     """$cmake"" --build ""$BuildDir"" --config $Config --target ssbl_xpbd_cuda_recon ssbl_abi41_smoke || exit /b 1"
 )
 if (-not $NoRun) {
@@ -149,14 +149,14 @@ try {
     Set-Content -LiteralPath $tempCmd -Value $lines -Encoding ASCII
     & cmd.exe /d /s /c """$tempCmd"""
     if ($LASTEXITCODE -ne 0) {
-        throw "ABI37 recon build failed with exit code $LASTEXITCODE."
+        throw "ABI38 recon build failed with exit code $LASTEXITCODE."
     }
 } finally {
     Remove-Item -LiteralPath $tempCmd -Force -ErrorAction SilentlyContinue
 }
 
-$dllPath = Join-Path $outputDirPath "ssbl_xpbd_cuda_abi37.dll"
+$dllPath = Join-Path $outputDirPath "ssbl_xpbd_cuda_abi38.dll"
 if (-not (Test-Path -LiteralPath $dllPath)) {
-    throw "Build completed but ABI37 DLL was not found at $dllPath."
+    throw "Build completed but ABI38 DLL was not found at $dllPath."
 }
 Write-Host "Built $dllPath"

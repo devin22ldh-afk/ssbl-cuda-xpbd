@@ -60,7 +60,13 @@ typedef struct SsblXpbdConfig {
     float contact_tangent_damping;
     float contact_compliance;
     int fast_self_collision_passes;
+    int stretch_optimization_enabled;
+    float stretch_optimization_strength;
 } SsblXpbdConfig;
+
+enum {
+    SSBL_CAP_STRETCH_OPTIMIZATION = 1u << 0
+};
 
 typedef struct SsblXpbdDiagnostics {
     float step_ms;
@@ -251,6 +257,7 @@ SSBL_API int ssbl_step_solver(void* handle, int substeps, int iterations);
 SSBL_API int ssbl_step_solver_ex(void* handle, int substeps, int iterations, int fetch_diagnostics, int force_sync);
 SSBL_API int ssbl_download_positions(void* handle, float* out_positions, int max_floats);
 SSBL_API int ssbl_get_diagnostics(void* handle, SsblXpbdDiagnostics* out_diag);
+SSBL_API unsigned int ssbl_capabilities(void);
 SSBL_API const char* ssbl_last_error(void);
 
 #ifdef __cplusplus

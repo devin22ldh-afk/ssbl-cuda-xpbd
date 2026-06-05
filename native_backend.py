@@ -68,6 +68,8 @@ class _NativeConfig(ctypes.Structure):
         ("contact_tangent_damping", ctypes.c_float),
         ("contact_compliance", ctypes.c_float),
         ("fast_self_collision_passes", ctypes.c_int),
+        ("stretch_optimization_enabled", ctypes.c_int),
+        ("stretch_optimization_strength", ctypes.c_float),
     ]
 
 
@@ -385,8 +387,9 @@ class NativeStepDiagnostics:
 
 _LIB = None
 _LOAD_ERROR = ""
-_ABI41_DLL_NAME = "ssbl_xpbd_cuda_abi37.dll"
+_ABI41_DLL_NAME = "ssbl_xpbd_cuda_abi38.dll"
 _LEGACY_DLL_NAME = "ssbl_xpbd_cuda_abi36.dll"
+_CAP_STRETCH_OPTIMIZATION = 1 << 0
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -488,6 +491,9 @@ def _load_library():
     lib.ssbl_download_positions.restype = ctypes.c_int
     lib.ssbl_get_diagnostics.argtypes = [ctypes.c_void_p, ctypes.POINTER(_NativeDiagnostics)]
     lib.ssbl_get_diagnostics.restype = ctypes.c_int
+    if hasattr(lib, "ssbl_capabilities"):
+        lib.ssbl_capabilities.argtypes = []
+        lib.ssbl_capabilities.restype = ctypes.c_uint
     lib.ssbl_last_error.argtypes = []
     lib.ssbl_last_error.restype = ctypes.c_char_p
     _LIB = lib
@@ -511,6 +517,12 @@ def _last_error(lib) -> str:
     if not raw:
         return "Native CUDA solver failed without an error message."
     return raw.decode("utf-8", errors="replace")
+
+
+def _capabilities(lib) -> int:
+    if hasattr(lib, "ssbl_capabilities"):
+        return int(lib.ssbl_capabilities())
+    return 0
 
 
 def _config_from_options(
@@ -568,6 +580,8 @@ def _config_from_options(
     cfg.contact_tangent_damping = float(getattr(options, "contact_tangent_damping", 0.2))
     cfg.contact_compliance = float(getattr(options, "contact_compliance", 0.0))
     cfg.fast_self_collision_passes = int(getattr(options, "fast_self_collision_passes", 4))
+    cfg.stretch_optimization_enabled = int(getattr(options, "stretch_optimization_enabled", False))
+    cfg.stretch_optimization_strength = float(getattr(options, "stretch_optimization_strength", 0.35))
     return cfg
 
 
@@ -627,6 +641,12 @@ def _as_force_field_ptr(arr):
 class NativeXpbdSolver:
     def __init__(self, cloth: ClothBuildData, options: SolverOptions, static_triangles: np.ndarray):
         self._lib = _load_library()
+        if bool(getattr(options, "stretch_optimization_enabled", False)):
+            if (_capabilities(self._lib) & _CAP_STRETCH_OPTIMIZATION) == 0:
+                raise NativeSolverError(
+                    "Loaded CUDA solver DLL does not support hard stretch optimization. "
+                    "Rebuild native/build_recon.ps1 to generate the ABI38 DLL."
+                )
         self._vertex_count = int(len(cloth.positions_world))
         self._positions_out = np.empty((self._vertex_count, 3), dtype=np.float32)
         self._static_triangle_count = int(len(static_triangles))

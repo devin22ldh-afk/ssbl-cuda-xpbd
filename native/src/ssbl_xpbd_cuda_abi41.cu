@@ -164,7 +164,7 @@ struct Abi41Solver {
 };
 
 bool set_error(const char* message) {
-    g_last_error = message ? message : "unknown ABI37 recon CUDA error";
+    g_last_error = message ? message : "unknown ABI38 recon CUDA error";
     return false;
 }
 
@@ -236,6 +236,10 @@ __device__ void atomic_add(Vec3* dst, Vec3 value) {
 
 __device__ float length(Vec3 value) {
     return sqrtf(fmaxf(dot(value, value), 0.0f));
+}
+
+__device__ bool finite_vec(Vec3 value) {
+    return isfinite(value.x) && isfinite(value.y) && isfinite(value.z);
 }
 
 __device__ Vec3 array_vec3(const float values[3]) {
@@ -545,6 +549,71 @@ __global__ void abi41_spring_project_kernel(Abi41Solver solver, float dt) {
     }
     if (wj > 0.0f) {
         atomic_add(&solver.pos[j], mul(corr, wj));
+    }
+}
+
+__global__ void abi41_hard_stretch_project_kernel(Abi41Solver solver) {
+    int s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (!solver.cfg.stretch_optimization_enabled || s >= solver.cfg.edge_count) {
+        return;
+    }
+    float strength = clamp01(solver.cfg.stretch_optimization_strength);
+    if (strength <= 0.0f) {
+        return;
+    }
+    ReconSpring spring = solver.springs[s];
+    int i = static_cast<int>(spring.id0);
+    int j = static_cast<int>(spring.id1);
+    if (i < 0 || j < 0 || i >= solver.cfg.vertex_count || j >= solver.cfg.vertex_count) {
+        return;
+    }
+    float wi = solver.inv_mass[i];
+    float wj = solver.inv_mass[j];
+    if (solver.state_flags) {
+        if ((solver.state_flags[i] & ssbl_abi41::kPinnedOrKinematicFlag) != 0u) {
+            wi = 0.0f;
+        }
+        if ((solver.state_flags[j] & ssbl_abi41::kPinnedOrKinematicFlag) != 0u) {
+            wj = 0.0f;
+        }
+    }
+    float weight = wi + wj;
+    if (!isfinite(weight) || weight <= 0.0f) {
+        return;
+    }
+    float rest = spring.rest_length;
+    if (!isfinite(rest) || rest <= kEps) {
+        return;
+    }
+    Vec3 pi = solver.pos[i];
+    Vec3 pj = solver.pos[j];
+    if (!finite_vec(pi) || !finite_vec(pj)) {
+        return;
+    }
+    Vec3 delta = sub(pj, pi);
+    float len_sq = dot(delta, delta);
+    if (!isfinite(len_sq) || len_sq <= kEps) {
+        return;
+    }
+    float len = sqrtf(len_sq);
+    float over = len - rest;
+    if (!isfinite(over) || over <= 0.0f) {
+        return;
+    }
+    float max_delta = fmaxf(1.0e-5f, fminf(fmaxf(rest, solver.cfg.cloth_thickness) * 0.5f, 0.25f));
+    float projected = fminf(over * strength, max_delta);
+    if (!isfinite(projected) || projected <= 0.0f) {
+        return;
+    }
+    Vec3 corr = mul(delta, projected / (weight * len));
+    if (!finite_vec(corr)) {
+        return;
+    }
+    if (wi > 0.0f) {
+        atomic_add(&solver.pos[i], mul(corr, wi));
+    }
+    if (wj > 0.0f) {
+        atomic_add(&solver.pos[j], mul(corr, -wj));
     }
 }
 
@@ -2749,7 +2818,7 @@ bool upload_dynamic_particles(
 extern "C" SSBL_API void* ssbl_create_solver(const SsblXpbdConfig* config, const SsblXpbdMesh* mesh) {
     g_last_error.clear();
     if (!finite_config(config) || !mesh || !mesh->positions || !mesh->inv_mass) {
-        set_error("invalid ABI37 ABI41 solver create request");
+        set_error("invalid ABI38 ABI41 solver create request");
         return nullptr;
     }
     auto* solver = new Abi41Solver();
@@ -2759,6 +2828,15 @@ extern "C" SSBL_API void* ssbl_create_solver(const SsblXpbdConfig* config, const
     solver->cfg.triangle_count = std::max(solver->cfg.triangle_count, 0);
     solver->cfg.damping = std::isfinite(solver->cfg.damping) ? solver->cfg.damping : 1.0f;
     solver->cfg.damping = std::max(0.0f, std::min(solver->cfg.damping, 1.0f));
+    if (!std::isfinite(solver->cfg.stretch_optimization_strength)) {
+        solver->cfg.stretch_optimization_strength = 0.0f;
+    }
+    solver->cfg.stretch_optimization_strength = clamp01(solver->cfg.stretch_optimization_strength);
+    solver->cfg.stretch_optimization_enabled = (
+        solver->cfg.edge_count > 0
+        && solver->cfg.stretch_optimization_enabled
+        && solver->cfg.stretch_optimization_strength > 0.0f
+    ) ? 1 : 0;
     solver->runtime_colliders.use_ground = solver->cfg.use_ground;
     solver->runtime_colliders.ground_height = solver->cfg.ground_height;
     solver->runtime_colliders.use_wall = solver->cfg.use_wall;
@@ -2995,12 +3073,17 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
         if (solver->pin_count > 0) {
             abi41_pin_project_kernel<<<p_blocks, kThreads>>>(*solver);
         }
-        if (!set_cuda_error(cudaGetLastError(), "launch ABI37 recon integrate/pin")) {
+        if (!set_cuda_error(cudaGetLastError(), "launch ABI38 recon integrate/pin")) {
             return 0;
         }
         for (int it = 0; it < iterations; ++it) {
             if (solver->cfg.edge_count > 0) {
                 abi41_spring_project_kernel<<<e_blocks, kThreads>>>(*solver, sub_dt);
+            }
+            if (solver->cfg.edge_count > 0
+                && solver->cfg.stretch_optimization_enabled
+                && solver->cfg.stretch_optimization_strength > 0.0f) {
+                abi41_hard_stretch_project_kernel<<<e_blocks, kThreads>>>(*solver);
             }
             if (solver->pin_count > 0) {
                 abi41_pin_project_kernel<<<p_blocks, kThreads>>>(*solver);
@@ -3068,18 +3151,18 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
                 abi41_apply_self_averaged_delta_kernel<<<v_blocks, kThreads>>>(*solver);
                 solver->diag.self_solve_ms += elapsed_ms_since(self_solve_started);
             }
-            if (!set_cuda_error(cudaGetLastError(), "launch ABI37 recon constraints")) {
+            if (!set_cuda_error(cudaGetLastError(), "launch ABI38 recon constraints")) {
                 return 0;
             }
         }
         abi41_update_velocity_kernel<<<v_blocks, kThreads>>>(*solver, sub_dt);
-        if (!set_cuda_error(cudaGetLastError(), "launch ABI37 recon velocity")) {
+        if (!set_cuda_error(cudaGetLastError(), "launch ABI38 recon velocity")) {
             return 0;
         }
     }
     if (force_sync != 0 || fetch_diagnostics != 0) {
         const auto sync_started = std::chrono::high_resolution_clock::now();
-        if (!set_cuda_error(cudaDeviceSynchronize(), "ABI37 ABI41 solver step")) {
+        if (!set_cuda_error(cudaDeviceSynchronize(), "ABI38 ABI41 solver step")) {
             return 0;
         }
         solver->diag.sync_ms = elapsed_ms_since(sync_started);
@@ -3107,7 +3190,7 @@ extern "C" SSBL_API int ssbl_download_positions(void* handle, float* out_positio
     }
     return set_cuda_error(
         cudaMemcpy(out_positions, solver->pos, sizeof(Vec3) * solver->cfg.vertex_count, cudaMemcpyDeviceToHost),
-        "download ABI37 recon positions"
+        "download ABI38 recon positions"
     ) ? 1 : 0;
 }
 
@@ -3119,6 +3202,10 @@ extern "C" SSBL_API int ssbl_get_diagnostics(void* handle, SsblXpbdDiagnostics* 
     }
     *out_diag = solver->diag;
     return 1;
+}
+
+extern "C" SSBL_API unsigned int ssbl_capabilities(void) {
+    return SSBL_CAP_STRETCH_OPTIMIZATION;
 }
 
 extern "C" SSBL_API const char* ssbl_last_error(void) {

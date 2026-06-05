@@ -42,6 +42,8 @@ class SolverOptions:
     damping: float
     gravity: np.ndarray
     stretch_compliance: float
+    stretch_optimization_enabled: bool
+    stretch_optimization_strength: float
     bend_compliance: float
     lra_compliance: float
     collision_margin: float
@@ -117,6 +119,8 @@ class _TopologyCacheEntry:
 class HardnessDerivedSettings:
     hardness: float
     stretch_compliance: float
+    stretch_optimization_enabled: bool
+    stretch_optimization_strength: float
     bend_compliance: float
     hidden_tether_enabled: bool
     hidden_tether_compliance: float
@@ -201,6 +205,8 @@ def derive_hardness_settings(hardness: float) -> HardnessDerivedSettings:
     return HardnessDerivedSettings(
         hardness=hardness,
         stretch_compliance=_log_interpolate(_SOFT_STRETCH_COMPLIANCE, _HARD_STRETCH_COMPLIANCE, material_hardness),
+        stretch_optimization_enabled=hardness > 0.0,
+        stretch_optimization_strength=hardness,
         bend_compliance=_log_interpolate(_SOFT_BEND_COMPLIANCE, _HARD_BEND_COMPLIANCE, material_hardness),
         hidden_tether_enabled=tether_enabled,
         hidden_tether_compliance=_log_interpolate(_SOFT_TETHER_COMPLIANCE, _HARD_TETHER_COMPLIANCE, tether_hardness),
@@ -899,6 +905,8 @@ def settings_to_options(settings, runtime_mode_override: str | None = None) -> S
         damping=float(settings.damping),
         gravity=np.asarray(settings.gravity, dtype=np.float32),
         stretch_compliance=float(derived.stretch_compliance),
+        stretch_optimization_enabled=bool(derived.stretch_optimization_enabled),
+        stretch_optimization_strength=float(derived.stretch_optimization_strength),
         bend_compliance=float(derived.bend_compliance),
         lra_compliance=float(derived.hidden_tether_compliance if derived.hidden_tether_enabled else 0.0),
         collision_margin=float(settings.collision_margin),

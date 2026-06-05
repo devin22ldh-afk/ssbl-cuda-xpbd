@@ -2467,6 +2467,109 @@ __global__ void edge_project_kernel(Solver solver, float dt) {
     atomic_add(&solver.pos[j], mul(corr, wj));
 }
 
+__device__ bool hard_stretch_correction(
+    Solver solver,
+    int e,
+    int* out_i,
+    int* out_j,
+    float* out_wi,
+    float* out_wj,
+    Vec3* out_corr
+) {
+    if (!solver.cfg.stretch_optimization_enabled) {
+        return false;
+    }
+    float strength = clamp01(solver.cfg.stretch_optimization_strength);
+    if (strength <= 0.0f || e < 0 || e >= solver.cfg.edge_count) {
+        return false;
+    }
+    Int2 edge = solver.edges[e];
+    int i = edge.x;
+    int j = edge.y;
+    if (i < 0 || j < 0 || i >= solver.cfg.vertex_count || j >= solver.cfg.vertex_count) {
+        return false;
+    }
+    float wi = solver.inv_mass[i];
+    float wj = solver.inv_mass[j];
+    float weight = wi + wj;
+    if (!isfinite(weight) || weight <= 0.0f) {
+        return false;
+    }
+    float rest = solver.edge_rest[e];
+    if (!isfinite(rest) || rest <= kEps) {
+        return false;
+    }
+    Vec3 pi = solver.pos[i];
+    Vec3 pj = solver.pos[j];
+    if (!finite_vec(pi) || !finite_vec(pj)) {
+        return false;
+    }
+    Vec3 delta = sub(pj, pi);
+    float len_sq = dot(delta, delta);
+    if (!isfinite(len_sq) || len_sq <= kEps) {
+        return false;
+    }
+    float len = sqrtf(len_sq);
+    float over = len - rest;
+    if (!isfinite(over) || over <= 0.0f) {
+        return false;
+    }
+    float max_delta = fmaxf(1.0e-5f, fminf(fmaxf(rest, solver.cfg.cloth_thickness) * 0.5f, 0.25f));
+    float projected = fminf(over * strength, max_delta);
+    if (!isfinite(projected) || projected <= 0.0f) {
+        return false;
+    }
+    Vec3 corr = mul(delta, projected / (weight * len));
+    if (!finite_vec(corr)) {
+        return false;
+    }
+    *out_i = i;
+    *out_j = j;
+    *out_wi = wi;
+    *out_wj = wj;
+    *out_corr = corr;
+    return true;
+}
+
+__global__ void hard_stretch_project_kernel(Solver solver) {
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = 0;
+    int j = 0;
+    float wi = 0.0f;
+    float wj = 0.0f;
+    Vec3 corr{0.0f, 0.0f, 0.0f};
+    if (!hard_stretch_correction(solver, e, &i, &j, &wi, &wj, &corr)) {
+        return;
+    }
+    if (wi > 0.0f) {
+        atomic_add(&solver.pos[i], mul(corr, wi));
+    }
+    if (wj > 0.0f) {
+        atomic_add(&solver.pos[j], mul(corr, -wj));
+    }
+}
+
+__global__ void hard_stretch_project_range_kernel(Solver solver, int start, int count) {
+    int local = blockIdx.x * blockDim.x + threadIdx.x;
+    if (local >= count) {
+        return;
+    }
+    int i = 0;
+    int j = 0;
+    float wi = 0.0f;
+    float wj = 0.0f;
+    Vec3 corr{0.0f, 0.0f, 0.0f};
+    if (!hard_stretch_correction(solver, start + local, &i, &j, &wi, &wj, &corr)) {
+        return;
+    }
+    if (wi > 0.0f) {
+        solver.pos[i] = add(solver.pos[i], mul(corr, wi));
+    }
+    if (wj > 0.0f) {
+        solver.pos[j] = add(solver.pos[j], mul(corr, -wj));
+    }
+}
+
 __global__ void bend_project_kernel(Solver solver, float dt) {
     int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= solver.cfg.bend_count) {
@@ -6551,6 +6654,21 @@ bool run_substep(
                 edge_project_kernel<<<e_blocks, 256>>>(*solver, sub_dt);
             }
         }
+        if (solver->cfg.edge_count > 0
+            && solver->cfg.stretch_optimization_enabled
+            && solver->cfg.stretch_optimization_strength > 0.0f) {
+            if (solver->cfg.edge_color_count > 0 && solver->edge_color_offsets_host) {
+                for (int color = 0; color < solver->cfg.edge_color_count; ++color) {
+                    int start = solver->edge_color_offsets_host[color];
+                    int count = solver->edge_color_offsets_host[color + 1] - start;
+                    if (count > 0) {
+                        hard_stretch_project_range_kernel<<<block_count(count), 256>>>(*solver, start, count);
+                    }
+                }
+            } else {
+                hard_stretch_project_kernel<<<e_blocks, 256>>>(*solver);
+            }
+        }
         if (solver->cfg.bend_count > 0) {
             if (solver->cfg.bend_color_count > 0 && solver->bend_color_offsets_host) {
                 for (int color = 0; color < solver->cfg.bend_color_count; ++color) {
@@ -7262,6 +7380,15 @@ extern "C" SSBL_API void* ssbl_create_solver(const SsblXpbdConfig* config, const
     if (!std::isfinite(solver->cfg.contact_compliance) || solver->cfg.contact_compliance < 0.0f) {
         solver->cfg.contact_compliance = 0.0f;
     }
+    if (!std::isfinite(solver->cfg.stretch_optimization_strength)) {
+        solver->cfg.stretch_optimization_strength = 0.0f;
+    }
+    solver->cfg.stretch_optimization_strength = std::clamp(solver->cfg.stretch_optimization_strength, 0.0f, 1.0f);
+    solver->cfg.stretch_optimization_enabled = (
+        solver->cfg.edge_count > 0
+        && solver->cfg.stretch_optimization_enabled
+        && solver->cfg.stretch_optimization_strength > 0.0f
+    ) ? 1 : 0;
 
     const int vertex_count = solver->cfg.vertex_count;
     std::vector<Vec3> host_pos(vertex_count);
@@ -7883,6 +8010,10 @@ extern "C" SSBL_API int ssbl_get_diagnostics(void* handle, SsblXpbdDiagnostics* 
     }
     *out_diag = solver->diag;
     return 1;
+}
+
+extern "C" SSBL_API unsigned int ssbl_capabilities(void) {
+    return SSBL_CAP_STRETCH_OPTIMIZATION;
 }
 
 extern "C" SSBL_API const char* ssbl_last_error(void) {
