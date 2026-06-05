@@ -653,6 +653,8 @@ class NativeXpbdSolver:
         self._handle = self._lib.ssbl_create_solver(ctypes.byref(cfg), ctypes.byref(mesh))
         if not self._handle:
             raise NativeSolverError(_last_error(self._lib))
+        if len(cloth.pin_indices) > 0:
+            self.update_pin_targets(cloth.pin_indices, cloth.pin_targets_world)
 
     def close(self) -> None:
         if getattr(self, "_handle", None):

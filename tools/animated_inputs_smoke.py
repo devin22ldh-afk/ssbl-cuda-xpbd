@@ -107,6 +107,13 @@ def main():
 
     bpy.context.scene.frame_set(1)
     session = ssbl.solver.start_preview(bpy.context, cloth)
+    slot = session.slots[cloth.name]
+    pin_pairs = getattr(slot.cloth, "pin_attachment_pairs", [])
+    pin_indices = list(slot.cloth.pin_indices)
+    pin_attachment_pairs_identity = (
+        len(pin_pairs) == len(pin_indices)
+        and all(int(pair[0]) == int(pin_indices[index]) and int(pair[1]) == index for index, pair in enumerate(pin_pairs))
+    )
     for _index in range(10):
         ssbl.solver.step_preview(bpy.context, cloth.name)
     preview_frame = int(bpy.context.scene.frame_current)
@@ -127,29 +134,41 @@ def main():
     cleared = ssbl.solver.clear_xpbd_cache(cloth)
     cache_exists_after_clear = os.path.exists(bake_path)
 
-    print(
-        "SSBL_ANIMATED_INPUTS_SMOKE",
-        json.dumps(
-            {
-                "session_object": session.object_name,
-                "preview_frame": preview_frame,
-                "restored_frame": restored_frame,
-                "baked_frame": baked_frame,
-                "preview_finite": preview_finite,
-                "original_mesh_max_abs_delta": original_mesh_max_abs_delta,
-                "pc2_signature": signature.decode("ascii", errors="replace").rstrip("\0"),
-                "pc2_version": version,
-                "pc2_vertex_count": vertex_count,
-                "pc2_start": start,
-                "pc2_sample_rate": sample_rate,
-                "pc2_sample_count": sample_count,
-                "cache_exists_before_clear": cache_exists_before_clear,
-                "cache_cleared": cleared,
-                "cache_exists_after_clear": cache_exists_after_clear,
-            },
-            ensure_ascii=False,
-        ),
-    )
+    result = {
+        "session_object": session.object_name,
+        "preview_frame": preview_frame,
+        "restored_frame": restored_frame,
+        "baked_frame": baked_frame,
+        "preview_finite": preview_finite,
+        "original_mesh_max_abs_delta": original_mesh_max_abs_delta,
+        "pin_count": len(pin_indices),
+        "pin_attachment_pair_count": len(pin_pairs),
+        "pin_attachment_pairs_identity": bool(pin_attachment_pairs_identity),
+        "slot_use_evaluated_mesh": bool(slot.use_evaluated_mesh),
+        "pc2_signature": signature.decode("ascii", errors="replace").rstrip("\0"),
+        "pc2_version": version,
+        "pc2_vertex_count": vertex_count,
+        "pc2_start": start,
+        "pc2_sample_rate": sample_rate,
+        "pc2_sample_count": sample_count,
+        "cache_exists_before_clear": cache_exists_before_clear,
+        "cache_cleared": cleared,
+        "cache_exists_after_clear": cache_exists_after_clear,
+    }
+    print("SSBL_ANIMATED_INPUTS_SMOKE", json.dumps(result, ensure_ascii=False))
+    if not (
+        result["preview_finite"]
+        and result["pin_count"] > 0
+        and result["pin_attachment_pair_count"] == result["pin_count"]
+        and result["pin_attachment_pairs_identity"]
+        and result["slot_use_evaluated_mesh"]
+        and result["pc2_signature"] == "POINTCACHE2"
+        and result["cache_exists_before_clear"]
+        and result["cache_cleared"]
+        and not result["cache_exists_after_clear"]
+        and result["original_mesh_max_abs_delta"] <= 1.0e-6
+    ):
+        raise RuntimeError(f"Animated input smoke failed: {result}")
     ssbl.unregister()
 
 

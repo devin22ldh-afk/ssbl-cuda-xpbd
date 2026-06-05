@@ -495,9 +495,20 @@ int main() {
         std::fprintf(stderr, "SSBL_ABI41_NATIVE_ERROR non-finite output\n");
         return 7;
     }
+    for (int pin = 0; pin < 2; ++pin) {
+        const int vertex = pins[pin];
+        for (int axis = 0; axis < 3; ++axis) {
+            const float actual = out[vertex * 3 + axis];
+            const float expected = pin_positions[pin * 3 + axis];
+            if (std::fabs(actual - expected) > 1.0e-5f) {
+                std::fprintf(stderr, "SSBL_ABI41_NATIVE_ERROR pin target mismatch\n");
+                return 8;
+            }
+        }
+    }
     if (!(out[7] < positions[7])) {
         std::fprintf(stderr, "SSBL_ABI41_NATIVE_ERROR cloth did not move under gravity\n");
-        return 8;
+        return 9;
     }
     std::printf(
         "SSBL_ABI41_NATIVE_OK vertices=%d step_ms=%.3f contacts=%lld\n",

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import os
 
@@ -28,6 +28,12 @@ _TETHER_START_HARDNESS = 0.50
 _LEGACY_BALANCED_STRETCH = 1.0e-6
 _LEGACY_BALANCED_BEND = 1.0e-4
 _STARTUP_CACHE_LIMIT = 16
+
+
+@dataclass
+class PinAttachmentBatch:
+    pairs: np.ndarray
+    targets_world: np.ndarray
 
 
 @dataclass
@@ -91,6 +97,8 @@ class ClothBuildData:
     pin_targets_world: np.ndarray
     matrix_world_inv: np.ndarray
     rest_volume: float
+    pin_attachment_pairs: np.ndarray = field(default_factory=lambda: np.empty((0, 2), dtype=np.int32))
+    pin_attachment_targets_world: np.ndarray = field(default_factory=lambda: np.empty((0, 3), dtype=np.float32))
 
 
 @dataclass
@@ -135,6 +143,24 @@ def clear_cloth_topology_cache() -> None:
     _TOPOLOGY_CACHE_STATS["hits"] = 0
     _TOPOLOGY_CACHE_STATS["misses"] = 0
     _TOPOLOGY_CACHE_STATS["last_hit"] = False
+
+
+def make_pin_attachment_batch(pin_indices: np.ndarray, targets_world: np.ndarray) -> PinAttachmentBatch:
+    pin_indices_arr = np.ascontiguousarray(pin_indices, dtype=np.int32).reshape((-1,))
+    targets_arr = np.ascontiguousarray(targets_world, dtype=np.float32).reshape((-1, 3))
+    if len(pin_indices_arr) != len(targets_arr):
+        raise ValueError("Pin attachment indices and target positions must have matching lengths.")
+    if len(pin_indices_arr) == 0:
+        return PinAttachmentBatch(
+            pairs=np.empty((0, 2), dtype=np.int32),
+            targets_world=np.empty((0, 3), dtype=np.float32),
+        )
+    attachment_sources = np.arange(len(pin_indices_arr), dtype=np.int32)
+    pairs = np.column_stack((pin_indices_arr, attachment_sources)).astype(np.int32, copy=False)
+    return PinAttachmentBatch(
+        pairs=np.ascontiguousarray(pairs, dtype=np.int32),
+        targets_world=targets_arr,
+    )
 
 
 def cloth_topology_cache_stats() -> dict[str, int | bool]:
@@ -349,6 +375,7 @@ def _build_cloth_data_uncached(
     inv_mass = vertex_inverse_mass(world, triangles, float(settings.density), pin_mask)
     pin_indices = np.flatnonzero(pin_mask).astype(np.int32)
     pin_targets = world[pin_indices].astype(np.float32, copy=True)
+    pin_attachments = make_pin_attachment_batch(pin_indices, pin_targets)
 
     return ClothBuildData(
         positions_world=np.ascontiguousarray(world, dtype=np.float32),
@@ -363,10 +390,12 @@ def _build_cloth_data_uncached(
         lra_edges=np.ascontiguousarray(lra_edges, dtype=np.int32),
         lra_rest_lengths=np.ascontiguousarray(lra_rest, dtype=np.float32),
         lra_color_offsets=np.ascontiguousarray(lra_color_offsets, dtype=np.int32),
-        pin_indices=pin_indices,
-        pin_targets_world=pin_targets,
+        pin_indices=pin_attachments.pairs[:, 0].copy(),
+        pin_targets_world=pin_attachments.targets_world,
         matrix_world_inv=matrix_world_inv,
         rest_volume=float(rest_volume),
+        pin_attachment_pairs=pin_attachments.pairs,
+        pin_attachment_targets_world=pin_attachments.targets_world,
     )
 
 
@@ -489,6 +518,7 @@ def _build_cloth_data_from_mesh(
     lra_rest = _distance_rest_lengths(lra_edges, world, derived.hidden_tether_slack)
     inv_mass = vertex_inverse_mass(world, triangles, float(settings.density), pin_mask)
     pin_targets = world[pin_indices].astype(np.float32, copy=True)
+    pin_attachments = make_pin_attachment_batch(pin_indices, pin_targets)
 
     return ClothBuildData(
         positions_world=np.ascontiguousarray(world, dtype=np.float32),
@@ -503,10 +533,12 @@ def _build_cloth_data_from_mesh(
         lra_edges=np.ascontiguousarray(lra_edges, dtype=np.int32),
         lra_rest_lengths=np.ascontiguousarray(lra_rest, dtype=np.float32),
         lra_color_offsets=np.ascontiguousarray(lra_color_offsets, dtype=np.int32),
-        pin_indices=np.ascontiguousarray(pin_indices, dtype=np.int32),
-        pin_targets_world=pin_targets,
+        pin_indices=pin_attachments.pairs[:, 0].copy(),
+        pin_targets_world=pin_attachments.targets_world,
         matrix_world_inv=matrix_world_inv,
         rest_volume=float(rest_volume),
+        pin_attachment_pairs=pin_attachments.pairs,
+        pin_attachment_targets_world=pin_attachments.targets_world,
     )
 
 

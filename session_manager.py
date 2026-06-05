@@ -17,8 +17,10 @@ from .force_fields import EMPTY_FORCE_FIELD_BATCH, ForceFieldBatch, collect_forc
 from .native_backend import NativeStepDiagnostics, NativeXpbdSolver, status as native_status
 from .xpbd_core import (
     ClothBuildData,
+    PinAttachmentBatch,
     build_cloth_data,
     clear_cloth_topology_cache,
+    make_pin_attachment_batch,
     settings_to_options,
     to_local,
     world_positions_from_object,
@@ -98,6 +100,7 @@ class ClothSlot:
     static_collider_signature: tuple[tuple[str, int, int], ...]
     static_triangles: np.ndarray
     static_runtime_signature: tuple
+    pin_attachment_pairs: np.ndarray
     pin_targets_world: np.ndarray
     runtime_options_signature: tuple
     solver_options_signature: tuple
@@ -1145,6 +1148,23 @@ def _pin_targets_from_object(
     return _pin_targets_from_mesh(mesh, obj.matrix_world.copy(), pin_indices), obj.matrix_world.copy()
 
 
+def _pin_attachment_batch_from_object(
+    obj: bpy.types.Object,
+    pin_indices: np.ndarray,
+    use_evaluated_mesh: bool,
+    depsgraph: bpy.types.Depsgraph | None = None,
+    expected_vertex_count: int | None = None,
+) -> tuple[PinAttachmentBatch, bpy.types.Matrix]:
+    targets, matrix_world = _pin_targets_from_object(
+        obj,
+        pin_indices,
+        use_evaluated_mesh,
+        depsgraph=depsgraph,
+        expected_vertex_count=expected_vertex_count,
+    )
+    return make_pin_attachment_batch(pin_indices, targets), matrix_world
+
+
 def _pin_targets_from_mesh(mesh: bpy.types.Mesh, matrix_world, pin_indices: np.ndarray) -> np.ndarray:
     if len(pin_indices) == 0:
         return np.empty((0, 3), dtype=np.float32)
@@ -1247,6 +1267,7 @@ def _create_cloth_slot(
             depsgraph,
             use_evaluated_mesh,
         ),
+        pin_attachment_pairs=np.array(cloth.pin_attachment_pairs, dtype=np.int32, copy=True),
         pin_targets_world=np.array(cloth.pin_targets_world, dtype=np.float32, copy=True),
         runtime_options_signature=_runtime_options_signature(options),
         solver_options_signature=_solver_options_signature(options, settings),
@@ -1404,6 +1425,7 @@ def _rebuild_slot_native(
         slot.current_positions_world = current_positions
         slot.runtime_options_signature = _runtime_options_signature(options)
         slot.solver_options_signature = solver_signature
+        slot.pin_attachment_pairs = np.array(cloth.pin_attachment_pairs, dtype=np.int32, copy=True)
         slot.pin_targets_world = np.empty((0, 3), dtype=np.float32)
         slot.force_next_writeback = True
     finally:
@@ -1463,13 +1485,14 @@ def _refresh_session_runtime_inputs(context: bpy.types.Context, session: SceneSe
             static_collection = settings.static_collider_collection
             has_static_collection = static_collection is not None
             if len(slot.cloth.pin_indices) > 0:
-                pin_targets, matrix_world = _pin_targets_from_object(
+                pin_attachment_batch, matrix_world = _pin_attachment_batch_from_object(
                     obj,
                     slot.cloth.pin_indices,
                     slot.use_evaluated_mesh,
                     depsgraph=depsgraph,
                     expected_vertex_count=len(slot.cloth.positions_world),
                 )
+                pin_targets = pin_attachment_batch.targets_world
             else:
                 pin_targets = np.empty((0, 3), dtype=np.float32)
                 matrix_world = obj.matrix_world.copy()
@@ -1750,7 +1773,11 @@ def _refresh_bake_runtime_inputs(
     if static_signature != expected_static_signature:
         raise ValueError("Animated static collider topology changed during bake; fixed topology is required.")
     cloth.matrix_world_inv = np.array(matrix_world.inverted(), dtype=np.float32)
-    pin_targets = np.ascontiguousarray(world_positions[cloth.pin_indices], dtype=np.float32)
+    pin_attachment_batch = make_pin_attachment_batch(
+        cloth.pin_indices,
+        np.ascontiguousarray(world_positions[cloth.pin_indices], dtype=np.float32),
+    )
+    pin_targets = pin_attachment_batch.targets_world
     force_fields = (
         collect_force_fields(context.scene, depsgraph, settings)
         if bool(getattr(settings, "use_blender_force_fields", False))

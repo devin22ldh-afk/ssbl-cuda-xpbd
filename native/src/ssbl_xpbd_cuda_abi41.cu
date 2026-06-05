@@ -2988,10 +2988,14 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
     iterations = std::max(iterations, 1);
     int v_blocks = block_count(solver->cfg.vertex_count);
     int e_blocks = block_count(solver->cfg.edge_count);
+    int p_blocks = block_count(solver->pin_count);
     float sub_dt = solver->cfg.dt / static_cast<float>(substeps);
     for (int s = 0; s < substeps; ++s) {
         abi41_integrate_kernel<<<v_blocks, kThreads>>>(*solver, sub_dt);
-        if (!set_cuda_error(cudaGetLastError(), "launch ABI37 recon integrate")) {
+        if (solver->pin_count > 0) {
+            abi41_pin_project_kernel<<<p_blocks, kThreads>>>(*solver);
+        }
+        if (!set_cuda_error(cudaGetLastError(), "launch ABI37 recon integrate/pin")) {
             return 0;
         }
         for (int it = 0; it < iterations; ++it) {
@@ -2999,7 +3003,7 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
                 abi41_spring_project_kernel<<<e_blocks, kThreads>>>(*solver, sub_dt);
             }
             if (solver->pin_count > 0) {
-                abi41_pin_project_kernel<<<block_count(solver->pin_count), kThreads>>>(*solver);
+                abi41_pin_project_kernel<<<p_blocks, kThreads>>>(*solver);
             }
             abi41_analytic_collision_kernel<<<v_blocks, kThreads>>>(*solver);
             if (solver->static_triangle_count > 0 && solver->static_triangle_count <= 4096) {
