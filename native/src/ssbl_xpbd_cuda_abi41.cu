@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <string>
@@ -56,7 +57,13 @@ constexpr int kAbi41PcgMaxIterations = 1;
 constexpr int kAbi41PcgReductionDAD = 0;
 constexpr int kAbi41PcgReductionRZ = 1;
 constexpr int kAbi41PcgReductionRZNext = 2;
-constexpr int kAbi41PcgReductionSlots = 3;
+constexpr int kAbi41PcgReductionStatus = 3;
+constexpr int kAbi41PcgReductionSlots = 4;
+constexpr float kAbi41PcgStatusOk = 0.0f;
+constexpr float kAbi41PcgStatusBadResidual = 1.0f;
+constexpr float kAbi41PcgStatusZeroResidual = 2.0f;
+constexpr float kAbi41PcgStatusBadDAD = 3.0f;
+constexpr float kAbi41PcgStatusBadAlpha = 4.0f;
 constexpr int kAbi41MaxForceFields = 64;
 constexpr int kAbi41ForceFieldWind = 1;
 constexpr int kAbi41ForceFieldForce = 2;
@@ -71,6 +78,25 @@ constexpr int kAbi41ForceFieldTexture = 10;
 constexpr float kAbi41MaxForceFieldAcceleration = 5000.0f;
 
 std::string g_last_error;
+
+bool abi41_env_flag(const char* name, bool default_value) {
+    const char* raw = std::getenv(name);
+    if (!raw || raw[0] == '\0') {
+        return default_value;
+    }
+    return std::strcmp(raw, "0") != 0
+        && std::strcmp(raw, "false") != 0
+        && std::strcmp(raw, "FALSE") != 0
+        && std::strcmp(raw, "off") != 0
+        && std::strcmp(raw, "OFF") != 0
+        && std::strcmp(raw, "no") != 0
+        && std::strcmp(raw, "NO") != 0;
+}
+
+bool abi41_pcg_device_scalar_enabled() {
+    static const bool enabled = abi41_env_flag("SSBL_ABI41_PCG_DEVICE_SCALAR", true);
+    return enabled;
+}
 
 struct Vec3 {
     float x;
@@ -1327,6 +1353,83 @@ __global__ void abi41_pcg_update_solution_residual_z_kernel(Abi41Solver solver, 
         local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
     }
     if ((threadIdx.x & 31) == 0 && solver.pcg_reductions) {
+        atomicAdd(&solver.pcg_reductions[kAbi41PcgReductionRZNext], local_sum);
+    }
+}
+
+__global__ void abi41_pcg_update_solution_residual_z_device_alpha_kernel(Abi41Solver solver, int apply_solution_now) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (!solver.pcg_reductions) {
+        return;
+    }
+
+    const float rz_old = solver.pcg_reductions[kAbi41PcgReductionRZ];
+    const float dad = solver.pcg_reductions[kAbi41PcgReductionDAD];
+    float status = kAbi41PcgStatusOk;
+    float alpha = 0.0f;
+    if (!isfinite(rz_old) || rz_old < 0.0f) {
+        status = kAbi41PcgStatusBadResidual;
+    } else if (rz_old <= 1.0e-14f) {
+        status = kAbi41PcgStatusZeroResidual;
+    } else if (!isfinite(dad) || dad <= 1.0e-14f) {
+        status = kAbi41PcgStatusBadDAD;
+    } else {
+        alpha = rz_old / dad;
+        if (!isfinite(alpha)) {
+            status = kAbi41PcgStatusBadAlpha;
+        }
+    }
+
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        solver.pcg_reductions[kAbi41PcgReductionStatus] = status;
+    }
+    if (status != kAbi41PcgStatusOk) {
+        return;
+    }
+
+    float local_sum = 0.0f;
+    if (i < solver.cfg.vertex_count
+        && solver.pcg_solution
+        && solver.pcg_search_dir
+        && solver.pcg_residual
+        && solver.pcg_adir
+        && solver.pcg_z
+        && solver.pcg_preconditioner_inv) {
+        const bool pinned = solver.state_flags
+            && ((solver.state_flags[i] & ssbl_abi41::kPinnedOrKinematicFlag) != 0u);
+        if (solver.inv_mass[i] <= 0.0f || pinned) {
+            solver.pcg_solution[i] = make_vec3(0.0f, 0.0f, 0.0f);
+            solver.pcg_residual[i] = make_vec3(0.0f, 0.0f, 0.0f);
+            solver.pcg_z[i] = make_vec3(0.0f, 0.0f, 0.0f);
+        } else {
+            const Vec3 solution = fma_vec(solver.pcg_search_dir[i], alpha, solver.pcg_solution[i]);
+            const Vec3 residual = fma_vec(solver.pcg_adir[i], -alpha, solver.pcg_residual[i]);
+            const Vec3 safe_solution = finite_vec(solution) ? solution : make_vec3(0.0f, 0.0f, 0.0f);
+            const Vec3 safe_residual = finite_vec(residual) ? residual : make_vec3(0.0f, 0.0f, 0.0f);
+            const Vec3 z = sym_mul(solver.pcg_preconditioner_inv[i], safe_residual);
+            solver.pcg_solution[i] = safe_solution;
+            solver.pcg_residual[i] = safe_residual;
+            solver.pcg_z[i] = z;
+            local_sum = dot(safe_residual, z);
+
+            if (apply_solution_now != 0) {
+                Vec3 delta = safe_solution;
+                const float len = length(delta);
+                const float max_delta = 0.25f;
+                if (len > max_delta) {
+                    delta = mul(delta, max_delta / fmaxf(len, kEps));
+                }
+                solver.pos[i] = add(solver.pos[i], delta);
+                if (solver.pcg_max_delta_device) {
+                    atomic_max_float(solver.pcg_max_delta_device, length(delta));
+                }
+            }
+        }
+    }
+    for (int offset = 16; offset > 0; offset /= 2) {
+        local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
+    }
+    if ((threadIdx.x & 31) == 0) {
         atomicAdd(&solver.pcg_reductions[kAbi41PcgReductionRZNext], local_sum);
     }
 }
@@ -3461,6 +3564,16 @@ bool fetch_pcg_reduction(Abi41Solver* solver, int slot, float* out_value, const 
     return set_cuda_error(cudaMemcpy(out_value, solver->pcg_reductions + slot, sizeof(float), cudaMemcpyDeviceToHost), label);
 }
 
+bool fetch_pcg_reductions(Abi41Solver* solver, float* out_values, const char* label) {
+    if (!solver || !solver->pcg_reductions || !out_values) {
+        return set_error("invalid PCG reductions fetch");
+    }
+    return set_cuda_error(
+        cudaMemcpy(out_values, solver->pcg_reductions, sizeof(float) * kAbi41PcgReductionSlots, cudaMemcpyDeviceToHost),
+        label
+    );
+}
+
 bool run_abi41_hard_stretch_pcg(Abi41Solver* solver, int v_blocks, int e_blocks) {
     if (!solver || !solver->cfg.stretch_optimization_enabled || solver->cfg.stretch_optimization_strength <= 0.0f) {
         return true;
@@ -3474,6 +3587,49 @@ bool run_abi41_hard_stretch_pcg(Abi41Solver* solver, int v_blocks, int e_blocks)
     abi41_pcg_finalize_preconditioner_kernel<<<v_blocks, kThreads>>>(*solver);
     if (!set_cuda_error(cudaGetLastError(), "launch PCG stretch system build")) {
         return false;
+    }
+
+    if (abi41_pcg_device_scalar_enabled()) {
+        abi41_pcg_compute_ad_kernel<<<v_blocks, kThreads>>>(*solver);
+        abi41_pcg_update_solution_residual_z_device_alpha_kernel<<<v_blocks, kThreads>>>(*solver, 1);
+        if (!set_cuda_error(cudaGetLastError(), "launch PCG device-scalar solve")) {
+            return false;
+        }
+
+        float reductions[kAbi41PcgReductionSlots]{};
+        if (!fetch_pcg_reductions(solver, reductions, "fetch PCG device-scalar reductions")) {
+            return false;
+        }
+
+        const float rz_old = reductions[kAbi41PcgReductionRZ];
+        const float rz_new = reductions[kAbi41PcgReductionRZNext];
+        const float status = reductions[kAbi41PcgReductionStatus];
+        if (!std::isfinite(rz_old) || rz_old < 0.0f || status == kAbi41PcgStatusBadResidual) {
+            solver->diag.abi41_pcg_guarded += 1;
+            return true;
+        }
+
+        const float initial_residual = sqrtf(fmaxf(rz_old, 0.0f));
+        solver->diag.abi41_pcg_initial_residual = fmaxf(
+            solver->diag.abi41_pcg_initial_residual,
+            initial_residual
+        );
+        solver->diag.abi41_pcg_final_residual = initial_residual;
+        if (status == kAbi41PcgStatusZeroResidual || rz_old <= 1.0e-14f) {
+            return true;
+        }
+        if (status != kAbi41PcgStatusOk) {
+            solver->diag.abi41_pcg_guarded += 1;
+            return true;
+        }
+        if (!std::isfinite(rz_new) || rz_new < 0.0f) {
+            solver->diag.abi41_pcg_guarded += 1;
+            return true;
+        }
+
+        solver->diag.abi41_pcg_iterations += kAbi41PcgMaxIterations;
+        solver->diag.abi41_pcg_final_residual = sqrtf(fmaxf(rz_new, 0.0f));
+        return true;
     }
 
     float rz_old = 0.0f;

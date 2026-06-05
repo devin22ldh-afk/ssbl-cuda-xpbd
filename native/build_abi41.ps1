@@ -3,6 +3,7 @@ param(
     [string]$Config = "Release",
     [string]$CudaRoot = "",
     [string]$BuildDir = "",
+    [string]$OutputName = "ssbl_xpbd_cuda_abi39",
     [switch]$Clean,
     [switch]$NoRun
 )
@@ -138,7 +139,7 @@ $lines = @(
     "set ""PATH=$(Split-Path -Parent $cmake);$cudaBin;%PATH%""",
     "set ""CUDA_PATH=$cudaRoot""",
     "set ""CudaToolkitDir=$cudaToolkitDir""",
-    """$cmake"" -S ""$Root"" -B ""$BuildDir"" -G ""Visual Studio 17 2022"" -A x64 -T ""cuda=$cudaRoot"" -DCMAKE_CUDA_COMPILER=""$cudaBin\nvcc.exe"" -DSSBL_BUILD_LEGACY=OFF -DSSBL_BUILD_ABI41=ON -DSSBL_ABI41_OUTPUT_NAME=""ssbl_xpbd_cuda_abi39"" -DSSBL_ABI41_OUTPUT_DIR=""$outputDirPath"" || exit /b 1",
+    """$cmake"" -S ""$Root"" -B ""$BuildDir"" -G ""Visual Studio 17 2022"" -A x64 -T ""cuda=$cudaRoot"" -DCMAKE_CUDA_COMPILER=""$cudaBin\nvcc.exe"" -DSSBL_BUILD_LEGACY=OFF -DSSBL_BUILD_ABI41=ON -DSSBL_ABI41_OUTPUT_NAME=""$OutputName"" -DSSBL_ABI41_OUTPUT_DIR=""$outputDirPath"" || exit /b 1",
     """$cmake"" --build ""$BuildDir"" --config $Config --target ssbl_xpbd_cuda_recon ssbl_abi41_smoke || exit /b 1"
 )
 if (-not $NoRun) {
@@ -155,7 +156,7 @@ try {
     Remove-Item -LiteralPath $tempCmd -Force -ErrorAction SilentlyContinue
 }
 
-$dllPath = Join-Path $outputDirPath "ssbl_xpbd_cuda_abi39.dll"
+$dllPath = Join-Path $outputDirPath ("{0}.dll" -f $OutputName)
 if (-not (Test-Path -LiteralPath $dllPath)) {
     throw "Build completed but ABI39 DLL was not found at $dllPath."
 }
