@@ -25,6 +25,10 @@ float distance3(const std::vector<float>& values, int a, int b) {
     return std::sqrt(dx * dx + dy * dy + dz * dz);
 }
 
+float edge_average_z(const std::vector<float>& values, int a, int b) {
+    return (values[a * 3 + 2] + values[b * 3 + 2]) * 0.5f;
+}
+
 int run_self_collision_smoke() {
     constexpr int kVertexCount = 600;
     constexpr int kPairVertex = kVertexCount - 1;
@@ -236,6 +240,149 @@ int run_self_vertex_triangle_smoke() {
     return 0;
 }
 
+int run_self_edge_edge_smoke() {
+    constexpr int kVertexCount = 600;
+    constexpr int kEdgeCount = 64;
+    std::vector<float> rest_positions(kVertexCount * 3, 0.0f);
+    std::vector<float> inv_mass(kVertexCount, 1.0f);
+    for (int i = 0; i < kVertexCount; ++i) {
+        rest_positions[i * 3 + 0] = 200.0f + static_cast<float>(i) * 3.0f;
+        rest_positions[i * 3 + 1] = 100.0f + static_cast<float>(i % 11);
+        rest_positions[i * 3 + 2] = 0.0f;
+    }
+
+    rest_positions[0] = -1.0f;
+    rest_positions[1] = 0.0f;
+    rest_positions[2] = 0.0f;
+    rest_positions[3] = 1.0f;
+    rest_positions[4] = 0.0f;
+    rest_positions[5] = 0.0f;
+    rest_positions[6] = 5.0f;
+    rest_positions[7] = -1.0f;
+    rest_positions[8] = 0.0f;
+    rest_positions[9] = 5.0f;
+    rest_positions[10] = 1.0f;
+    rest_positions[11] = 0.0f;
+    inv_mass[0] = 0.0f;
+    inv_mass[1] = 0.0f;
+
+    std::vector<int> edges;
+    edges.reserve(kEdgeCount * 2);
+    edges.insert(edges.end(), {0, 1, 2, 3});
+    for (int e = 2; e < kEdgeCount; ++e) {
+        const int a = 4 + (e - 2) * 2;
+        const int b = a + 1;
+        rest_positions[a * 3 + 0] = 50.0f + static_cast<float>(e) * 4.0f;
+        rest_positions[a * 3 + 1] = 30.0f;
+        rest_positions[a * 3 + 2] = 0.0f;
+        rest_positions[b * 3 + 0] = 51.0f + static_cast<float>(e) * 4.0f;
+        rest_positions[b * 3 + 1] = 30.0f;
+        rest_positions[b * 3 + 2] = 0.0f;
+        edges.push_back(a);
+        edges.push_back(b);
+    }
+
+    std::vector<float> rest_lengths;
+    rest_lengths.reserve(kEdgeCount);
+    for (int e = 0; e < kEdgeCount; ++e) {
+        const int a = edges[e * 2 + 0] * 3;
+        const int b = edges[e * 2 + 1] * 3;
+        const float dx = rest_positions[a + 0] - rest_positions[b + 0];
+        const float dy = rest_positions[a + 1] - rest_positions[b + 1];
+        const float dz = rest_positions[a + 2] - rest_positions[b + 2];
+        rest_lengths.push_back(std::sqrt(dx * dx + dy * dy + dz * dz));
+    }
+
+    SsblXpbdConfig cfg{};
+    cfg.vertex_count = kVertexCount;
+    cfg.edge_count = kEdgeCount;
+    cfg.dt = 1.0f / 60.0f;
+    cfg.damping = 1.0f;
+    cfg.gravity[0] = 0.0f;
+    cfg.gravity[1] = 0.0f;
+    cfg.gravity[2] = 0.0f;
+    cfg.self_collision = 1;
+    cfg.self_collision_mode = 1;
+    cfg.cloth_thickness = 0.10f;
+    cfg.collision_margin = 0.0f;
+    cfg.max_self_collision_neighbors = 32;
+
+    SsblXpbdMesh mesh{};
+    mesh.positions = rest_positions.data();
+    mesh.inv_mass = inv_mass.data();
+    mesh.edges = edges.data();
+    mesh.edge_rest_lengths = rest_lengths.data();
+
+    void* solver = ssbl_create_solver(&cfg, &mesh);
+    if (!solver) {
+        std::fprintf(stderr, "SSBL_ABI41_SELF_EE_ERROR create: %s\n", ssbl_last_error());
+        return 40;
+    }
+
+    std::vector<float> close_positions = rest_positions;
+    close_positions[6] = 0.0f;
+    close_positions[7] = -1.0f;
+    close_positions[8] = 0.03f;
+    close_positions[9] = 0.0f;
+    close_positions[10] = 1.0f;
+    close_positions[11] = 0.03f;
+    const float initial_height = edge_average_z(close_positions, 2, 3);
+    if (!ssbl_update_positions(solver, close_positions.data(), static_cast<int>(close_positions.size()))) {
+        std::fprintf(stderr, "SSBL_ABI41_SELF_EE_ERROR upload: %s\n", ssbl_last_error());
+        ssbl_destroy_solver(solver);
+        return 41;
+    }
+    if (!ssbl_step_solver_ex(solver, 1, 6, 1, 1)) {
+        std::fprintf(stderr, "SSBL_ABI41_SELF_EE_ERROR step: %s\n", ssbl_last_error());
+        ssbl_destroy_solver(solver);
+        return 42;
+    }
+
+    std::vector<float> out(close_positions.size(), 0.0f);
+    if (!ssbl_download_positions(solver, out.data(), static_cast<int>(out.size()))) {
+        std::fprintf(stderr, "SSBL_ABI41_SELF_EE_ERROR download: %s\n", ssbl_last_error());
+        ssbl_destroy_solver(solver);
+        return 43;
+    }
+    SsblXpbdDiagnostics diag{};
+    if (!ssbl_get_diagnostics(solver, &diag)) {
+        std::fprintf(stderr, "SSBL_ABI41_SELF_EE_ERROR diagnostics: %s\n", ssbl_last_error());
+        ssbl_destroy_solver(solver);
+        return 44;
+    }
+    ssbl_destroy_solver(solver);
+
+    const float final_height = edge_average_z(out, 2, 3);
+    if (!finite_positions(out) || !diag.finite_flag) {
+        std::fprintf(stderr, "SSBL_ABI41_SELF_EE_ERROR non-finite output\n");
+        return 45;
+    }
+    if (diag.abi41_edge_edge_contact_count <= 0 || diag.resolved_contacts <= 0) {
+        std::fprintf(stderr, "SSBL_ABI41_SELF_EE_ERROR no EE contacts\n");
+        return 46;
+    }
+    if (!(final_height > initial_height + 1.0e-4f)) {
+        std::fprintf(
+            stderr,
+            "SSBL_ABI41_SELF_EE_ERROR height did not increase initial=%.6f final=%.6f contacts=%lld\n",
+            initial_height,
+            final_height,
+            diag.abi41_edge_edge_contact_count
+        );
+        return 47;
+    }
+    std::printf(
+        "SSBL_ABI41_SELF_EE_OK vertices=%d edges=%d contacts=%lld candidates=%lld height=%.5f->%.5f\n",
+        kVertexCount,
+        kEdgeCount,
+        diag.abi41_edge_edge_contact_count,
+        diag.fast_soft_repulsion_candidates,
+        initial_height,
+        final_height
+    );
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -344,5 +491,9 @@ int main() {
     if (self_result != 0) {
         return self_result;
     }
-    return run_self_vertex_triangle_smoke();
+    int vt_result = run_self_vertex_triangle_smoke();
+    if (vt_result != 0) {
+        return vt_result;
+    }
+    return run_self_edge_edge_smoke();
 }

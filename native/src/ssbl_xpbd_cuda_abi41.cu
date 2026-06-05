@@ -26,6 +26,9 @@ constexpr int kAbi41MinSelfHashBuckets = 1024;
 constexpr int kAbi41SelfTriangleHashMinCount = 64;
 constexpr int kAbi41SelfTriangleHashBucketSlots = 32;
 constexpr int kAbi41MinSelfTriangleHashBuckets = 1024;
+constexpr int kAbi41SelfEdgeHashMinCount = 64;
+constexpr int kAbi41SelfEdgeHashBucketSlots = 32;
+constexpr int kAbi41MinSelfEdgeHashBuckets = 1024;
 constexpr int kAbi41TriangleHashMinCount = 64;
 constexpr int kAbi41TriangleHashBucketSlots = 32;
 constexpr int kAbi41MinTriangleHashBuckets = 1024;
@@ -85,6 +88,13 @@ struct Abi41Solver {
     int self_triangle_hash_bucket_count = 0;
     int self_triangle_hash_ready = 0;
     float self_triangle_hash_cell_size = 0.0f;
+    int* self_edge_bucket_counts = nullptr;
+    int* self_edge_bucket_indices = nullptr;
+    int* self_edge_cell_coords = nullptr;
+    int self_edge_cell_capacity = 0;
+    int self_edge_hash_bucket_count = 0;
+    int self_edge_hash_ready = 0;
+    float self_edge_hash_cell_size = 0.0f;
     Vec3* static_triangles = nullptr;
     int* static_triangle_bucket_counts = nullptr;
     int* static_triangle_bucket_indices = nullptr;
@@ -1299,6 +1309,318 @@ __global__ void abi41_soft_vertex_triangle_repulsion_kernel(Abi41Solver solver) 
     }
 }
 
+__host__ __device__ float clamp01(float value) {
+    return fminf(fmaxf(value, 0.0f), 1.0f);
+}
+
+__device__ bool abi41_edge_indices_valid(Abi41Solver solver, ReconSpring edge) {
+    const int a = static_cast<int>(edge.id0);
+    const int b = static_cast<int>(edge.id1);
+    return a >= 0 && b >= 0
+        && a < solver.cfg.vertex_count
+        && b < solver.cfg.vertex_count
+        && a != b;
+}
+
+__device__ bool abi41_edges_share_vertex(ReconSpring a, ReconSpring b) {
+    return a.id0 == b.id0 || a.id0 == b.id1 || a.id1 == b.id0 || a.id1 == b.id1;
+}
+
+__device__ void closest_segment_parameters(
+    Vec3 p1,
+    Vec3 q1,
+    Vec3 p2,
+    Vec3 q2,
+    float* s,
+    float* t
+) {
+    const Vec3 d1 = sub(q1, p1);
+    const Vec3 d2 = sub(q2, p2);
+    const Vec3 r = sub(p1, p2);
+    const float a = dot(d1, d1);
+    const float e = dot(d2, d2);
+    const float f = dot(d2, r);
+    if (a <= kEps && e <= kEps) {
+        *s = 0.0f;
+        *t = 0.0f;
+        return;
+    }
+    if (a <= kEps) {
+        *s = 0.0f;
+        *t = clamp01(f / fmaxf(e, kEps));
+        return;
+    }
+    const float c = dot(d1, r);
+    if (e <= kEps) {
+        *t = 0.0f;
+        *s = clamp01(-c / fmaxf(a, kEps));
+        return;
+    }
+    const float b = dot(d1, d2);
+    const float denom = a * e - b * b;
+    if (fabsf(denom) > kEps) {
+        *s = clamp01((b * f - c * e) / denom);
+    } else {
+        *s = 0.0f;
+    }
+    float tnom = b * (*s) + f;
+    if (tnom < 0.0f) {
+        *t = 0.0f;
+        *s = clamp01(-c / fmaxf(a, kEps));
+    } else if (tnom > e) {
+        *t = 1.0f;
+        *s = clamp01((b - c) / fmaxf(a, kEps));
+    } else {
+        *t = tnom / e;
+    }
+}
+
+__device__ bool abi41_rest_edges_neighbor(Abi41Solver solver, ReconSpring edge_a, ReconSpring edge_b, float target, float onset) {
+    if (abi41_edges_share_vertex(edge_a, edge_b)) {
+        return true;
+    }
+    const int a0 = static_cast<int>(edge_a.id0);
+    const int a1 = static_cast<int>(edge_a.id1);
+    const int b0 = static_cast<int>(edge_b.id0);
+    const int b1 = static_cast<int>(edge_b.id1);
+    float s = 0.0f;
+    float t = 0.0f;
+    closest_segment_parameters(
+        solver.rest[a0],
+        solver.rest[a1],
+        solver.rest[b0],
+        solver.rest[b1],
+        &s,
+        &t
+    );
+    const Vec3 pa = add(solver.rest[a0], mul(sub(solver.rest[a1], solver.rest[a0]), s));
+    const Vec3 pb = add(solver.rest[b0], mul(sub(solver.rest[b1], solver.rest[b0]), t));
+    const Vec3 d = sub(pa, pb);
+    const float rest_skip = fmaxf(onset * 1.25f, target * 2.5f);
+    return dot(d, d) < rest_skip * rest_skip;
+}
+
+__global__ void abi41_build_self_edge_hash_kernel(Abi41Solver solver) {
+    const int edge_index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (edge_index >= solver.cfg.edge_count
+        || !solver.springs
+        || !solver.self_edge_bucket_counts
+        || !solver.self_edge_bucket_indices
+        || !solver.self_edge_cell_coords
+        || solver.self_edge_hash_bucket_count <= 0) {
+        return;
+    }
+    const ReconSpring edge = solver.springs[edge_index];
+    if (!abi41_edge_indices_valid(solver, edge)) {
+        return;
+    }
+    const Vec3 a = solver.pos[static_cast<int>(edge.id0)];
+    const Vec3 b = solver.pos[static_cast<int>(edge.id1)];
+    const float margin = abi41_self_contact_radius(solver.cfg) * 1.8f;
+    const float min_x = fminf(a.x, b.x) - margin;
+    const float min_y = fminf(a.y, b.y) - margin;
+    const float min_z = fminf(a.z, b.z) - margin;
+    const float max_x = fmaxf(a.x, b.x) + margin;
+    const float max_y = fmaxf(a.y, b.y) + margin;
+    const float max_z = fmaxf(a.z, b.z) + margin;
+    const int min_cx = cell_coord(min_x, solver.self_edge_hash_cell_size);
+    const int min_cy = cell_coord(min_y, solver.self_edge_hash_cell_size);
+    const int min_cz = cell_coord(min_z, solver.self_edge_hash_cell_size);
+    const int max_cx = cell_coord(max_x, solver.self_edge_hash_cell_size);
+    const int max_cy = cell_coord(max_y, solver.self_edge_hash_cell_size);
+    const int max_cz = cell_coord(max_z, solver.self_edge_hash_cell_size);
+    solver.self_edge_cell_coords[edge_index * 3 + 0] = min_cx;
+    solver.self_edge_cell_coords[edge_index * 3 + 1] = min_cy;
+    solver.self_edge_cell_coords[edge_index * 3 + 2] = min_cz;
+
+    for (int z = min_cz; z <= max_cz; ++z) {
+        for (int y = min_cy; y <= max_cy; ++y) {
+            for (int x = min_cx; x <= max_cx; ++x) {
+                const unsigned int bucket = hash_cell(x, y, z, solver.self_edge_hash_bucket_count);
+                const int slot = atomicAdd(&solver.self_edge_bucket_counts[bucket], 1);
+                if (slot < kAbi41SelfEdgeHashBucketSlots) {
+                    solver.self_edge_bucket_indices[
+                        static_cast<int>(bucket) * kAbi41SelfEdgeHashBucketSlots + slot
+                    ] = edge_index;
+                } else {
+                    atomicAdd(&solver.abi41_counts[kAbi41CountSelfOverflow], 1ull);
+                }
+            }
+        }
+    }
+}
+
+__device__ bool abi41_apply_soft_edge_edge_pair(Abi41Solver solver, int edge_a_index, int edge_b_index, float target, float onset) {
+    if (edge_b_index <= edge_a_index
+        || edge_a_index < 0
+        || edge_b_index < 0
+        || edge_a_index >= solver.cfg.edge_count
+        || edge_b_index >= solver.cfg.edge_count
+        || target <= 0.0f
+        || onset <= target) {
+        return false;
+    }
+    const ReconSpring edge_a = solver.springs[edge_a_index];
+    const ReconSpring edge_b = solver.springs[edge_b_index];
+    if (!abi41_edge_indices_valid(solver, edge_a)
+        || !abi41_edge_indices_valid(solver, edge_b)
+        || abi41_rest_edges_neighbor(solver, edge_a, edge_b, target, onset)) {
+        return false;
+    }
+
+    const int a0 = static_cast<int>(edge_a.id0);
+    const int a1 = static_cast<int>(edge_a.id1);
+    const int b0 = static_cast<int>(edge_b.id0);
+    const int b1 = static_cast<int>(edge_b.id1);
+    float s = 0.0f;
+    float t = 0.0f;
+    closest_segment_parameters(solver.pos[a0], solver.pos[a1], solver.pos[b0], solver.pos[b1], &s, &t);
+    const Vec3 pa = add(solver.pos[a0], mul(sub(solver.pos[a1], solver.pos[a0]), s));
+    const Vec3 pb = add(solver.pos[b0], mul(sub(solver.pos[b1], solver.pos[b0]), t));
+    Vec3 d = sub(pa, pb);
+    const float dist_sq = dot(d, d);
+    float dist = sqrtf(fmaxf(dist_sq, kEps));
+    if (dist >= onset) {
+        return false;
+    }
+    atomicAdd(&solver.abi41_counts[kAbi41CountSelfCandidates], 1ull);
+
+    Vec3 normal = make_vec3(0.0f, 0.0f, 1.0f);
+    if (dist_sq > kEps) {
+        normal = mul(d, 1.0f / dist);
+    } else {
+        normal = cross(sub(solver.pos[a1], solver.pos[a0]), sub(solver.pos[b1], solver.pos[b0]));
+        const float normal_len_sq = dot(normal, normal);
+        if (normal_len_sq > kEps) {
+            normal = mul(normal, rsqrtf(normal_len_sq));
+        } else {
+            float rs = 0.0f;
+            float rt = 0.0f;
+            closest_segment_parameters(solver.rest[a0], solver.rest[a1], solver.rest[b0], solver.rest[b1], &rs, &rt);
+            const Vec3 rpa = add(solver.rest[a0], mul(sub(solver.rest[a1], solver.rest[a0]), rs));
+            const Vec3 rpb = add(solver.rest[b0], mul(sub(solver.rest[b1], solver.rest[b0]), rt));
+            const Vec3 rd = sub(rpa, rpb);
+            const float rd_len_sq = dot(rd, rd);
+            if (rd_len_sq > kEps) {
+                normal = mul(rd, rsqrtf(rd_len_sq));
+            }
+        }
+        dist = 0.0f;
+    }
+
+    const float penetration = target - dist;
+    float push = 0.0f;
+    if (penetration > 0.0f) {
+        push = fminf(penetration * 0.35f + target * 0.01f, target * 0.25f);
+    } else {
+        const float x = 1.0f - fminf(dist / onset, 1.0f);
+        push = fminf(x * x * target * 0.06f, target * 0.04f);
+    }
+
+    const float a0_weight = 1.0f - s;
+    const float a1_weight = s;
+    const float b0_weight = 1.0f - t;
+    const float b1_weight = t;
+    const float wa0 = solver.inv_mass[a0] * a0_weight;
+    const float wa1 = solver.inv_mass[a1] * a1_weight;
+    const float wb0 = solver.inv_mass[b0] * b0_weight;
+    const float wb1 = solver.inv_mass[b1] * b1_weight;
+    const float total = solver.inv_mass[a0] * a0_weight * a0_weight
+        + solver.inv_mass[a1] * a1_weight * a1_weight
+        + solver.inv_mass[b0] * b0_weight * b0_weight
+        + solver.inv_mass[b1] * b1_weight * b1_weight;
+    if (push <= 0.0f || total <= 0.0f) {
+        return true;
+    }
+
+    const Vec3 delta = mul(normal, push / total);
+    if (wa0 > 0.0f) {
+        atomic_add(&solver.pos[a0], mul(delta, wa0));
+    }
+    if (wa1 > 0.0f) {
+        atomic_add(&solver.pos[a1], mul(delta, wa1));
+    }
+    if (wb0 > 0.0f) {
+        atomic_add(&solver.pos[b0], mul(delta, -wb0));
+    }
+    if (wb1 > 0.0f) {
+        atomic_add(&solver.pos[b1], mul(delta, -wb1));
+    }
+    atomicAdd(&solver.abi41_counts[kAbi41CountEdgeEdgeContacts], 1ull);
+    return true;
+}
+
+__global__ void abi41_soft_edge_edge_repulsion_hash_kernel(Abi41Solver solver) {
+    const int edge_index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (edge_index >= solver.cfg.edge_count
+        || !solver.springs
+        || !solver.self_edge_bucket_counts
+        || !solver.self_edge_bucket_indices
+        || !solver.self_edge_cell_coords
+        || solver.self_edge_hash_bucket_count <= 0) {
+        return;
+    }
+    const ReconSpring edge = solver.springs[edge_index];
+    if (!abi41_edge_indices_valid(solver, edge)) {
+        return;
+    }
+    const float target = abi41_self_contact_radius(solver.cfg);
+    if (target <= 0.0f) {
+        return;
+    }
+    const float onset = fmaxf(target * 1.8f, target + kEps);
+    int max_neighbors = solver.cfg.max_self_collision_neighbors;
+    if (max_neighbors < 1) {
+        max_neighbors = 1;
+    }
+    if (max_neighbors > kAbi41SelfEdgeHashBucketSlots) {
+        max_neighbors = kAbi41SelfEdgeHashBucketSlots;
+    }
+    const Vec3 a = solver.pos[static_cast<int>(edge.id0)];
+    const Vec3 b = solver.pos[static_cast<int>(edge.id1)];
+    const Vec3 mid = mul(add(a, b), 0.5f);
+    const int cx = cell_coord(mid.x, solver.self_edge_hash_cell_size);
+    const int cy = cell_coord(mid.y, solver.self_edge_hash_cell_size);
+    const int cz = cell_coord(mid.z, solver.self_edge_hash_cell_size);
+    const unsigned int bucket = hash_cell(cx, cy, cz, solver.self_edge_hash_bucket_count);
+    const int stored = solver.self_edge_bucket_counts[bucket];
+    const int limit = stored < kAbi41SelfEdgeHashBucketSlots ? stored : kAbi41SelfEdgeHashBucketSlots;
+    int accepted = 0;
+    for (int slot = 0; slot < limit && accepted < max_neighbors; ++slot) {
+        const int other_edge = solver.self_edge_bucket_indices[
+            static_cast<int>(bucket) * kAbi41SelfEdgeHashBucketSlots + slot
+        ];
+        if (abi41_apply_soft_edge_edge_pair(solver, edge_index, other_edge, target, onset)) {
+            ++accepted;
+        }
+    }
+}
+
+__global__ void abi41_soft_edge_edge_repulsion_kernel(Abi41Solver solver) {
+    const int edge_index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (edge_index >= solver.cfg.edge_count || !solver.springs) {
+        return;
+    }
+    const float target = abi41_self_contact_radius(solver.cfg);
+    if (target <= 0.0f) {
+        return;
+    }
+    const float onset = fmaxf(target * 1.8f, target + kEps);
+    int max_neighbors = solver.cfg.max_self_collision_neighbors;
+    if (max_neighbors < 1) {
+        max_neighbors = 1;
+    }
+    if (max_neighbors > kAbi41SelfEdgeHashBucketSlots) {
+        max_neighbors = kAbi41SelfEdgeHashBucketSlots;
+    }
+    int accepted = 0;
+    for (int other_edge = edge_index + 1; other_edge < solver.cfg.edge_count && accepted < max_neighbors; ++other_edge) {
+        if (abi41_apply_soft_edge_edge_pair(solver, edge_index, other_edge, target, onset)) {
+            ++accepted;
+        }
+    }
+}
+
 __global__ void abi41_update_velocity_kernel(Abi41Solver solver, float dt) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= solver.cfg.vertex_count) {
@@ -1523,8 +1845,11 @@ bool build_dynamic_particle_hash(Abi41Solver* solver) {
 }
 
 bool prepare_self_collision_hash_buffers(Abi41Solver* solver) {
+    if (!solver) {
+        return true;
+    }
     solver->self_hash_ready = 0;
-    if (!solver || !solver->cfg.self_collision || solver->cfg.vertex_count < kAbi41SelfHashMinCount) {
+    if (!solver->cfg.self_collision || solver->cfg.vertex_count < kAbi41SelfHashMinCount) {
         return true;
     }
     const float target = std::max(std::max(solver->cfg.cloth_thickness, solver->cfg.collision_margin), 0.0f);
@@ -1584,8 +1909,11 @@ bool build_self_collision_hash(Abi41Solver* solver) {
 }
 
 bool prepare_self_triangle_hash_buffers(Abi41Solver* solver) {
+    if (!solver) {
+        return true;
+    }
     solver->self_triangle_hash_ready = 0;
-    if (!solver || !solver->cfg.self_collision || solver->cfg.triangle_count < kAbi41SelfTriangleHashMinCount) {
+    if (!solver->cfg.self_collision || solver->cfg.triangle_count < kAbi41SelfTriangleHashMinCount) {
         return true;
     }
     const float target = std::max(std::max(solver->cfg.cloth_thickness, solver->cfg.collision_margin), 0.0f);
@@ -1642,6 +1970,70 @@ bool build_self_triangle_hash(Abi41Solver* solver) {
     }
     abi41_build_self_triangle_hash_kernel<<<block_count(solver->cfg.triangle_count), kThreads>>>(*solver);
     return set_cuda_error(cudaGetLastError(), "build self triangle hash");
+}
+
+bool prepare_self_edge_hash_buffers(Abi41Solver* solver) {
+    if (!solver) {
+        return true;
+    }
+    solver->self_edge_hash_ready = 0;
+    if (!solver->cfg.self_collision || solver->cfg.edge_count < kAbi41SelfEdgeHashMinCount) {
+        return true;
+    }
+    const float target = std::max(std::max(solver->cfg.cloth_thickness, solver->cfg.collision_margin), 0.0f);
+    if (target <= 0.0f) {
+        return true;
+    }
+    solver->self_edge_hash_cell_size = std::max(target * 1.8f, 1.0e-3f);
+    const int edge_count = solver->cfg.edge_count;
+    if (edge_count > solver->self_edge_cell_capacity) {
+        cudaFree(solver->self_edge_cell_coords);
+        solver->self_edge_cell_coords = nullptr;
+        solver->self_edge_cell_capacity = 0;
+        if (!alloc_and_copy(&solver->self_edge_cell_coords, static_cast<const int*>(nullptr), edge_count * 3, "self edge cell allocation")) {
+            return false;
+        }
+        solver->self_edge_cell_capacity = edge_count;
+    } else if (!solver->self_edge_cell_coords) {
+        if (!alloc_and_copy(&solver->self_edge_cell_coords, static_cast<const int*>(nullptr), edge_count * 3, "self edge cell allocation")) {
+            return false;
+        }
+        solver->self_edge_cell_capacity = edge_count;
+    }
+
+    const int bucket_count = next_power_of_two(std::max(kAbi41MinSelfEdgeHashBuckets, edge_count * 4));
+    if (bucket_count != solver->self_edge_hash_bucket_count) {
+        cudaFree(solver->self_edge_bucket_counts);
+        cudaFree(solver->self_edge_bucket_indices);
+        solver->self_edge_bucket_counts = nullptr;
+        solver->self_edge_bucket_indices = nullptr;
+        solver->self_edge_hash_bucket_count = 0;
+        if (!alloc_and_copy(&solver->self_edge_bucket_counts, static_cast<const int*>(nullptr), bucket_count, "self edge hash count allocation")
+            || !alloc_and_copy(&solver->self_edge_bucket_indices, static_cast<const int*>(nullptr), bucket_count * kAbi41SelfEdgeHashBucketSlots, "self edge hash index allocation")) {
+            cudaFree(solver->self_edge_bucket_counts);
+            cudaFree(solver->self_edge_bucket_indices);
+            solver->self_edge_bucket_counts = nullptr;
+            solver->self_edge_bucket_indices = nullptr;
+            return false;
+        }
+        solver->self_edge_hash_bucket_count = bucket_count;
+    }
+    solver->self_edge_hash_ready = 1;
+    return true;
+}
+
+bool build_self_edge_hash(Abi41Solver* solver) {
+    if (!solver || solver->self_edge_hash_ready == 0 || solver->cfg.edge_count <= 0) {
+        return true;
+    }
+    if (!set_cuda_error(
+        cudaMemset(solver->self_edge_bucket_counts, 0, sizeof(int) * solver->self_edge_hash_bucket_count),
+        "reset self edge hash"
+    )) {
+        return false;
+    }
+    abi41_build_self_edge_hash_kernel<<<block_count(solver->cfg.edge_count), kThreads>>>(*solver);
+    return set_cuda_error(cudaGetLastError(), "build self edge hash");
 }
 
 bool upload_pins(Abi41Solver* solver, const int* indices, const float* positions, int count) {
@@ -1732,6 +2124,9 @@ void free_solver(Abi41Solver* solver) {
     cudaFree(solver->self_triangle_bucket_counts);
     cudaFree(solver->self_triangle_bucket_indices);
     cudaFree(solver->self_triangle_cell_coords);
+    cudaFree(solver->self_edge_bucket_counts);
+    cudaFree(solver->self_edge_bucket_indices);
+    cudaFree(solver->self_edge_cell_coords);
     cudaFree(solver->static_triangles);
     cudaFree(solver->static_triangle_bucket_counts);
     cudaFree(solver->static_triangle_bucket_indices);
@@ -1969,6 +2364,9 @@ extern "C" SSBL_API void* ssbl_create_solver(const SsblXpbdConfig* config, const
     if (ok && !prepare_self_triangle_hash_buffers(solver)) {
         ok = false;
     }
+    if (ok && !prepare_self_edge_hash_buffers(solver)) {
+        ok = false;
+    }
     if (!ok || !reset_abi41_counts(solver)) {
         free_solver(solver);
         return nullptr;
@@ -2173,6 +2571,13 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
                     }
                     solver->diag.self_hash_ms += elapsed_ms_since(self_hash_started);
                 }
+                if (solver->self_edge_hash_ready != 0) {
+                    const auto self_hash_started = std::chrono::high_resolution_clock::now();
+                    if (!build_self_edge_hash(solver)) {
+                        return 0;
+                    }
+                    solver->diag.self_hash_ms += elapsed_ms_since(self_hash_started);
+                }
                 const auto self_solve_started = std::chrono::high_resolution_clock::now();
                 if (solver->self_hash_ready != 0) {
                     abi41_soft_vertex_repulsion_hash_kernel<<<v_blocks, kThreads>>>(*solver);
@@ -2184,6 +2589,13 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
                         abi41_soft_vertex_triangle_repulsion_hash_kernel<<<v_blocks, kThreads>>>(*solver);
                     } else {
                         abi41_soft_vertex_triangle_repulsion_kernel<<<v_blocks, kThreads>>>(*solver);
+                    }
+                }
+                if (solver->cfg.edge_count > 0) {
+                    if (solver->self_edge_hash_ready != 0) {
+                        abi41_soft_edge_edge_repulsion_hash_kernel<<<e_blocks, kThreads>>>(*solver);
+                    } else {
+                        abi41_soft_edge_edge_repulsion_kernel<<<e_blocks, kThreads>>>(*solver);
                     }
                 }
                 solver->diag.self_solve_ms += elapsed_ms_since(self_solve_started);
