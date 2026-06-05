@@ -13,156 +13,6 @@ def _active_cloth_settings(context: bpy.types.Context):
     return context.scene.ssbl_preview
 
 
-def _panel_header(layout: bpy.types.UILayout, text: str, icon: str):
-    row = layout.row(align=True)
-    row.label(text=text, icon=icon)
-    return row
-
-
-def _draw_status_box(layout: bpy.types.UILayout, obj: bpy.types.Object, settings) -> None:
-    box = layout.box()
-    _panel_header(box, "状态与操作", "MOD_CLOTH")
-    box.prop(settings, "enabled", text="启用当前布料", toggle=True, icon="CHECKMARK")
-
-    grid = box.grid_flow(columns=1, even_columns=False, even_rows=False, align=True)
-    grid.label(text=f"对象: {obj.name if obj is not None else '-'}", icon="OBJECT_DATA")
-    grid.label(text=f"状态: {solver.session_status(obj)}", icon="INFO")
-    fps_text = f"{solver.session_fps(obj):.1f}" if solver.has_session(obj) else "-"
-    grid.label(text=f"预览 FPS: {fps_text}", icon="TIME")
-    grid.label(text=solver.backend_status_text(), icon="CONSOLE")
-
-    action_row = box.row(align=True)
-    action_row.operator("ssbl.reset_preview", text="重置预览", icon="LOOP_BACK")
-
-
-def _draw_preview_box(layout: bpy.types.UILayout, obj: bpy.types.Object, settings) -> None:
-    box = layout.box()
-    _panel_header(box, "预览输入", "PLAY")
-    box.prop(settings, "use_evaluated_mesh", text="使用修改器后的动态网格")
-    box.prop(settings, "preview_target_fps")
-
-    multi_box = box.box()
-    _panel_header(multi_box, "多布料", "OUTLINER_OB_GROUP_INSTANCE")
-    multi_box.prop(settings, "multi_cloth_preview", text="启用多布料预览")
-    if settings.multi_cloth_preview:
-        multi_box.prop(settings, "cross_cloth_collision")
-        if obj is not None:
-            multi_box.prop(obj, "ssbl_collision_layer")
-            multi_box.prop(obj, "ssbl_enable_cross_cloth_collision")
-
-
-def _draw_material_force_box(layout: bpy.types.UILayout, settings) -> None:
-    box = layout.box()
-    _panel_header(box, "材料与外力", "MATERIAL")
-
-    box.prop(settings, "hardness", slider=True)
-    box.label(text="0 = 丝绸    1 = 皮革", icon="IPO_EASE_IN_OUT")
-    box.prop(settings, "pin_vertex_group")
-
-    volume_box = box.box()
-    _panel_header(volume_box, "充气 / 体积保持", "META_BALL")
-    volume_box.prop(settings, "use_volume_pressure")
-    if settings.use_volume_pressure:
-        volume_box.prop(settings, "pressure_strength")
-        volume_box.prop(settings, "volume_target_scale")
-
-
-def _draw_collision_box(layout: bpy.types.UILayout, settings) -> None:
-    box = layout.box()
-    _panel_header(box, "碰撞", "MOD_PHYSICS")
-    box.prop(settings, "collision_margin")
-    box.prop(settings, "cloth_thickness")
-    box.prop(settings, "self_collision")
-    if settings.self_collision:
-        box.prop(settings, "self_collision_mode")
-
-    ground_row = box.row(align=True)
-    ground_row.prop(settings, "use_ground")
-    if settings.use_ground:
-        ground_row.prop(settings, "ground_height")
-    box.prop(settings, "static_collider_collection")
-
-
-def _draw_bake_box(layout: bpy.types.UILayout, settings) -> None:
-    box = layout.box()
-    _panel_header(box, "烘焙", "REC")
-
-    is_baking = bool(getattr(settings, "bake_in_progress", False))
-    if is_baking:
-        current = int(getattr(settings, "bake_progress_current", 0))
-        total = int(getattr(settings, "bake_progress_total", 0))
-        percent = float(getattr(settings, "bake_progress_percent", 0.0))
-        box.label(text=f"烘焙中: {current}/{total} ({percent:.0f}%)", icon="TIME")
-
-    frame_row = box.row(align=True)
-    frame_row.enabled = not is_baking
-    frame_row.prop(settings, "bake_start")
-    frame_row.prop(settings, "bake_end")
-
-    action_row = box.row(align=True)
-    action_row.enabled = not is_baking
-    action_row.operator("ssbl.bake_xpbd_cache", text="烘焙 XPBD", icon="REC")
-    action_row.operator("ssbl.clear_xpbd_cache", text="清除缓存", icon="TRASH")
-
-
-def _draw_force_field_box(layout: bpy.types.UILayout, settings) -> None:
-    box = layout.box()
-    box.prop(settings, "force_field_collection", text="效果器集合")
-
-    flow = box.grid_flow(
-        row_major=True,
-        columns=0,
-        even_columns=True,
-        even_rows=False,
-        align=True,
-    )
-    for group in visible_force_field_weight_groups():
-        col = flow.column()
-        for prop_name in group:
-            col.prop(settings, prop_name, slider=True)
-
-
-def _draw_advanced_box(layout: bpy.types.UILayout, settings) -> None:
-    box = layout.box()
-    icon = "TRIA_DOWN" if settings.show_advanced_settings else "TRIA_RIGHT"
-    box.prop(settings, "show_advanced_settings", text="高级调参", emboss=False, icon=icon)
-    if not settings.show_advanced_settings:
-        return
-
-    solve_box = box.box()
-    _panel_header(solve_box, "解算", "PREFERENCES")
-    solve_box.prop(settings, "dt")
-    solve_box.prop(settings, "substeps")
-    solve_box.prop(settings, "iterations")
-    solve_box.prop(settings, "damping")
-    solve_box.prop(settings, "density")
-
-    if settings.use_volume_pressure:
-        volume_box = box.box()
-        _panel_header(volume_box, "体积", "META_BALL")
-        volume_box.prop(settings, "volume_compliance")
-        volume_box.prop(settings, "volume_solve_interval")
-
-    contact_box = box.box()
-    _panel_header(contact_box, "接触", "SNAP_FACE")
-    contact_box.prop(settings, "contact_friction")
-    contact_box.prop(settings, "contact_tangent_damping")
-    contact_box.prop(settings, "contact_compliance")
-
-    if settings.self_collision:
-        self_box = box.box()
-        _panel_header(self_box, "自碰撞", "MOD_CLOTH")
-        self_box.prop(settings, "self_collision_interval")
-        self_box.prop(settings, "max_self_collision_neighbors")
-        if str(getattr(settings, "self_collision_mode", "fast")).lower() == "fast":
-            self_box.prop(settings, "fast_self_collision_passes")
-        self_box.prop(settings, "self_probe_interval")
-        self_box.prop(settings, "self_surface_pair_interval")
-        self_box.prop(settings, "self_sleep_enabled")
-        if settings.self_sleep_enabled:
-            self_box.prop(settings, "self_sleep_still_frames")
-            self_box.prop(settings, "self_sleep_full_scan_interval")
-
 
 class SSBL_PT_physics_panel(bpy.types.Panel):
     bl_label = "SSBL CUDA XPBD"
@@ -183,10 +33,200 @@ class SSBL_PT_physics_panel(bpy.types.Panel):
         layout.use_property_split = True
         layout.use_property_decorate = False
 
-        _draw_status_box(layout, obj, settings)
-        _draw_preview_box(layout, obj, settings)
-        _draw_material_force_box(layout, settings)
-        _draw_collision_box(layout, settings)
-        _draw_bake_box(layout, settings)
-        _draw_force_field_box(layout, settings)
-        _draw_advanced_box(layout, settings)
+        # Main toggle
+        row = layout.row(align=True)
+        row.scale_y = 1.2
+        row.prop(settings, "enabled", text="启用布料模拟" if not settings.enabled else "布料模拟已启用", toggle=True, icon="PHYSICS")
+
+        if settings.enabled:
+            # Status display
+            col = layout.column(align=True)
+            status_str = f"状态: {solver.session_status(obj)}"
+            fps_str = f"  |  FPS: {solver.session_fps(obj):.1f}" if solver.has_session(obj) else ""
+            col.label(text=status_str + fps_str, icon="INFO")
+            col.label(text=solver.backend_status_text(), icon="CONSOLE")
+
+            layout.separator()
+            layout.operator("ssbl.reset_preview", text="重置预览状态", icon="LOOP_BACK")
+
+
+class SSBL_PT_material(bpy.types.Panel):
+    bl_label = "材料与体积"
+    bl_parent_id = "SSBL_PT_physics_panel"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+
+    def draw(self, context: bpy.types.Context):
+        layout = self.layout
+        settings = _active_cloth_settings(context)
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        layout.prop(settings, "hardness", slider=True)
+        layout.prop(settings, "pin_vertex_group")
+        
+        layout.separator()
+        layout.prop(settings, "use_volume_pressure")
+        if settings.use_volume_pressure:
+            col = layout.column(align=True)
+            col.prop(settings, "pressure_strength")
+            col.prop(settings, "volume_target_scale")
+
+
+class SSBL_PT_collision(bpy.types.Panel):
+    bl_label = "碰撞"
+    bl_parent_id = "SSBL_PT_physics_panel"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+
+    def draw(self, context: bpy.types.Context):
+        layout = self.layout
+        settings = _active_cloth_settings(context)
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        layout.prop(settings, "self_collision")
+        if settings.self_collision:
+            layout.prop(settings, "self_collision_mode")
+
+        layout.separator()
+        layout.prop(settings, "collision_margin")
+        layout.prop(settings, "cloth_thickness")
+
+        layout.separator()
+        layout.prop(settings, "use_ground")
+        if settings.use_ground:
+            layout.prop(settings, "ground_height")
+        layout.prop(settings, "static_collider_collection")
+
+
+class SSBL_PT_cache(bpy.types.Panel):
+    bl_label = "预览与烘焙"
+    bl_parent_id = "SSBL_PT_physics_panel"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context: bpy.types.Context):
+        layout = self.layout
+        obj = context.active_object
+        settings = _active_cloth_settings(context)
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        is_baking = bool(getattr(settings, "bake_in_progress", False))
+        
+        col = layout.column(align=True)
+        col.prop(settings, "preview_target_fps")
+        col.prop(settings, "use_evaluated_mesh")
+        
+        layout.separator()
+        col = layout.column(align=True)
+        col.prop(settings, "multi_cloth_preview")
+        if settings.multi_cloth_preview:
+            col.prop(settings, "cross_cloth_collision")
+            if obj is not None:
+                col.prop(obj, "ssbl_collision_layer")
+                col.prop(obj, "ssbl_enable_cross_cloth_collision")
+
+        layout.separator()
+        if is_baking:
+            current = int(getattr(settings, "bake_progress_current", 0))
+            total = int(getattr(settings, "bake_progress_total", 0))
+            percent = float(getattr(settings, "bake_progress_percent", 0.0))
+            layout.label(text=f"烘焙中: {current}/{total} ({percent:.0f}%)", icon="TIME")
+
+        col = layout.column(align=True)
+        col.enabled = not is_baking
+        
+        row = col.row(align=True)
+        row.prop(settings, "bake_start")
+        row.prop(settings, "bake_end")
+        
+        row = col.row(align=True)
+        row.operator("ssbl.bake_xpbd_cache", text="开始烘焙", icon="REC")
+        row.operator("ssbl.clear_xpbd_cache", text="清除", icon="TRASH")
+
+
+class SSBL_PT_force_fields(bpy.types.Panel):
+    bl_label = "外力与场"
+    bl_parent_id = "SSBL_PT_physics_panel"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context: bpy.types.Context):
+        layout = self.layout
+        settings = _active_cloth_settings(context)
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        layout.prop(settings, "force_field_collection", text="效果器集合")
+        
+        layout.separator()
+        flow = layout.grid_flow(row_major=True, columns=0, even_columns=True, even_rows=False, align=True)
+        for group in visible_force_field_weight_groups():
+            col = flow.column()
+            for prop_name in group:
+                col.prop(settings, prop_name, slider=True)
+
+
+class SSBL_PT_advanced(bpy.types.Panel):
+    bl_label = "高级解算"
+    bl_parent_id = "SSBL_PT_physics_panel"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context: bpy.types.Context):
+        layout = self.layout
+        settings = _active_cloth_settings(context)
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        col = layout.column(align=True)
+        col.prop(settings, "dt")
+        col.prop(settings, "substeps")
+        col.prop(settings, "iterations")
+        col.prop(settings, "damping")
+        col.prop(settings, "density")
+
+        if settings.use_volume_pressure:
+            layout.separator()
+            col = layout.column(align=True)
+            col.label(text="体积:")
+            col.prop(settings, "volume_compliance")
+            col.prop(settings, "volume_solve_interval")
+
+        layout.separator()
+        col = layout.column(align=True)
+        col.label(text="接触:")
+        col.prop(settings, "contact_friction")
+        col.prop(settings, "contact_tangent_damping")
+        col.prop(settings, "contact_compliance")
+
+        if settings.self_collision:
+            layout.separator()
+            col = layout.column(align=True)
+            col.label(text="自碰撞:")
+            col.prop(settings, "self_collision_interval")
+            col.prop(settings, "max_self_collision_neighbors")
+            if str(getattr(settings, "self_collision_mode", "fast")).lower() == "fast":
+                col.prop(settings, "fast_self_collision_passes")
+            col.prop(settings, "self_probe_interval")
+            col.prop(settings, "self_surface_pair_interval")
+            
+            col.prop(settings, "self_sleep_enabled")
+            if settings.self_sleep_enabled:
+                col.prop(settings, "self_sleep_still_frames")
+                col.prop(settings, "self_sleep_full_scan_interval")
+
+
+CLASSES = (
+    SSBL_PT_physics_panel,
+    SSBL_PT_material,
+    SSBL_PT_collision,
+    SSBL_PT_cache,
+    SSBL_PT_force_fields,
+    SSBL_PT_advanced,
+)

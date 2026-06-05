@@ -780,8 +780,7 @@ CLASSES = (
     operators.SSBL_OT_reset_preview,
     operators.SSBL_OT_bake_xpbd_cache,
     operators.SSBL_OT_clear_xpbd_cache,
-    ui.SSBL_PT_physics_panel,
-)
+) + ui.CLASSES
 
 
 def register():
