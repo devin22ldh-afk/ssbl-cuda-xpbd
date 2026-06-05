@@ -730,6 +730,30 @@ class SSBL_PreviewSettings(PropertyGroup):
         options={"HIDDEN"},
         description="Internal XPBD compliance for static/dynamic triangle contacts",
     )
+    static_sdf_voxel_size: FloatProperty(
+        name="Static SDF voxel size",
+        default=0.0,
+        min=0.0,
+        soft_max=0.05,
+        precision=4,
+        description="Static mesh SDF voxel size; 0 uses max(collision margin * 0.5, 0.002)",
+    )
+    static_sdf_band_voxels: IntProperty(
+        name="Static SDF band voxels",
+        default=4,
+        min=1,
+        max=32,
+        soft_max=16,
+        description="Voxel padding band around static mesh SDF collision surfaces",
+    )
+    static_sdf_max_resolution: IntProperty(
+        name="Static SDF max resolution",
+        default=160,
+        min=16,
+        max=512,
+        soft_max=256,
+        description="Maximum grid resolution per axis for CUDA static mesh SDF rebuilds",
+    )
     use_ground: BoolProperty(
         name="地面平面",
         default=True,

@@ -67,6 +67,9 @@ def _make_options() -> SolverOptions:
         contact_friction=0.0,
         contact_tangent_damping=0.0,
         contact_compliance=0.0,
+        static_sdf_voxel_size=0.0,
+        static_sdf_band_voxels=4,
+        static_sdf_max_resolution=160,
     )
 
 

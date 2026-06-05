@@ -6,8 +6,11 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
+#include <limits>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -44,7 +47,8 @@ constexpr int kAbi41CountTrianglePairs = 7;
 constexpr int kAbi41CountTrianglePairOverflow = 8;
 constexpr int kAbi41CountSelfCandidates = 9;
 constexpr int kAbi41CountSelfOverflow = 10;
-constexpr int kAbi41CountSlots = 11;
+constexpr int kAbi41CountStaticSdfContacts = 11;
+constexpr int kAbi41CountSlots = 12;
 constexpr float kAbi41SpringRelaxation = 0.18f;
 constexpr float kAbi41SelfAveragingClampScale = 0.35f;
 constexpr int kAbi41MaxForceFields = 64;
@@ -120,15 +124,20 @@ struct Abi41Solver {
     Vec3* self_averaged_delta = nullptr;
     float* self_max_smoothed_delta_device = nullptr;
     Vec3* static_triangles = nullptr;
-    int* static_triangle_bucket_counts = nullptr;
-    int* static_triangle_bucket_indices = nullptr;
-    int* static_triangle_cell_coords = nullptr;
     int static_triangle_count = 0;
     int static_triangle_capacity = 0;
-    int static_triangle_cell_capacity = 0;
-    int static_triangle_hash_bucket_count = 0;
-    int static_triangle_hash_ready = 0;
-    float static_triangle_hash_cell_size = 0.0f;
+    float* static_sdf = nullptr;
+    int static_sdf_capacity = 0;
+    int static_sdf_ready = 0;
+    int static_sdf_dim_x = 0;
+    int static_sdf_dim_y = 0;
+    int static_sdf_dim_z = 0;
+    Vec3 static_sdf_origin{};
+    float static_sdf_voxel_size = 0.0f;
+    int static_sdf_signed = 0;
+    long long static_sdf_rebuild_count = 0;
+    long long static_sdf_unsigned_fallback_count = 0;
+    float static_sdf_build_ms = 0.0f;
     Vec3* dynamic_triangles = nullptr;
     int* dynamic_triangle_bucket_counts = nullptr;
     int* dynamic_triangle_bucket_indices = nullptr;
@@ -167,7 +176,7 @@ struct Abi41Solver {
 };
 
 bool set_error(const char* message) {
-    g_last_error = message ? message : "unknown ABI38 recon CUDA error";
+    g_last_error = message ? message : "unknown ABI39 recon CUDA error";
     return false;
 }
 
@@ -229,6 +238,10 @@ __host__ __device__ unsigned int hash_cell(int x, int y, int z, int bucket_count
     const unsigned int uz = static_cast<unsigned int>(z);
     const unsigned int hash = ux * 73856093u ^ uy * 19349663u ^ uz * 83492791u;
     return bucket_count > 0 ? hash & static_cast<unsigned int>(bucket_count - 1) : 0u;
+}
+
+__host__ __device__ int clamp_int_value(int value, int lo, int hi) {
+    return value < lo ? lo : (value > hi ? hi : value);
 }
 
 __device__ void atomic_add(Vec3* dst, Vec3 value) {
@@ -578,6 +591,252 @@ __device__ Vec3 closest_point_on_triangle(Vec3 p, Vec3 a, Vec3 b, Vec3 c) {
     return add(a, add(mul(ab, v), mul(ac, w)));
 }
 
+__device__ int static_sdf_index(Abi41Solver solver, int x, int y, int z) {
+    return (z * solver.static_sdf_dim_y + y) * solver.static_sdf_dim_x + x;
+}
+
+__device__ float lerp_float(float a, float b, float t) {
+    return a + (b - a) * t;
+}
+
+__device__ bool static_sdf_sample(Abi41Solver solver, Vec3 p, float* out_distance) {
+    if (!out_distance
+        || !solver.static_sdf
+        || solver.static_sdf_ready == 0
+        || solver.static_sdf_dim_x < 2
+        || solver.static_sdf_dim_y < 2
+        || solver.static_sdf_dim_z < 2
+        || solver.static_sdf_voxel_size <= 0.0f) {
+        return false;
+    }
+    const float inv_voxel = 1.0f / solver.static_sdf_voxel_size;
+    const float gx = (p.x - solver.static_sdf_origin.x) * inv_voxel;
+    const float gy = (p.y - solver.static_sdf_origin.y) * inv_voxel;
+    const float gz = (p.z - solver.static_sdf_origin.z) * inv_voxel;
+    if (gx < 0.0f || gy < 0.0f || gz < 0.0f
+        || gx > static_cast<float>(solver.static_sdf_dim_x - 1)
+        || gy > static_cast<float>(solver.static_sdf_dim_y - 1)
+        || gz > static_cast<float>(solver.static_sdf_dim_z - 1)) {
+        return false;
+    }
+    const int x0 = clamp_int_value(static_cast<int>(floorf(gx)), 0, solver.static_sdf_dim_x - 1);
+    const int y0 = clamp_int_value(static_cast<int>(floorf(gy)), 0, solver.static_sdf_dim_y - 1);
+    const int z0 = clamp_int_value(static_cast<int>(floorf(gz)), 0, solver.static_sdf_dim_z - 1);
+    const int x1 = clamp_int_value(x0 + 1, 0, solver.static_sdf_dim_x - 1);
+    const int y1 = clamp_int_value(y0 + 1, 0, solver.static_sdf_dim_y - 1);
+    const int z1 = clamp_int_value(z0 + 1, 0, solver.static_sdf_dim_z - 1);
+    const float tx = gx - static_cast<float>(x0);
+    const float ty = gy - static_cast<float>(y0);
+    const float tz = gz - static_cast<float>(z0);
+
+    const float c000 = solver.static_sdf[static_sdf_index(solver, x0, y0, z0)];
+    const float c100 = solver.static_sdf[static_sdf_index(solver, x1, y0, z0)];
+    const float c010 = solver.static_sdf[static_sdf_index(solver, x0, y1, z0)];
+    const float c110 = solver.static_sdf[static_sdf_index(solver, x1, y1, z0)];
+    const float c001 = solver.static_sdf[static_sdf_index(solver, x0, y0, z1)];
+    const float c101 = solver.static_sdf[static_sdf_index(solver, x1, y0, z1)];
+    const float c011 = solver.static_sdf[static_sdf_index(solver, x0, y1, z1)];
+    const float c111 = solver.static_sdf[static_sdf_index(solver, x1, y1, z1)];
+    const float c00 = lerp_float(c000, c100, tx);
+    const float c10 = lerp_float(c010, c110, tx);
+    const float c01 = lerp_float(c001, c101, tx);
+    const float c11 = lerp_float(c011, c111, tx);
+    const float c0 = lerp_float(c00, c10, ty);
+    const float c1 = lerp_float(c01, c11, ty);
+    *out_distance = lerp_float(c0, c1, tz);
+    return isfinite(*out_distance);
+}
+
+__device__ float static_sdf_sample_clamped(Abi41Solver solver, Vec3 p) {
+    const float inv_voxel = 1.0f / fmaxf(solver.static_sdf_voxel_size, kEps);
+    const float max_x = static_cast<float>(solver.static_sdf_dim_x - 1);
+    const float max_y = static_cast<float>(solver.static_sdf_dim_y - 1);
+    const float max_z = static_cast<float>(solver.static_sdf_dim_z - 1);
+    float gx = fminf(fmaxf((p.x - solver.static_sdf_origin.x) * inv_voxel, 0.0f), max_x);
+    float gy = fminf(fmaxf((p.y - solver.static_sdf_origin.y) * inv_voxel, 0.0f), max_y);
+    float gz = fminf(fmaxf((p.z - solver.static_sdf_origin.z) * inv_voxel, 0.0f), max_z);
+    const int x0 = clamp_int_value(static_cast<int>(floorf(gx)), 0, solver.static_sdf_dim_x - 1);
+    const int y0 = clamp_int_value(static_cast<int>(floorf(gy)), 0, solver.static_sdf_dim_y - 1);
+    const int z0 = clamp_int_value(static_cast<int>(floorf(gz)), 0, solver.static_sdf_dim_z - 1);
+    const int x1 = clamp_int_value(x0 + 1, 0, solver.static_sdf_dim_x - 1);
+    const int y1 = clamp_int_value(y0 + 1, 0, solver.static_sdf_dim_y - 1);
+    const int z1 = clamp_int_value(z0 + 1, 0, solver.static_sdf_dim_z - 1);
+    const float tx = gx - static_cast<float>(x0);
+    const float ty = gy - static_cast<float>(y0);
+    const float tz = gz - static_cast<float>(z0);
+    const float c000 = solver.static_sdf[static_sdf_index(solver, x0, y0, z0)];
+    const float c100 = solver.static_sdf[static_sdf_index(solver, x1, y0, z0)];
+    const float c010 = solver.static_sdf[static_sdf_index(solver, x0, y1, z0)];
+    const float c110 = solver.static_sdf[static_sdf_index(solver, x1, y1, z0)];
+    const float c001 = solver.static_sdf[static_sdf_index(solver, x0, y0, z1)];
+    const float c101 = solver.static_sdf[static_sdf_index(solver, x1, y0, z1)];
+    const float c011 = solver.static_sdf[static_sdf_index(solver, x0, y1, z1)];
+    const float c111 = solver.static_sdf[static_sdf_index(solver, x1, y1, z1)];
+    return lerp_float(
+        lerp_float(lerp_float(c000, c100, tx), lerp_float(c010, c110, tx), ty),
+        lerp_float(lerp_float(c001, c101, tx), lerp_float(c011, c111, tx), ty),
+        tz
+    );
+}
+
+__device__ bool ray_pos_x_intersects_triangle(Vec3 p, Vec3 a, Vec3 b, Vec3 c) {
+    const Vec3 dir = make_vec3(1.0f, 0.0f, 0.0f);
+    const Vec3 edge1 = sub(b, a);
+    const Vec3 edge2 = sub(c, a);
+    const Vec3 h = cross(dir, edge2);
+    const float det = dot(edge1, h);
+    if (fabsf(det) <= 1.0e-8f) {
+        return false;
+    }
+    const float inv_det = 1.0f / det;
+    const Vec3 s = sub(p, a);
+    const float u = inv_det * dot(s, h);
+    if (u < -1.0e-5f || u > 1.0f + 1.0e-5f) {
+        return false;
+    }
+    const Vec3 q = cross(s, edge1);
+    const float v = inv_det * dot(dir, q);
+    if (v < -1.0e-5f || u + v > 1.0f + 1.0e-5f) {
+        return false;
+    }
+    const float t = inv_det * dot(edge2, q);
+    return t > 1.0e-6f;
+}
+
+__device__ Vec3 nearest_static_triangle_normal(Abi41Solver solver, Vec3 p) {
+    Vec3 best_normal = make_vec3(0.0f, 0.0f, 1.0f);
+    float best_sq = 3.402823466e+38f;
+    for (int t = 0; t < solver.static_triangle_count; ++t) {
+        const Vec3 a = solver.static_triangles[t * 3 + 0];
+        const Vec3 b = solver.static_triangles[t * 3 + 1];
+        const Vec3 c = solver.static_triangles[t * 3 + 2];
+        const Vec3 q = closest_point_on_triangle(p, a, b, c);
+        const Vec3 d = sub(p, q);
+        const float dist_sq = dot(d, d);
+        if (dist_sq < best_sq) {
+            best_sq = dist_sq;
+            if (dist_sq > kEps * kEps) {
+                best_normal = normalize_or(d, best_normal);
+            } else {
+                best_normal = normalize_or(cross(sub(b, a), sub(c, a)), best_normal);
+            }
+        }
+    }
+    return normalize_or(best_normal, make_vec3(0.0f, 0.0f, 1.0f));
+}
+
+__device__ Vec3 static_sdf_normal(Abi41Solver solver, Vec3 p) {
+    const float h = fmaxf(solver.static_sdf_voxel_size, 1.0e-5f);
+    const float dx = static_sdf_sample_clamped(solver, add(p, make_vec3(h, 0.0f, 0.0f)))
+        - static_sdf_sample_clamped(solver, add(p, make_vec3(-h, 0.0f, 0.0f)));
+    const float dy = static_sdf_sample_clamped(solver, add(p, make_vec3(0.0f, h, 0.0f)))
+        - static_sdf_sample_clamped(solver, add(p, make_vec3(0.0f, -h, 0.0f)));
+    const float dz = static_sdf_sample_clamped(solver, add(p, make_vec3(0.0f, 0.0f, h)))
+        - static_sdf_sample_clamped(solver, add(p, make_vec3(0.0f, 0.0f, -h)));
+    const Vec3 n = make_vec3(dx, dy, dz);
+    const float len_sq = dot(n, n);
+    if (!isfinite(len_sq) || len_sq <= 1.0e-12f) {
+        return nearest_static_triangle_normal(solver, p);
+    }
+    return mul(n, rsqrtf(len_sq));
+}
+
+__global__ void abi41_build_static_sdf_kernel(Abi41Solver solver) {
+    const int voxel = blockIdx.x * blockDim.x + threadIdx.x;
+    const int voxel_count = solver.static_sdf_dim_x * solver.static_sdf_dim_y * solver.static_sdf_dim_z;
+    if (voxel >= voxel_count
+        || !solver.static_sdf
+        || !solver.static_triangles
+        || solver.static_triangle_count <= 0) {
+        return;
+    }
+    const int x = voxel % solver.static_sdf_dim_x;
+    const int y = (voxel / solver.static_sdf_dim_x) % solver.static_sdf_dim_y;
+    const int z = voxel / (solver.static_sdf_dim_x * solver.static_sdf_dim_y);
+    Vec3 p = add(
+        solver.static_sdf_origin,
+        make_vec3(
+            static_cast<float>(x) * solver.static_sdf_voxel_size,
+            static_cast<float>(y) * solver.static_sdf_voxel_size,
+            static_cast<float>(z) * solver.static_sdf_voxel_size
+        )
+    );
+    Vec3 ray_point = add(
+        p,
+        make_vec3(0.0f, solver.static_sdf_voxel_size * 1.37e-4f, solver.static_sdf_voxel_size * 2.11e-4f)
+    );
+    float best_sq = 3.402823466e+38f;
+    int parity = 0;
+    for (int t = 0; t < solver.static_triangle_count; ++t) {
+        const Vec3 a = solver.static_triangles[t * 3 + 0];
+        const Vec3 b = solver.static_triangles[t * 3 + 1];
+        const Vec3 c = solver.static_triangles[t * 3 + 2];
+        const Vec3 q = closest_point_on_triangle(p, a, b, c);
+        const Vec3 d = sub(p, q);
+        best_sq = fminf(best_sq, dot(d, d));
+        if (solver.static_sdf_signed != 0 && ray_pos_x_intersects_triangle(ray_point, a, b, c)) {
+            parity ^= 1;
+        }
+    }
+    float distance = sqrtf(fmaxf(best_sq, 0.0f));
+    if (solver.static_sdf_signed != 0 && parity != 0) {
+        distance = -distance;
+    }
+    solver.static_sdf[voxel] = distance;
+}
+
+__global__ void abi41_static_sdf_collision_kernel(Abi41Solver solver, float dt) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= solver.cfg.vertex_count
+        || solver.inv_mass[i] <= 0.0f
+        || !solver.static_sdf
+        || solver.static_sdf_ready == 0
+        || (solver.state_flags[i] & ssbl_abi41::kPinnedOrKinematicFlag) != 0u) {
+        return;
+    }
+    const float margin = fmaxf(solver.cfg.collision_margin, 0.0f);
+    if (margin <= 0.0f) {
+        return;
+    }
+    Vec3 p = solver.pos[i];
+    float distance = 0.0f;
+    if (!static_sdf_sample(solver, p, &distance) || distance >= margin) {
+        return;
+    }
+    Vec3 normal = static_sdf_normal(solver, p);
+    if (!finite_vec(normal)) {
+        return;
+    }
+    const float penetration = margin - distance;
+    if (!isfinite(penetration) || penetration <= 0.0f) {
+        return;
+    }
+    Vec3 corrected = add(p, mul(normal, penetration));
+    Vec3 vel = solver.vel[i];
+    const float vn = dot(vel, normal);
+    const float inward_speed = fmaxf(-vn, 0.0f);
+    if (vn < 0.0f) {
+        vel = sub(vel, mul(normal, vn));
+    }
+    Vec3 tangent = sub(vel, mul(normal, dot(vel, normal)));
+    const float damping = clamp01(solver.cfg.contact_tangent_damping);
+    if (damping > 0.0f) {
+        vel = sub(vel, mul(tangent, damping));
+    }
+    tangent = sub(vel, mul(normal, dot(vel, normal)));
+    const float tangent_len = length(tangent);
+    const float friction = fmaxf(solver.cfg.contact_friction, 0.0f);
+    if (friction > 0.0f && tangent_len > 1.0e-6f) {
+        const float normal_proxy = inward_speed + penetration / fmaxf(dt, kEps);
+        const float drop = fminf(tangent_len, friction * normal_proxy);
+        vel = sub(vel, mul(tangent, drop / fmaxf(tangent_len, kEps)));
+    }
+    solver.pos[i] = corrected;
+    solver.vel[i] = vel;
+    solver.prev[i] = sub(corrected, mul(vel, fmaxf(dt, kEps)));
+    atomicAdd(&solver.abi41_counts[kAbi41CountStaticSdfContacts], 1ull);
+}
+
 __global__ void abi41_integrate_kernel(Abi41Solver solver, float dt) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= solver.cfg.vertex_count) {
@@ -781,172 +1040,6 @@ __global__ void abi41_analytic_collision_kernel(Abi41Solver solver) {
         }
     }
     solver.pos[i] = p;
-}
-
-__global__ void abi41_build_static_triangle_hash_kernel(Abi41Solver solver) {
-    const int triangle = blockIdx.x * blockDim.x + threadIdx.x;
-    if (triangle >= solver.static_triangle_count
-        || !solver.static_triangles
-        || !solver.static_triangle_bucket_counts
-        || !solver.static_triangle_bucket_indices
-        || !solver.static_triangle_cell_coords
-        || solver.static_triangle_hash_bucket_count <= 0) {
-        return;
-    }
-    Vec3 a = solver.static_triangles[triangle * 3 + 0];
-    Vec3 b = solver.static_triangles[triangle * 3 + 1];
-    Vec3 c = solver.static_triangles[triangle * 3 + 2];
-    Vec3 center = mul(add(add(a, b), c), 1.0f / 3.0f);
-    const int cx = cell_coord(center.x, solver.static_triangle_hash_cell_size);
-    const int cy = cell_coord(center.y, solver.static_triangle_hash_cell_size);
-    const int cz = cell_coord(center.z, solver.static_triangle_hash_cell_size);
-    solver.static_triangle_cell_coords[triangle * 3 + 0] = cx;
-    solver.static_triangle_cell_coords[triangle * 3 + 1] = cy;
-    solver.static_triangle_cell_coords[triangle * 3 + 2] = cz;
-
-    const float margin = fmaxf(solver.cfg.collision_margin, 0.0f);
-    const float min_x = fminf(a.x, fminf(b.x, c.x)) - margin;
-    const float min_y = fminf(a.y, fminf(b.y, c.y)) - margin;
-    const float min_z = fminf(a.z, fminf(b.z, c.z)) - margin;
-    const float max_x = fmaxf(a.x, fmaxf(b.x, c.x)) + margin;
-    const float max_y = fmaxf(a.y, fmaxf(b.y, c.y)) + margin;
-    const float max_z = fmaxf(a.z, fmaxf(b.z, c.z)) + margin;
-    const int min_cx = cell_coord(min_x, solver.static_triangle_hash_cell_size);
-    const int min_cy = cell_coord(min_y, solver.static_triangle_hash_cell_size);
-    const int min_cz = cell_coord(min_z, solver.static_triangle_hash_cell_size);
-    const int max_cx = cell_coord(max_x, solver.static_triangle_hash_cell_size);
-    const int max_cy = cell_coord(max_y, solver.static_triangle_hash_cell_size);
-    const int max_cz = cell_coord(max_z, solver.static_triangle_hash_cell_size);
-    for (int z = min_cz; z <= max_cz; ++z) {
-        for (int y = min_cy; y <= max_cy; ++y) {
-            for (int x = min_cx; x <= max_cx; ++x) {
-                const unsigned int bucket = hash_cell(x, y, z, solver.static_triangle_hash_bucket_count);
-                const int slot = atomicAdd(&solver.static_triangle_bucket_counts[bucket], 1);
-                if (slot < kAbi41TriangleHashBucketSlots) {
-                    solver.static_triangle_bucket_indices[
-                        static_cast<int>(bucket) * kAbi41TriangleHashBucketSlots + slot
-                    ] = triangle;
-                }
-            }
-        }
-    }
-}
-
-__device__ void consider_static_triangle_candidate(
-    Abi41Solver solver,
-    int triangle,
-    Vec3 p,
-    float margin,
-    Vec3* best_delta,
-    float* best_penetration,
-    int* best_triangle
-) {
-    if (triangle < 0 || triangle >= solver.static_triangle_count) {
-        return;
-    }
-    Vec3 a = solver.static_triangles[triangle * 3 + 0];
-    Vec3 b = solver.static_triangles[triangle * 3 + 1];
-    Vec3 c = solver.static_triangles[triangle * 3 + 2];
-    Vec3 q = closest_point_on_triangle(p, a, b, c);
-    Vec3 d = sub(p, q);
-    float dist_sq = dot(d, d);
-    float dist = sqrtf(fmaxf(dist_sq, kEps));
-    if (dist >= margin) {
-        return;
-    }
-    Vec3 normal = mul(d, 1.0f / fmaxf(dist, kEps));
-    if (dist_sq <= kEps * 4.0f) {
-        Vec3 tri_n = cross(sub(b, a), sub(c, a));
-        float tri_len = sqrtf(fmaxf(dot(tri_n, tri_n), kEps));
-        normal = mul(tri_n, 1.0f / tri_len);
-    }
-    float penetration = margin - dist;
-    if (penetration > *best_penetration) {
-        *best_penetration = penetration;
-        *best_delta = mul(normal, penetration);
-        *best_triangle = triangle;
-    }
-}
-
-__global__ void abi41_build_static_triangle_pairs_kernel(Abi41Solver solver) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= solver.cfg.vertex_count
-        || solver.inv_mass[i] <= 0.0f
-        || !solver.static_triangles
-        || !solver.triangle_pairs
-        || !solver.triangle_pair_count
-        || solver.triangle_pair_capacity <= 0) {
-        return;
-    }
-    float margin = fmaxf(solver.cfg.collision_margin, 0.0f);
-    if (margin <= 0.0f) {
-        return;
-    }
-    Vec3 p = solver.pos[i];
-    Vec3 best_delta = make_vec3(0.0f, 0.0f, 0.0f);
-    float best_penetration = 0.0f;
-    int best_triangle = -1;
-    if (solver.static_triangle_hash_ready != 0
-        && solver.static_triangle_bucket_counts
-        && solver.static_triangle_bucket_indices
-        && solver.static_triangle_cell_coords
-        && solver.static_triangle_hash_bucket_count > 0) {
-        const int cx = cell_coord(p.x, solver.static_triangle_hash_cell_size);
-        const int cy = cell_coord(p.y, solver.static_triangle_hash_cell_size);
-        const int cz = cell_coord(p.z, solver.static_triangle_hash_cell_size);
-        for (int dz = -1; dz <= 1; ++dz) {
-            for (int dy = -1; dy <= 1; ++dy) {
-                for (int dx = -1; dx <= 1; ++dx) {
-                    const int qx = cx + dx;
-                    const int qy = cy + dy;
-                    const int qz = cz + dz;
-                    const unsigned int bucket = hash_cell(qx, qy, qz, solver.static_triangle_hash_bucket_count);
-                    const int stored = solver.static_triangle_bucket_counts[bucket];
-                    const int limit = stored < kAbi41TriangleHashBucketSlots ? stored : kAbi41TriangleHashBucketSlots;
-                    for (int slot = 0; slot < limit; ++slot) {
-                        const int triangle = solver.static_triangle_bucket_indices[
-                            static_cast<int>(bucket) * kAbi41TriangleHashBucketSlots + slot
-                        ];
-                        consider_static_triangle_candidate(
-                            solver,
-                            triangle,
-                            p,
-                            margin,
-                            &best_delta,
-                            &best_penetration,
-                            &best_triangle
-                        );
-                    }
-                }
-            }
-        }
-    } else {
-        for (int t = 0; t < solver.static_triangle_count; ++t) {
-            consider_static_triangle_candidate(
-                solver,
-                t,
-                p,
-                margin,
-                &best_delta,
-                &best_penetration,
-                &best_triangle
-            );
-        }
-    }
-    if (best_penetration > 0.0f) {
-        const int pair_index = atomicAdd(solver.triangle_pair_count, 1);
-        atomicAdd(&solver.abi41_counts[kAbi41CountTrianglePairs], 1ull);
-        if (pair_index < solver.triangle_pair_capacity) {
-            TriangleProximityPair pair{};
-            pair.vertex = i;
-            pair.triangle = best_triangle;
-            pair.source = 0;
-            pair.delta = best_delta;
-            solver.triangle_pairs[pair_index] = pair;
-        } else {
-            atomicAdd(&solver.abi41_counts[kAbi41CountTrianglePairOverflow], 1ull);
-        }
-    }
 }
 
 __global__ void abi41_build_dynamic_triangle_hash_kernel(Abi41Solver solver) {
@@ -2238,79 +2331,249 @@ int next_power_of_two(int value) {
     return result;
 }
 
-float triangle_hash_cell_size(Abi41Solver* solver, const float* triangles, int triangle_count) {
-    float max_extent = 0.0f;
-    const Vec3* triangle_vecs = reinterpret_cast<const Vec3*>(triangles);
-    for (int t = 0; t < triangle_count; ++t) {
-        const Vec3 a = triangle_vecs[t * 3 + 0];
-        const Vec3 b = triangle_vecs[t * 3 + 1];
-        const Vec3 c = triangle_vecs[t * 3 + 2];
-        const float min_x = std::min(a.x, std::min(b.x, c.x));
-        const float min_y = std::min(a.y, std::min(b.y, c.y));
-        const float min_z = std::min(a.z, std::min(b.z, c.z));
-        const float max_x = std::max(a.x, std::max(b.x, c.x));
-        const float max_y = std::max(a.y, std::max(b.y, c.y));
-        const float max_z = std::max(a.z, std::max(b.z, c.z));
-        max_extent = std::max(max_extent, std::max(max_x - min_x, std::max(max_y - min_y, max_z - min_z)));
+struct QuantizedVecKey {
+    long long x;
+    long long y;
+    long long z;
+
+    bool operator==(const QuantizedVecKey& other) const {
+        return x == other.x && y == other.y && z == other.z;
     }
-    const float margin = std::max(solver->cfg.collision_margin, 0.0f);
-    const float thickness = std::max(solver->cfg.cloth_thickness, 0.0f);
-    return std::max(std::max(max_extent + margin * 2.0f, thickness), 1.0e-3f);
+};
+
+struct QuantizedVecKeyHash {
+    size_t operator()(const QuantizedVecKey& key) const {
+        std::uint64_t h = static_cast<std::uint64_t>(key.x) * 73856093ull
+            ^ static_cast<std::uint64_t>(key.y) * 19349663ull
+            ^ static_cast<std::uint64_t>(key.z) * 83492791ull;
+        h ^= h >> 33;
+        h *= 0xff51afd7ed558ccdull;
+        h ^= h >> 33;
+        return static_cast<size_t>(h);
+    }
+};
+
+QuantizedVecKey quantized_vec_key(Vec3 value) {
+    constexpr double kScale = 1000000.0;
+    return QuantizedVecKey{
+        static_cast<long long>(std::llround(static_cast<double>(value.x) * kScale)),
+        static_cast<long long>(std::llround(static_cast<double>(value.y) * kScale)),
+        static_cast<long long>(std::llround(static_cast<double>(value.z) * kScale))
+    };
 }
 
-bool prepare_static_triangle_hash_buffers(Abi41Solver* solver, int triangle_count) {
-    solver->static_triangle_hash_ready = 0;
-    if (triangle_count < kAbi41TriangleHashMinCount) {
-        return true;
+int static_vertex_id(
+    std::unordered_map<QuantizedVecKey, int, QuantizedVecKeyHash>* ids,
+    Vec3 value
+) {
+    QuantizedVecKey key = quantized_vec_key(value);
+    auto found = ids->find(key);
+    if (found != ids->end()) {
+        return found->second;
     }
-    if (triangle_count > solver->static_triangle_cell_capacity) {
-        cudaFree(solver->static_triangle_cell_coords);
-        solver->static_triangle_cell_coords = nullptr;
-        solver->static_triangle_cell_capacity = 0;
-        if (!alloc_and_copy(&solver->static_triangle_cell_coords, static_cast<const int*>(nullptr), triangle_count * 3, "static triangle cell allocation")) {
-            return false;
-        }
-        solver->static_triangle_cell_capacity = triangle_count;
-    } else if (!solver->static_triangle_cell_coords) {
-        if (!alloc_and_copy(&solver->static_triangle_cell_coords, static_cast<const int*>(nullptr), triangle_count * 3, "static triangle cell allocation")) {
-            return false;
-        }
-        solver->static_triangle_cell_capacity = triangle_count;
-    }
+    const int id = static_cast<int>(ids->size());
+    ids->emplace(key, id);
+    return id;
+}
 
-    const int bucket_count = next_power_of_two(std::max(kAbi41MinTriangleHashBuckets, triangle_count * 4));
-    if (bucket_count != solver->static_triangle_hash_bucket_count) {
-        cudaFree(solver->static_triangle_bucket_counts);
-        cudaFree(solver->static_triangle_bucket_indices);
-        solver->static_triangle_bucket_counts = nullptr;
-        solver->static_triangle_bucket_indices = nullptr;
-        solver->static_triangle_hash_bucket_count = 0;
-        if (!alloc_and_copy(&solver->static_triangle_bucket_counts, static_cast<const int*>(nullptr), bucket_count, "static triangle hash count allocation")
-            || !alloc_and_copy(&solver->static_triangle_bucket_indices, static_cast<const int*>(nullptr), bucket_count * kAbi41TriangleHashBucketSlots, "static triangle hash index allocation")) {
-            cudaFree(solver->static_triangle_bucket_counts);
-            cudaFree(solver->static_triangle_bucket_indices);
-            solver->static_triangle_bucket_counts = nullptr;
-            solver->static_triangle_bucket_indices = nullptr;
+std::uint64_t static_edge_key(int a, int b) {
+    const unsigned int lo = static_cast<unsigned int>(std::min(a, b));
+    const unsigned int hi = static_cast<unsigned int>(std::max(a, b));
+    return (static_cast<std::uint64_t>(lo) << 32) | static_cast<std::uint64_t>(hi);
+}
+
+bool static_mesh_is_closed(const float* triangles, int triangle_count) {
+    if (!triangles || triangle_count <= 0) {
+        return false;
+    }
+    const Vec3* tri_vecs = reinterpret_cast<const Vec3*>(triangles);
+    std::unordered_map<QuantizedVecKey, int, QuantizedVecKeyHash> vertex_ids;
+    std::unordered_map<std::uint64_t, int> edge_counts;
+    vertex_ids.reserve(static_cast<size_t>(triangle_count) * 2);
+    edge_counts.reserve(static_cast<size_t>(triangle_count) * 3);
+    for (int t = 0; t < triangle_count; ++t) {
+        const Vec3 a = tri_vecs[t * 3 + 0];
+        const Vec3 b = tri_vecs[t * 3 + 1];
+        const Vec3 c = tri_vecs[t * 3 + 2];
+        if (!std::isfinite(a.x) || !std::isfinite(a.y) || !std::isfinite(a.z)
+            || !std::isfinite(b.x) || !std::isfinite(b.y) || !std::isfinite(b.z)
+            || !std::isfinite(c.x) || !std::isfinite(c.y) || !std::isfinite(c.z)) {
             return false;
         }
-        solver->static_triangle_hash_bucket_count = bucket_count;
+        const int ia = static_vertex_id(&vertex_ids, a);
+        const int ib = static_vertex_id(&vertex_ids, b);
+        const int ic = static_vertex_id(&vertex_ids, c);
+        if (ia == ib || ib == ic || ic == ia) {
+            continue;
+        }
+        edge_counts[static_edge_key(ia, ib)] += 1;
+        edge_counts[static_edge_key(ib, ic)] += 1;
+        edge_counts[static_edge_key(ic, ia)] += 1;
     }
-    solver->static_triangle_hash_ready = 1;
+    if (edge_counts.empty()) {
+        return false;
+    }
+    for (const auto& item : edge_counts) {
+        if (item.second != 2) {
+            return false;
+        }
+    }
     return true;
 }
 
-bool build_static_triangle_hash(Abi41Solver* solver) {
-    if (!solver || solver->static_triangle_hash_ready == 0 || solver->static_triangle_count <= 0) {
+void reset_static_sdf(Abi41Solver* solver, bool release_buffer) {
+    if (!solver) {
+        return;
+    }
+    solver->static_sdf_ready = 0;
+    solver->static_sdf_dim_x = 0;
+    solver->static_sdf_dim_y = 0;
+    solver->static_sdf_dim_z = 0;
+    solver->static_sdf_origin = make_vec3(0.0f, 0.0f, 0.0f);
+    solver->static_sdf_voxel_size = 0.0f;
+    solver->static_sdf_signed = 0;
+    solver->static_sdf_build_ms = 0.0f;
+    if (release_buffer) {
+        cudaFree(solver->static_sdf);
+        solver->static_sdf = nullptr;
+        solver->static_sdf_capacity = 0;
+    }
+}
+
+float static_sdf_default_voxel_size(const Abi41Solver* solver) {
+    const float requested = solver ? solver->cfg.static_sdf_voxel_size : 0.0f;
+    if (std::isfinite(requested) && requested > 0.0f) {
+        return requested;
+    }
+    const float margin = solver ? std::max(solver->cfg.collision_margin, 0.0f) : 0.0f;
+    return std::max(margin * 0.5f, 0.002f);
+}
+
+int static_sdf_band_voxels(const Abi41Solver* solver) {
+    const int requested = solver ? solver->cfg.static_sdf_band_voxels : 0;
+    return std::max(requested > 0 ? requested : 4, 1);
+}
+
+int static_sdf_max_resolution(const Abi41Solver* solver) {
+    const int requested = solver ? solver->cfg.static_sdf_max_resolution : 0;
+    return std::max(requested > 0 ? requested : 160, 16);
+}
+
+void populate_static_sdf_diagnostics(Abi41Solver* solver) {
+    if (!solver) {
+        return;
+    }
+    const long long voxel_count = (
+        solver->static_sdf_ready != 0
+        ? static_cast<long long>(solver->static_sdf_dim_x)
+            * static_cast<long long>(solver->static_sdf_dim_y)
+            * static_cast<long long>(solver->static_sdf_dim_z)
+        : 0ll
+    );
+    solver->diag.static_sdf_rebuild_count = solver->static_sdf_rebuild_count;
+    solver->diag.static_sdf_voxel_count = voxel_count;
+    solver->diag.static_sdf_grid_x = solver->static_sdf_dim_x;
+    solver->diag.static_sdf_grid_y = solver->static_sdf_dim_y;
+    solver->diag.static_sdf_grid_z = solver->static_sdf_dim_z;
+    solver->diag.static_sdf_build_ms = solver->static_sdf_build_ms;
+    solver->diag.static_sdf_unsigned_fallback_count = solver->static_sdf_unsigned_fallback_count;
+}
+
+bool build_static_sdf(Abi41Solver* solver, const float* triangles, int triangle_count) {
+    if (!solver) {
+        return set_error("invalid static SDF build");
+    }
+    reset_static_sdf(solver, false);
+    if (triangle_count <= 0) {
         return true;
     }
-    if (!set_cuda_error(
-        cudaMemset(solver->static_triangle_bucket_counts, 0, sizeof(int) * solver->static_triangle_hash_bucket_count),
-        "reset static triangle hash"
-    )) {
+    if (!triangles) {
+        return set_error("static triangle data is required for SDF build");
+    }
+    const auto started = std::chrono::high_resolution_clock::now();
+    const Vec3* tri_vecs = reinterpret_cast<const Vec3*>(triangles);
+    Vec3 min_v = make_vec3(
+        std::numeric_limits<float>::infinity(),
+        std::numeric_limits<float>::infinity(),
+        std::numeric_limits<float>::infinity()
+    );
+    Vec3 max_v = make_vec3(
+        -std::numeric_limits<float>::infinity(),
+        -std::numeric_limits<float>::infinity(),
+        -std::numeric_limits<float>::infinity()
+    );
+    for (int i = 0; i < triangle_count * 3; ++i) {
+        const Vec3 v = tri_vecs[i];
+        if (!std::isfinite(v.x) || !std::isfinite(v.y) || !std::isfinite(v.z)) {
+            return set_error("static triangle data contains non-finite coordinates");
+        }
+        min_v.x = std::min(min_v.x, v.x);
+        min_v.y = std::min(min_v.y, v.y);
+        min_v.z = std::min(min_v.z, v.z);
+        max_v.x = std::max(max_v.x, v.x);
+        max_v.y = std::max(max_v.y, v.y);
+        max_v.z = std::max(max_v.z, v.z);
+    }
+
+    float voxel_size = static_sdf_default_voxel_size(solver);
+    const int band = static_sdf_band_voxels(solver);
+    const int max_res = static_sdf_max_resolution(solver);
+    const float margin = std::max(solver->cfg.collision_margin, 0.0f);
+    const float expand = margin + static_cast<float>(band) * voxel_size + voxel_size * 2.0f;
+    min_v = sub(min_v, make_vec3(expand, expand, expand));
+    max_v = add(max_v, make_vec3(expand, expand, expand));
+    Vec3 extent = sub(max_v, min_v);
+    extent.x = std::max(extent.x, voxel_size);
+    extent.y = std::max(extent.y, voxel_size);
+    extent.z = std::max(extent.z, voxel_size);
+    const float largest_extent = std::max(extent.x, std::max(extent.y, extent.z));
+    if (largest_extent / voxel_size + 1.0f > static_cast<float>(max_res)) {
+        voxel_size = largest_extent / static_cast<float>(std::max(max_res - 1, 1));
+    }
+    voxel_size = std::max(voxel_size, 1.0e-5f);
+    int dim_x = std::max(static_cast<int>(std::ceil(extent.x / voxel_size)) + 1, 2);
+    int dim_y = std::max(static_cast<int>(std::ceil(extent.y / voxel_size)) + 1, 2);
+    int dim_z = std::max(static_cast<int>(std::ceil(extent.z / voxel_size)) + 1, 2);
+    dim_x = std::min(dim_x, max_res);
+    dim_y = std::min(dim_y, max_res);
+    dim_z = std::min(dim_z, max_res);
+    const long long voxel_count_ll = static_cast<long long>(dim_x) * static_cast<long long>(dim_y) * static_cast<long long>(dim_z);
+    if (voxel_count_ll <= 0 || voxel_count_ll > static_cast<long long>(std::numeric_limits<int>::max())) {
+        return set_error("static SDF grid is too large");
+    }
+    const int voxel_count = static_cast<int>(voxel_count_ll);
+    if (voxel_count > solver->static_sdf_capacity) {
+        cudaFree(solver->static_sdf);
+        solver->static_sdf = nullptr;
+        solver->static_sdf_capacity = 0;
+        if (!alloc_and_copy(&solver->static_sdf, static_cast<const float*>(nullptr), voxel_count, "static SDF allocation")) {
+            return false;
+        }
+        solver->static_sdf_capacity = voxel_count;
+    }
+    solver->static_sdf_dim_x = dim_x;
+    solver->static_sdf_dim_y = dim_y;
+    solver->static_sdf_dim_z = dim_z;
+    solver->static_sdf_origin = min_v;
+    solver->static_sdf_voxel_size = voxel_size;
+    solver->static_sdf_signed = static_mesh_is_closed(triangles, triangle_count) ? 1 : 0;
+    if (solver->static_sdf_signed == 0) {
+        solver->static_sdf_unsigned_fallback_count += 1;
+    }
+    abi41_build_static_sdf_kernel<<<block_count(voxel_count), kThreads>>>(*solver);
+    if (!set_cuda_error(cudaGetLastError(), "build static SDF")) {
+        reset_static_sdf(solver, false);
         return false;
     }
-    abi41_build_static_triangle_hash_kernel<<<block_count(solver->static_triangle_count), kThreads>>>(*solver);
-    return set_cuda_error(cudaGetLastError(), "build static triangle hash");
+    if (!set_cuda_error(cudaDeviceSynchronize(), "sync static SDF build")) {
+        reset_static_sdf(solver, false);
+        return false;
+    }
+    solver->static_sdf_ready = 1;
+    solver->static_sdf_rebuild_count += 1;
+    solver->static_sdf_build_ms = elapsed_ms_since(started);
+    populate_static_sdf_diagnostics(solver);
+    return true;
 }
 
 bool prepare_dynamic_triangle_hash_buffers(Abi41Solver* solver, int triangle_count) {
@@ -2767,10 +3030,12 @@ bool fetch_abi41_counts(Abi41Solver* solver) {
     solver->diag.dynamic_particle_candidate_count = static_cast<long long>(counts[kAbi41CountDynamicParticleCandidates]);
     solver->diag.dynamic_particle_contacts = static_cast<long long>(counts[kAbi41CountDynamicParticleContacts]);
     solver->diag.dynamic_particle_overflow = 0;
+    solver->diag.static_sdf_contact_count = static_cast<long long>(counts[kAbi41CountStaticSdfContacts]);
     solver->diag.candidate_count = static_cast<long long>(
         counts[kAbi41CountDynamicParticleCandidates] + counts[kAbi41CountTrianglePairs]
-        + counts[kAbi41CountSelfCandidates]
+        + counts[kAbi41CountSelfCandidates] + counts[kAbi41CountStaticSdfContacts]
     );
+    populate_static_sdf_diagnostics(solver);
     return true;
 }
 
@@ -2805,9 +3070,7 @@ void free_solver(Abi41Solver* solver) {
     cudaFree(solver->self_averaged_delta);
     cudaFree(solver->self_max_smoothed_delta_device);
     cudaFree(solver->static_triangles);
-    cudaFree(solver->static_triangle_bucket_counts);
-    cudaFree(solver->static_triangle_bucket_indices);
-    cudaFree(solver->static_triangle_cell_coords);
+    cudaFree(solver->static_sdf);
     cudaFree(solver->dynamic_triangles);
     cudaFree(solver->dynamic_triangle_bucket_counts);
     cudaFree(solver->dynamic_triangle_bucket_indices);
@@ -2843,13 +3106,14 @@ bool upload_static_triangles(Abi41Solver* solver, const float* triangles, int tr
     if (triangle_count == 0) {
         solver->static_triangle_count = 0;
         solver->diag.static_triangle_count = 0;
-        solver->static_triangle_hash_ready = 0;
+        solver->cfg.static_triangle_count = 0;
+        reset_static_sdf(solver, false);
+        populate_static_sdf_diagnostics(solver);
         return true;
     }
     if (!triangles) {
         return set_error("static triangle data is required when triangle count is nonzero");
     }
-    solver->static_triangle_hash_cell_size = triangle_hash_cell_size(solver, triangles, triangle_count);
     int vec_count = triangle_count * 3;
     if (triangle_count > solver->static_triangle_capacity) {
         cudaFree(solver->static_triangles);
@@ -2864,7 +3128,11 @@ bool upload_static_triangles(Abi41Solver* solver, const float* triangles, int tr
     }
     solver->static_triangle_count = triangle_count;
     solver->diag.static_triangle_count = triangle_count;
-    return prepare_static_triangle_hash_buffers(solver, triangle_count);
+    solver->cfg.static_triangle_count = triangle_count;
+    if (!build_static_sdf(solver, triangles, triangle_count)) {
+        return false;
+    }
+    return true;
 }
 
 bool upload_dynamic_triangles(Abi41Solver* solver, const float* triangles, int triangle_count) {
@@ -2975,7 +3243,7 @@ bool upload_dynamic_particles(
 extern "C" SSBL_API void* ssbl_create_solver(const SsblXpbdConfig* config, const SsblXpbdMesh* mesh) {
     g_last_error.clear();
     if (!finite_config(config) || !mesh || !mesh->positions || !mesh->inv_mass) {
-        set_error("invalid ABI38 ABI41 solver create request");
+        set_error("invalid ABI39 ABI41 solver create request");
         return nullptr;
     }
     auto* solver = new Abi41Solver();
@@ -3042,7 +3310,6 @@ extern "C" SSBL_API void* ssbl_create_solver(const SsblXpbdConfig* config, const
         && alloc_and_copy(&solver->springs, springs.data(), solver->cfg.edge_count, "spring allocation")
         && alloc_and_copy(&solver->triangles, triangles.data(), solver->cfg.triangle_count, "triangle allocation")
         && build_surface_vertex_triangles(solver, n, triangles)
-        && alloc_and_copy(&solver->static_triangles, reinterpret_cast<const Vec3*>(mesh->static_triangles), solver->cfg.static_triangle_count * 3, "static triangle allocation")
         && alloc_and_copy(&solver->triangle_pairs, static_cast<const TriangleProximityPair*>(nullptr), solver->triangle_pair_capacity, "triangle pair allocation")
         && alloc_and_copy(&solver->triangle_pair_count, static_cast<const int*>(nullptr), 1, "triangle pair count allocation")
         && alloc_and_copy(&solver->abi41_counts, static_cast<const unsigned long long*>(nullptr), kAbi41CountSlots, "recon diagnostic allocation")
@@ -3067,14 +3334,10 @@ extern "C" SSBL_API void* ssbl_create_solver(const SsblXpbdConfig* config, const
         return nullptr;
     }
     solver->diag.finite_flag = 1;
-    solver->static_triangle_count = solver->cfg.static_triangle_count;
-    solver->static_triangle_capacity = solver->cfg.static_triangle_count;
-    if (solver->static_triangle_count > 0 && mesh->static_triangles) {
-        solver->static_triangle_hash_cell_size = triangle_hash_cell_size(solver, mesh->static_triangles, solver->static_triangle_count);
-        if (!prepare_static_triangle_hash_buffers(solver, solver->static_triangle_count)) {
-            free_solver(solver);
-            return nullptr;
-        }
+    const int initial_static_triangle_count = std::max(solver->cfg.static_triangle_count, 0);
+    if (!upload_static_triangles(solver, mesh->static_triangles, initial_static_triangle_count)) {
+        free_solver(solver);
+        return nullptr;
     }
     return solver;
 }
@@ -3207,10 +3470,8 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
     solver->diag.dynamic_particle_count = solver->dynamic_particle_count;
     solver->diag.force_field_count = solver->force_field_count;
     solver->diag.unsupported_force_field_count = solver->unsupported_force_field_count;
+    populate_static_sdf_diagnostics(solver);
     if (!reset_abi41_counts(solver)) {
-        return 0;
-    }
-    if (!build_static_triangle_hash(solver)) {
         return 0;
     }
     if (!build_dynamic_triangle_hash(solver)) {
@@ -3231,7 +3492,7 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
         if (solver->pin_count > 0) {
             abi41_pin_project_kernel<<<p_blocks, kThreads>>>(*solver);
         }
-        if (!set_cuda_error(cudaGetLastError(), "launch ABI38 recon integrate/pin")) {
+        if (!set_cuda_error(cudaGetLastError(), "launch ABI39 recon integrate/pin")) {
             return 0;
         }
         for (int it = 0; it < iterations; ++it) {
@@ -3247,22 +3508,24 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
                 abi41_pin_project_kernel<<<p_blocks, kThreads>>>(*solver);
             }
             abi41_analytic_collision_kernel<<<v_blocks, kThreads>>>(*solver);
-            if (solver->static_triangle_count > 0 && solver->static_triangle_count <= 4096) {
-                if (!set_cuda_error(cudaMemset(solver->triangle_pair_count, 0, sizeof(int)), "reset static triangle pair count")) {
-                    return 0;
-                }
-                abi41_build_static_triangle_pairs_kernel<<<v_blocks, kThreads>>>(*solver);
-                abi41_resolve_triangle_pairs_kernel<<<block_count(solver->triangle_pair_capacity), kThreads>>>(*solver);
+            if (solver->static_sdf_ready != 0) {
+                const auto static_started = std::chrono::high_resolution_clock::now();
+                abi41_static_sdf_collision_kernel<<<v_blocks, kThreads>>>(*solver, sub_dt);
+                solver->diag.static_collision_ms += elapsed_ms_since(static_started);
             }
             if (solver->dynamic_triangle_count > 0) {
+                const auto dynamic_started = std::chrono::high_resolution_clock::now();
                 if (!set_cuda_error(cudaMemset(solver->triangle_pair_count, 0, sizeof(int)), "reset dynamic triangle pair count")) {
                     return 0;
                 }
                 abi41_build_dynamic_triangle_pairs_kernel<<<v_blocks, kThreads>>>(*solver);
                 abi41_resolve_triangle_pairs_kernel<<<block_count(solver->triangle_pair_capacity), kThreads>>>(*solver);
+                solver->diag.dynamic_collision_ms += elapsed_ms_since(dynamic_started);
             }
             if (solver->dynamic_particle_count > 0) {
+                const auto dynamic_particle_started = std::chrono::high_resolution_clock::now();
                 abi41_dynamic_particle_collision_kernel<<<v_blocks, kThreads>>>(*solver);
+                solver->diag.dynamic_particle_collision_ms += elapsed_ms_since(dynamic_particle_started);
             }
             if (solver->cfg.self_collision) {
                 if (solver->self_hash_ready != 0) {
@@ -3309,18 +3572,18 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
                 abi41_apply_self_averaged_delta_kernel<<<v_blocks, kThreads>>>(*solver);
                 solver->diag.self_solve_ms += elapsed_ms_since(self_solve_started);
             }
-            if (!set_cuda_error(cudaGetLastError(), "launch ABI38 recon constraints")) {
+            if (!set_cuda_error(cudaGetLastError(), "launch ABI39 recon constraints")) {
                 return 0;
             }
         }
         abi41_update_velocity_kernel<<<v_blocks, kThreads>>>(*solver, sub_dt);
-        if (!set_cuda_error(cudaGetLastError(), "launch ABI38 recon velocity")) {
+        if (!set_cuda_error(cudaGetLastError(), "launch ABI39 recon velocity")) {
             return 0;
         }
     }
     if (force_sync != 0 || fetch_diagnostics != 0) {
         const auto sync_started = std::chrono::high_resolution_clock::now();
-        if (!set_cuda_error(cudaDeviceSynchronize(), "ABI38 ABI41 solver step")) {
+        if (!set_cuda_error(cudaDeviceSynchronize(), "ABI39 ABI41 solver step")) {
             return 0;
         }
         solver->diag.sync_ms = elapsed_ms_since(sync_started);
@@ -3332,7 +3595,8 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
     solver->diag.constraints_ms = solver->diag.step_ms;
     solver->diag.resolved_contacts = solver->diag.abi41_soft_contact_count
         + solver->diag.abi41_exact_impulse_contact_count
-        + solver->diag.abi41_edge_edge_contact_count;
+        + solver->diag.abi41_edge_edge_contact_count
+        + solver->diag.static_sdf_contact_count;
     return 1;
 }
 
@@ -3348,7 +3612,7 @@ extern "C" SSBL_API int ssbl_download_positions(void* handle, float* out_positio
     }
     return set_cuda_error(
         cudaMemcpy(out_positions, solver->pos, sizeof(Vec3) * solver->cfg.vertex_count, cudaMemcpyDeviceToHost),
-        "download ABI38 recon positions"
+        "download ABI39 recon positions"
     ) ? 1 : 0;
 }
 

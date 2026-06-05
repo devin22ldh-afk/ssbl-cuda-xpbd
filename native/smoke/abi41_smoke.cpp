@@ -3,6 +3,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <initializer_list>
 #include <vector>
 
 namespace {
@@ -27,6 +28,200 @@ float distance3(const std::vector<float>& values, int a, int b) {
 
 float edge_average_z(const std::vector<float>& values, int a, int b) {
     return (values[a * 3 + 2] + values[b * 3 + 2]) * 0.5f;
+}
+
+void append_triangle(
+    std::vector<float>* triangles,
+    std::initializer_list<float> a,
+    std::initializer_list<float> b,
+    std::initializer_list<float> c
+) {
+    triangles->insert(triangles->end(), a.begin(), a.end());
+    triangles->insert(triangles->end(), b.begin(), b.end());
+    triangles->insert(triangles->end(), c.begin(), c.end());
+}
+
+std::vector<float> make_plane_static_triangles(float z, float extent) {
+    std::vector<float> triangles;
+    triangles.reserve(18);
+    append_triangle(&triangles, {-extent, -extent, z}, {extent, -extent, z}, {-extent, extent, z});
+    append_triangle(&triangles, {extent, -extent, z}, {extent, extent, z}, {-extent, extent, z});
+    return triangles;
+}
+
+std::vector<float> make_box_static_triangles(float half_extent) {
+    const float h = half_extent;
+    std::vector<float> triangles;
+    triangles.reserve(12 * 9);
+    append_triangle(&triangles, {-h, -h, -h}, {-h, h, -h}, {h, h, -h});
+    append_triangle(&triangles, {-h, -h, -h}, {h, h, -h}, {h, -h, -h});
+    append_triangle(&triangles, {-h, -h, h}, {h, -h, h}, {h, h, h});
+    append_triangle(&triangles, {-h, -h, h}, {h, h, h}, {-h, h, h});
+    append_triangle(&triangles, {-h, -h, -h}, {h, -h, -h}, {h, -h, h});
+    append_triangle(&triangles, {-h, -h, -h}, {h, -h, h}, {-h, -h, h});
+    append_triangle(&triangles, {-h, h, -h}, {-h, h, h}, {h, h, h});
+    append_triangle(&triangles, {-h, h, -h}, {h, h, h}, {h, h, -h});
+    append_triangle(&triangles, {-h, -h, -h}, {-h, -h, h}, {-h, h, h});
+    append_triangle(&triangles, {-h, -h, -h}, {-h, h, h}, {-h, h, -h});
+    append_triangle(&triangles, {h, -h, -h}, {h, h, -h}, {h, h, h});
+    append_triangle(&triangles, {h, -h, -h}, {h, h, h}, {h, -h, h});
+    return triangles;
+}
+
+int run_static_sdf_smoke() {
+    std::vector<float> positions = {
+        0.0f, 0.0f, 0.02f,
+        0.25f, 0.0f, 0.02f,
+    };
+    std::vector<float> inv_mass = {1.0f, 0.0f};
+    std::vector<float> plane_triangles = make_plane_static_triangles(0.0f, 1.0f);
+
+    SsblXpbdConfig cfg{};
+    cfg.vertex_count = 2;
+    cfg.static_triangle_count = static_cast<int>(plane_triangles.size() / 9);
+    cfg.dt = 1.0f / 60.0f;
+    cfg.damping = 1.0f;
+    cfg.collision_margin = 0.08f;
+    cfg.cloth_thickness = 0.02f;
+    cfg.static_sdf_voxel_size = 0.04f;
+    cfg.static_sdf_band_voxels = 2;
+    cfg.static_sdf_max_resolution = 48;
+
+    SsblXpbdMesh mesh{};
+    mesh.positions = positions.data();
+    mesh.inv_mass = inv_mass.data();
+    mesh.static_triangles = plane_triangles.data();
+
+    void* solver = ssbl_create_solver(&cfg, &mesh);
+    if (!solver) {
+        std::fprintf(stderr, "SSBL_ABI41_STATIC_SDF_ERROR create: %s\n", ssbl_last_error());
+        return 80;
+    }
+
+    if (!ssbl_step_solver_ex(solver, 1, 1, 1, 1)) {
+        std::fprintf(stderr, "SSBL_ABI41_STATIC_SDF_ERROR plane step: %s\n", ssbl_last_error());
+        ssbl_destroy_solver(solver);
+        return 81;
+    }
+    std::vector<float> out(positions.size(), 0.0f);
+    if (!ssbl_download_positions(solver, out.data(), static_cast<int>(out.size()))) {
+        std::fprintf(stderr, "SSBL_ABI41_STATIC_SDF_ERROR plane download: %s\n", ssbl_last_error());
+        ssbl_destroy_solver(solver);
+        return 82;
+    }
+    SsblXpbdDiagnostics plane_diag{};
+    if (!ssbl_get_diagnostics(solver, &plane_diag)) {
+        std::fprintf(stderr, "SSBL_ABI41_STATIC_SDF_ERROR plane diagnostics: %s\n", ssbl_last_error());
+        ssbl_destroy_solver(solver);
+        return 83;
+    }
+    if (!finite_positions(out) || !plane_diag.finite_flag) {
+        std::fprintf(stderr, "SSBL_ABI41_STATIC_SDF_ERROR non-finite plane output\n");
+        ssbl_destroy_solver(solver);
+        return 84;
+    }
+    if (!(out[2] > positions[2] + 0.01f)) {
+        std::fprintf(stderr, "SSBL_ABI41_STATIC_SDF_ERROR plane vertex was not pushed out z=%.6f\n", out[2]);
+        ssbl_destroy_solver(solver);
+        return 85;
+    }
+    if (std::fabs(out[5] - positions[5]) > 1.0e-5f) {
+        std::fprintf(stderr, "SSBL_ABI41_STATIC_SDF_ERROR pinned vertex moved z=%.6f\n", out[5]);
+        ssbl_destroy_solver(solver);
+        return 86;
+    }
+    if (plane_diag.static_sdf_rebuild_count <= 0
+        || plane_diag.static_sdf_voxel_count <= 0
+        || plane_diag.static_sdf_grid_x <= 1
+        || plane_diag.static_sdf_grid_y <= 1
+        || plane_diag.static_sdf_grid_z <= 1
+        || plane_diag.static_sdf_contact_count <= 0
+        || plane_diag.static_sdf_unsigned_fallback_count <= 0) {
+        std::fprintf(stderr, "SSBL_ABI41_STATIC_SDF_ERROR plane diagnostics missing\n");
+        ssbl_destroy_solver(solver);
+        return 87;
+    }
+
+    std::vector<float> box_positions = {
+        0.11f, 0.07f, 0.03f,
+        0.20f, 0.0f, 0.0f,
+    };
+    std::vector<float> box_triangles = make_box_static_triangles(0.5f);
+    if (!ssbl_update_positions(solver, box_positions.data(), static_cast<int>(box_positions.size()))) {
+        std::fprintf(stderr, "SSBL_ABI41_STATIC_SDF_ERROR box position upload: %s\n", ssbl_last_error());
+        ssbl_destroy_solver(solver);
+        return 88;
+    }
+    if (!ssbl_update_static_triangles(solver, box_triangles.data(), static_cast<int>(box_triangles.size() / 9))) {
+        std::fprintf(stderr, "SSBL_ABI41_STATIC_SDF_ERROR box upload: %s\n", ssbl_last_error());
+        ssbl_destroy_solver(solver);
+        return 89;
+    }
+    if (!ssbl_step_solver_ex(solver, 1, 2, 1, 1)) {
+        std::fprintf(stderr, "SSBL_ABI41_STATIC_SDF_ERROR box step: %s\n", ssbl_last_error());
+        ssbl_destroy_solver(solver);
+        return 90;
+    }
+    std::vector<float> box_out(box_positions.size(), 0.0f);
+    if (!ssbl_download_positions(solver, box_out.data(), static_cast<int>(box_out.size()))) {
+        std::fprintf(stderr, "SSBL_ABI41_STATIC_SDF_ERROR box download: %s\n", ssbl_last_error());
+        ssbl_destroy_solver(solver);
+        return 91;
+    }
+    SsblXpbdDiagnostics box_diag{};
+    if (!ssbl_get_diagnostics(solver, &box_diag)) {
+        std::fprintf(stderr, "SSBL_ABI41_STATIC_SDF_ERROR box diagnostics: %s\n", ssbl_last_error());
+        ssbl_destroy_solver(solver);
+        return 92;
+    }
+    const float box_displacement = std::sqrt(
+        (box_out[0] - box_positions[0]) * (box_out[0] - box_positions[0])
+        + (box_out[1] - box_positions[1]) * (box_out[1] - box_positions[1])
+        + (box_out[2] - box_positions[2]) * (box_out[2] - box_positions[2])
+    );
+    if (!finite_positions(box_out) || !box_diag.finite_flag || !(box_displacement > 0.05f)) {
+        std::fprintf(stderr, "SSBL_ABI41_STATIC_SDF_ERROR box interior was not pushed out delta=%.6f\n", box_displacement);
+        ssbl_destroy_solver(solver);
+        return 93;
+    }
+    if (box_diag.static_sdf_rebuild_count <= plane_diag.static_sdf_rebuild_count
+        || box_diag.static_triangle_count != static_cast<long long>(box_triangles.size() / 9)
+        || box_diag.static_sdf_contact_count <= 0) {
+        std::fprintf(stderr, "SSBL_ABI41_STATIC_SDF_ERROR box rebuild diagnostics missing\n");
+        ssbl_destroy_solver(solver);
+        return 94;
+    }
+
+    std::vector<float> small_plane = make_plane_static_triangles(0.2f, 0.6f);
+    if (!ssbl_update_static_triangles(solver, small_plane.data(), static_cast<int>(small_plane.size() / 9))) {
+        std::fprintf(stderr, "SSBL_ABI41_STATIC_SDF_ERROR update upload: %s\n", ssbl_last_error());
+        ssbl_destroy_solver(solver);
+        return 95;
+    }
+    SsblXpbdDiagnostics update_diag{};
+    if (!ssbl_get_diagnostics(solver, &update_diag)) {
+        std::fprintf(stderr, "SSBL_ABI41_STATIC_SDF_ERROR update diagnostics: %s\n", ssbl_last_error());
+        ssbl_destroy_solver(solver);
+        return 96;
+    }
+    ssbl_destroy_solver(solver);
+    if (update_diag.static_sdf_rebuild_count <= box_diag.static_sdf_rebuild_count
+        || update_diag.static_triangle_count != static_cast<long long>(small_plane.size() / 9)) {
+        std::fprintf(stderr, "SSBL_ABI41_STATIC_SDF_ERROR triangle-count update did not rebuild\n");
+        return 97;
+    }
+
+    std::printf(
+        "SSBL_ABI41_STATIC_SDF_OK plane_z=%.5f box_dist=%.5f rebuilds=%lld grid=%lldx%lldx%lld unsigned=%lld\n",
+        out[2],
+        box_displacement,
+        update_diag.static_sdf_rebuild_count,
+        update_diag.static_sdf_grid_x,
+        update_diag.static_sdf_grid_y,
+        update_diag.static_sdf_grid_z,
+        update_diag.static_sdf_unsigned_fallback_count
+    );
+    return 0;
 }
 
 int run_self_collision_smoke() {
@@ -647,6 +842,10 @@ int main() {
     int pressure_result = run_overpressure_smoke();
     if (pressure_result != 0) {
         return pressure_result;
+    }
+    int static_sdf_result = run_static_sdf_smoke();
+    if (static_sdf_result != 0) {
+        return static_sdf_result;
     }
 
     std::vector<float> positions = {

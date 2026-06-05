@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+import hashlib
 import os
 import re
 import struct
@@ -288,6 +289,14 @@ def record_viewport_tag_ms(object_name: str, elapsed_ms: float) -> None:
         abi41_edge_edge_contact_count=diag.abi41_edge_edge_contact_count,
         abi41_max_smoothed_delta=diag.abi41_max_smoothed_delta,
         abi41_hard_projection_fallbacks=diag.abi41_hard_projection_fallbacks,
+        static_sdf_rebuild_count=diag.static_sdf_rebuild_count,
+        static_sdf_voxel_count=diag.static_sdf_voxel_count,
+        static_sdf_grid_x=diag.static_sdf_grid_x,
+        static_sdf_grid_y=diag.static_sdf_grid_y,
+        static_sdf_grid_z=diag.static_sdf_grid_z,
+        static_sdf_build_ms=diag.static_sdf_build_ms,
+        static_sdf_contact_count=diag.static_sdf_contact_count,
+        static_sdf_unsigned_fallback_count=diag.static_sdf_unsigned_fallback_count,
         frame_ms=diag.frame_ms,
         frame_set_ms=diag.frame_set_ms,
         input_refresh_ms=diag.input_refresh_ms,
@@ -1011,6 +1020,16 @@ def _matrix_signature(matrix) -> tuple[float, ...]:
     return tuple(round(float(value), 6) for row in matrix for value in row)
 
 
+def _mesh_coordinate_digest(mesh: bpy.types.Mesh) -> str:
+    coords = np.empty(len(mesh.vertices) * 3, dtype=np.float32)
+    if len(coords) > 0:
+        mesh.vertices.foreach_get("co", coords)
+    digest = hashlib.blake2b(digest_size=16)
+    digest.update(np.asarray(coords.shape, dtype=np.int64).tobytes())
+    digest.update(coords.tobytes())
+    return digest.hexdigest()
+
+
 def _vector_signature(values) -> tuple[float, ...]:
     return tuple(round(float(value), 6) for value in values)
 
@@ -1085,6 +1104,9 @@ def _solver_options_signature(options, settings=None) -> tuple:
         round(float(getattr(options, "contact_tangent_damping", 0.2)), 6),
         round(float(getattr(options, "contact_compliance", 0.0)), 12),
         int(getattr(options, "fast_self_collision_passes", 4)),
+        round(float(getattr(options, "static_sdf_voxel_size", 0.0)), 6),
+        int(getattr(options, "static_sdf_band_voxels", 4)),
+        int(getattr(options, "static_sdf_max_resolution", 160)),
         round(float(getattr(settings, "density", 1.0)), 6) if settings is not None else 1.0,
         str(getattr(settings, "pin_vertex_group", "")) if settings is not None else "",
     )
@@ -1103,16 +1125,32 @@ def _static_collider_runtime_signature(
     for obj in sorted(collection.objects, key=lambda item: item.name):
         if obj is None or obj == exclude_obj or obj.type != "MESH":
             continue
-        source = obj.evaluated_get(depsgraph) if use_evaluated_mesh else obj
-        mesh = source.data
-        entries.append(
-            (
-                obj.name,
-                len(mesh.vertices),
-                len(mesh.polygons),
-                _matrix_signature(source.matrix_world),
+        if use_evaluated_mesh:
+            source = obj.evaluated_get(depsgraph)
+            mesh = source.to_mesh()
+            try:
+                entries.append(
+                    (
+                        obj.name,
+                        len(mesh.vertices),
+                        len(mesh.polygons),
+                        _matrix_signature(source.matrix_world),
+                        _mesh_coordinate_digest(mesh),
+                    )
+                )
+            finally:
+                source.to_mesh_clear()
+        else:
+            mesh = obj.data
+            entries.append(
+                (
+                    obj.name,
+                    len(mesh.vertices),
+                    len(mesh.polygons),
+                    _matrix_signature(obj.matrix_world),
+                    _mesh_coordinate_digest(mesh),
+                )
             )
-        )
     return tuple(entries)
 
 
@@ -1400,8 +1438,6 @@ def _rebuild_slot_native(
         )
         if len(cloth.positions_world) != len(slot.cloth.positions_world) or len(cloth.positions_world) != len(current_positions):
             raise ValueError("Cloth topology changed during preview tuning; restart the preview after topology changes.")
-        if static_signature != slot.static_collider_signature:
-            raise ValueError("Animated static collider topology changed during preview; fixed topology is required.")
         new_native.update_positions(current_positions)
         old_native = slot.native
         slot.native = new_native
@@ -1413,6 +1449,18 @@ def _rebuild_slot_native(
 
         slot.cloth = cloth
         slot.static_triangles = np.array(static_tris, dtype=np.float32, copy=True)
+        slot.static_collider_signature = static_signature
+        static_collection = getattr(settings, "static_collider_collection", None)
+        slot.static_runtime_signature = (
+            _static_collider_runtime_signature(
+                static_collection,
+                obj,
+                depsgraph,
+                slot.use_evaluated_mesh,
+            )
+            if static_collection is not None
+            else ()
+        )
         slot.previous_positions_world = np.array(current_positions, dtype=np.float32, copy=True)
         slot.current_positions_world = current_positions
         slot.runtime_options_signature = _runtime_options_signature(options)
@@ -1762,8 +1810,6 @@ def _refresh_bake_runtime_inputs(
         depsgraph=depsgraph,
         use_evaluated_mesh=use_evaluated_mesh,
     )
-    if static_signature != expected_static_signature:
-        raise ValueError("Animated static collider topology changed during bake; fixed topology is required.")
     cloth.matrix_world_inv = np.array(matrix_world.inverted(), dtype=np.float32)
     pin_attachment_batch = make_pin_attachment_batch(
         cloth.pin_indices,
@@ -1799,8 +1845,6 @@ def _apply_runtime_inputs(
     force_fields_enabled: bool,
     perf: FramePerf | None = None,
 ) -> None:
-    if static_signature != slot.static_collider_signature:
-        raise ValueError("Animated static collider topology changed during preview; fixed topology is required.")
     slot.cloth.matrix_world_inv = np.array(matrix_world.inverted(), dtype=np.float32)
     pin_targets = np.ascontiguousarray(pin_targets, dtype=np.float32)
     update_pin = not _array_equal(pin_targets, slot.pin_targets_world)
@@ -1841,6 +1885,7 @@ def _apply_runtime_inputs(
         slot.runtime_options_signature = runtime_signature
     if update_static:
         slot.static_triangles = np.array(static_tris, dtype=np.float32, copy=True)
+        slot.static_collider_signature = static_signature
         slot.static_runtime_signature = static_runtime_signature
 
 
@@ -2191,6 +2236,14 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
     abi41_edge_edge_contact_count = 0
     abi41_max_smoothed_delta = 0.0
     abi41_hard_projection_fallbacks = 0
+    static_sdf_rebuild_count = 0
+    static_sdf_voxel_count = 0
+    static_sdf_grid_x = 0
+    static_sdf_grid_y = 0
+    static_sdf_grid_z = 0
+    static_sdf_build_ms = 0.0
+    static_sdf_contact_count = 0
+    static_sdf_unsigned_fallback_count = 0
     finite = True
     writeback_performed = False
     diag_started = time.perf_counter()
@@ -2287,6 +2340,14 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
         abi41_edge_edge_contact_count += int(diag.abi41_edge_edge_contact_count)
         abi41_max_smoothed_delta = max(abi41_max_smoothed_delta, float(diag.abi41_max_smoothed_delta))
         abi41_hard_projection_fallbacks += int(diag.abi41_hard_projection_fallbacks)
+        static_sdf_rebuild_count += int(diag.static_sdf_rebuild_count)
+        static_sdf_voxel_count = max(static_sdf_voxel_count, int(diag.static_sdf_voxel_count))
+        static_sdf_grid_x = max(static_sdf_grid_x, int(diag.static_sdf_grid_x))
+        static_sdf_grid_y = max(static_sdf_grid_y, int(diag.static_sdf_grid_y))
+        static_sdf_grid_z = max(static_sdf_grid_z, int(diag.static_sdf_grid_z))
+        static_sdf_build_ms += float(diag.static_sdf_build_ms)
+        static_sdf_contact_count += int(diag.static_sdf_contact_count)
+        static_sdf_unsigned_fallback_count += int(diag.static_sdf_unsigned_fallback_count)
         finite = finite and bool(diag.finite)
         writeback_performed = writeback_performed or bool(diag.writeback_performed)
         if diag.min_gap is not None:
@@ -2386,6 +2447,14 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
         abi41_edge_edge_contact_count=abi41_edge_edge_contact_count,
         abi41_max_smoothed_delta=abi41_max_smoothed_delta,
         abi41_hard_projection_fallbacks=abi41_hard_projection_fallbacks,
+        static_sdf_rebuild_count=static_sdf_rebuild_count,
+        static_sdf_voxel_count=static_sdf_voxel_count,
+        static_sdf_grid_x=static_sdf_grid_x,
+        static_sdf_grid_y=static_sdf_grid_y,
+        static_sdf_grid_z=static_sdf_grid_z,
+        static_sdf_build_ms=static_sdf_build_ms,
+        static_sdf_contact_count=static_sdf_contact_count,
+        static_sdf_unsigned_fallback_count=static_sdf_unsigned_fallback_count,
         finite=finite,
         frame_ms=perf.frame_ms if perf is not None else 0.0,
         frame_set_ms=perf.frame_set_ms if perf is not None else 0.0,

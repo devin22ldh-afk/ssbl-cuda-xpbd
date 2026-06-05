@@ -97,6 +97,11 @@ class SSBL_PT_collision(bpy.types.Panel):
         if settings.use_ground:
             layout.prop(settings, "ground_height")
         layout.prop(settings, "static_collider_collection")
+        sdf_box = layout.box()
+        sdf_col = sdf_box.column(align=True)
+        sdf_col.prop(settings, "static_sdf_voxel_size")
+        sdf_col.prop(settings, "static_sdf_band_voxels")
+        sdf_col.prop(settings, "static_sdf_max_resolution")
 
 
 class SSBL_PT_cache(bpy.types.Panel):

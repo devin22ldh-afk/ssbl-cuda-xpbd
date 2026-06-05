@@ -70,6 +70,9 @@ class _NativeConfig(ctypes.Structure):
         ("fast_self_collision_passes", ctypes.c_int),
         ("stretch_optimization_enabled", ctypes.c_int),
         ("stretch_optimization_strength", ctypes.c_float),
+        ("static_sdf_voxel_size", ctypes.c_float),
+        ("static_sdf_band_voxels", ctypes.c_int),
+        ("static_sdf_max_resolution", ctypes.c_int),
     ]
 
 
@@ -256,6 +259,14 @@ class _NativeDiagnostics(ctypes.Structure):
         ("abi41_edge_edge_contact_count", ctypes.c_longlong),
         ("abi41_max_smoothed_delta", ctypes.c_float),
         ("abi41_hard_projection_fallbacks", ctypes.c_longlong),
+        ("static_sdf_rebuild_count", ctypes.c_longlong),
+        ("static_sdf_voxel_count", ctypes.c_longlong),
+        ("static_sdf_grid_x", ctypes.c_longlong),
+        ("static_sdf_grid_y", ctypes.c_longlong),
+        ("static_sdf_grid_z", ctypes.c_longlong),
+        ("static_sdf_build_ms", ctypes.c_float),
+        ("static_sdf_contact_count", ctypes.c_longlong),
+        ("static_sdf_unsigned_fallback_count", ctypes.c_longlong),
     ]
 
 
@@ -360,6 +371,14 @@ class NativeStepDiagnostics:
     abi41_edge_edge_contact_count: int = 0
     abi41_max_smoothed_delta: float = 0.0
     abi41_hard_projection_fallbacks: int = 0
+    static_sdf_rebuild_count: int = 0
+    static_sdf_voxel_count: int = 0
+    static_sdf_grid_x: int = 0
+    static_sdf_grid_y: int = 0
+    static_sdf_grid_z: int = 0
+    static_sdf_build_ms: float = 0.0
+    static_sdf_contact_count: int = 0
+    static_sdf_unsigned_fallback_count: int = 0
     frame_ms: float = 0.0
     frame_set_ms: float = 0.0
     input_refresh_ms: float = 0.0
@@ -387,7 +406,7 @@ class NativeStepDiagnostics:
 
 _LIB = None
 _LOAD_ERROR = ""
-_ABI41_DLL_NAME = "ssbl_xpbd_cuda_abi38.dll"
+_ABI41_DLL_NAME = "ssbl_xpbd_cuda_abi39.dll"
 _CAP_STRETCH_OPTIMIZATION = 1 << 0
 
 
@@ -419,7 +438,7 @@ def _load_library():
     path = dll_path()
     if not os.path.exists(path):
         raise NativeBackendUnavailable(
-            "Missing ABI38 CUDA solver DLL. Install CUDA Toolkit, CMake, and VS Build Tools, then run native/build_recon.ps1."
+            "Missing ABI39 CUDA solver DLL. Install CUDA Toolkit, CMake, and VS Build Tools, then run native/build_recon.ps1."
         )
 
     try:
@@ -568,6 +587,9 @@ def _config_from_options(
     cfg.fast_self_collision_passes = int(getattr(options, "fast_self_collision_passes", 4))
     cfg.stretch_optimization_enabled = int(getattr(options, "stretch_optimization_enabled", False))
     cfg.stretch_optimization_strength = float(getattr(options, "stretch_optimization_strength", 0.35))
+    cfg.static_sdf_voxel_size = float(getattr(options, "static_sdf_voxel_size", 0.0))
+    cfg.static_sdf_band_voxels = int(getattr(options, "static_sdf_band_voxels", 4))
+    cfg.static_sdf_max_resolution = int(getattr(options, "static_sdf_max_resolution", 160))
     return cfg
 
 
@@ -631,7 +653,7 @@ class NativeXpbdSolver:
             if (_capabilities(self._lib) & _CAP_STRETCH_OPTIMIZATION) == 0:
                 raise NativeSolverError(
                     "Loaded CUDA solver DLL does not support hard stretch optimization. "
-                    "Rebuild native/build_recon.ps1 to generate the ABI38 DLL."
+                    "Rebuild native/build_recon.ps1 to generate the ABI39 DLL."
                 )
         self._vertex_count = int(len(cloth.positions_world))
         self._positions_out = np.empty((self._vertex_count, 3), dtype=np.float32)
@@ -704,16 +726,13 @@ class NativeXpbdSolver:
         if triangle_count <= 0 and self._static_triangle_count <= 0:
             return
         static_triangles = np.ascontiguousarray(static_triangles.reshape((-1, 3)), dtype=np.float32)
-        if triangle_count != self._static_triangle_count:
-            raise NativeSolverError(
-                f"Static collider triangle count changed from {self._static_triangle_count} to {triangle_count}."
-            )
         if not self._lib.ssbl_update_static_triangles(
             self._handle,
             _as_float_ptr(static_triangles),
             triangle_count,
         ):
             raise NativeSolverError(_last_error(self._lib))
+        self._static_triangle_count = triangle_count
 
     def update_dynamic_triangles(self, dynamic_triangles: np.ndarray) -> None:
         triangle_count = int(len(dynamic_triangles))
@@ -842,6 +861,8 @@ class NativeXpbdSolver:
             raise NativeSolverError(_last_error(self._lib))
         if update_runtime:
             self._runtime_colliders = runtime_inputs
+        if update_static:
+            self._static_triangle_count = static_triangle_count
         if update_dynamic:
             self._dynamic_triangle_count = dynamic_triangle_count
 
@@ -975,6 +996,14 @@ class NativeXpbdSolver:
             abi41_edge_edge_contact_count=int(raw.abi41_edge_edge_contact_count),
             abi41_max_smoothed_delta=float(raw.abi41_max_smoothed_delta),
             abi41_hard_projection_fallbacks=int(raw.abi41_hard_projection_fallbacks),
+            static_sdf_rebuild_count=int(raw.static_sdf_rebuild_count),
+            static_sdf_voxel_count=int(raw.static_sdf_voxel_count),
+            static_sdf_grid_x=int(raw.static_sdf_grid_x),
+            static_sdf_grid_y=int(raw.static_sdf_grid_y),
+            static_sdf_grid_z=int(raw.static_sdf_grid_z),
+            static_sdf_build_ms=float(raw.static_sdf_build_ms),
+            static_sdf_contact_count=int(raw.static_sdf_contact_count),
+            static_sdf_unsigned_fallback_count=int(raw.static_sdf_unsigned_fallback_count),
         )
         self._last_diagnostics = diag
         return diag

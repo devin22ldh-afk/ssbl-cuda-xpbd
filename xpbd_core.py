@@ -81,6 +81,9 @@ class SolverOptions:
     contact_friction: float
     contact_tangent_damping: float
     contact_compliance: float
+    static_sdf_voxel_size: float
+    static_sdf_band_voxels: int
+    static_sdf_max_resolution: int
 
 
 @dataclass
@@ -930,4 +933,7 @@ def settings_to_options(settings, runtime_mode_override: str | None = None) -> S
         contact_friction=max(float(getattr(settings, "contact_friction", 0.35)), 0.0),
         contact_tangent_damping=max(float(getattr(settings, "contact_tangent_damping", 0.2)), 0.0),
         contact_compliance=max(float(getattr(settings, "contact_compliance", 0.0)), 0.0),
+        static_sdf_voxel_size=max(float(getattr(settings, "static_sdf_voxel_size", 0.0)), 0.0),
+        static_sdf_band_voxels=max(int(getattr(settings, "static_sdf_band_voxels", 4)), 1),
+        static_sdf_max_resolution=max(int(getattr(settings, "static_sdf_max_resolution", 160)), 16),
     )

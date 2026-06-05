@@ -62,6 +62,9 @@ typedef struct SsblXpbdConfig {
     int fast_self_collision_passes;
     int stretch_optimization_enabled;
     float stretch_optimization_strength;
+    float static_sdf_voxel_size;
+    int static_sdf_band_voxels;
+    int static_sdf_max_resolution;
 } SsblXpbdConfig;
 
 enum {
@@ -161,6 +164,14 @@ typedef struct SsblXpbdDiagnostics {
     long long abi41_edge_edge_contact_count;
     float abi41_max_smoothed_delta;
     long long abi41_hard_projection_fallbacks;
+    long long static_sdf_rebuild_count;
+    long long static_sdf_voxel_count;
+    long long static_sdf_grid_x;
+    long long static_sdf_grid_y;
+    long long static_sdf_grid_z;
+    float static_sdf_build_ms;
+    long long static_sdf_contact_count;
+    long long static_sdf_unsigned_fallback_count;
 } SsblXpbdDiagnostics;
 
 typedef struct SsblXpbdMesh {

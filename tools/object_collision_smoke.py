@@ -69,6 +69,20 @@ def _make_static_plane_collection(plane_z):
     return collection
 
 
+def _make_static_grid_collection(name, plane_z, size=1.2, segments=50):
+    collection = bpy.data.collections.new(name)
+    bpy.context.scene.collection.children.link(collection)
+    collider = _make_grid(
+        f"{name}_Plane",
+        size=size,
+        segments=segments,
+        location=(0.0, 0.0, plane_z),
+    )
+    bpy.context.scene.collection.objects.unlink(collider)
+    collection.objects.link(collider)
+    return collection, segments * segments * 2
+
+
 def _make_static_object_collection(name, obj):
     collection = bpy.data.collections.new(name)
     bpy.context.scene.collection.children.link(collection)
@@ -142,9 +156,44 @@ def _configure_common(settings):
     settings.use_sphere = False
     settings.sphere_object = None
     settings.static_collider_collection = None
+    settings.static_sdf_voxel_size = 0.04
+    settings.static_sdf_band_voxels = 3
+    settings.static_sdf_max_resolution = 80
 
 
-def _run_case(label, build_scene, metric):
+def _static_sdf_summary(obj):
+    diag = ssbl.solver.session_diagnostics(obj)
+    return {
+        "static_triangle_count": int(diag.static_triangle_count),
+        "static_sdf_rebuild_count": int(diag.static_sdf_rebuild_count),
+        "static_sdf_voxel_count": int(diag.static_sdf_voxel_count),
+        "static_sdf_grid": [
+            int(diag.static_sdf_grid_x),
+            int(diag.static_sdf_grid_y),
+            int(diag.static_sdf_grid_z),
+        ],
+        "static_sdf_build_ms": float(diag.static_sdf_build_ms),
+        "static_sdf_contact_count": int(diag.static_sdf_contact_count),
+        "static_sdf_unsigned_fallback_count": int(diag.static_sdf_unsigned_fallback_count),
+        "resolved_contacts": int(diag.resolved_contacts),
+        "finite": bool(diag.finite),
+    }
+
+
+def _assert_static_sdf_diagnostics(label, diag, min_triangles=1):
+    if not diag["finite"]:
+        raise RuntimeError(f"{label} native diagnostics reported non-finite output")
+    if diag["static_triangle_count"] < min_triangles:
+        raise RuntimeError(f"{label} static triangle count {diag['static_triangle_count']} below expected {min_triangles}")
+    if diag["static_sdf_rebuild_count"] <= 0 or diag["static_sdf_voxel_count"] <= 0:
+        raise RuntimeError(f"{label} did not report a built static SDF: {diag}")
+    if any(value <= 1 for value in diag["static_sdf_grid"]):
+        raise RuntimeError(f"{label} reported invalid static SDF grid: {diag}")
+    if diag["static_sdf_contact_count"] <= 0:
+        raise RuntimeError(f"{label} did not report SDF contacts: {diag}")
+
+
+def _run_case(label, build_scene, metric, expect_static_sdf=False, min_static_triangles=1):
     _clear_scene()
     scene = bpy.context.scene
     scene.frame_set(1)
@@ -164,6 +213,7 @@ def _run_case(label, build_scene, metric):
 
     session = ssbl.solver.start_preview(bpy.context, cloth)
     final_metric = None
+    max_sdf_diag = None
     try:
         for _index in range(4):
             ssbl.solver.step_preview(bpy.context, cloth.name)
@@ -171,6 +221,10 @@ def _run_case(label, build_scene, metric):
             if not _all_finite(positions):
                 raise RuntimeError(f"{label} produced non-finite vertex coordinates")
             final_metric = metric(cloth, enforce=True)
+            if expect_static_sdf:
+                sdf_diag = _static_sdf_summary(cloth)
+                if max_sdf_diag is None or sdf_diag["static_sdf_contact_count"] > max_sdf_diag["static_sdf_contact_count"]:
+                    max_sdf_diag = sdf_diag
     finally:
         ssbl.solver.request_stop(cloth)
 
@@ -183,13 +237,20 @@ def _run_case(label, build_scene, metric):
         raise RuntimeError(f"{label} polluted the source mesh: max delta {original_delta}")
     if final_metric is None:
         raise RuntimeError(f"{label} did not step")
+    if expect_static_sdf:
+        if max_sdf_diag is None:
+            raise RuntimeError(f"{label} did not capture static SDF diagnostics")
+        _assert_static_sdf_diagnostics(label, max_sdf_diag, min_static_triangles)
 
-    return {
+    result = {
         "session_object": session.object_name,
         "initial": initial_metric,
         "final": final_metric,
         "original_mesh_max_abs_delta": original_delta,
     }
+    if max_sdf_diag is not None:
+        result["static_sdf"] = max_sdf_diag
+    return result
 
 
 def _ground_case(settings):
@@ -247,6 +308,18 @@ def _static_mesh_case(settings):
     return _make_grid("SSBL_Object_Collision_StaticMeshCloth", location=(0.0, 0.0, plane_z + MARGIN * 0.5))
 
 
+def _large_static_mesh_case(settings):
+    plane_z = 0.0
+    collection, triangle_count = _make_static_grid_collection(
+        "SSBL_Object_Collision_LargeStatic",
+        plane_z,
+        size=1.2,
+        segments=50,
+    )
+    settings.static_collider_collection = collection
+    return _make_grid("SSBL_Object_Collision_LargeStaticCloth", location=(0.0, 0.0, plane_z + MARGIN * 0.5))
+
+
 def _static_mesh_metric(obj, enforce=True):
     limit = MARGIN
     min_z = min(point.z for point in _world_positions(obj))
@@ -254,6 +327,72 @@ def _static_mesh_metric(obj, enforce=True):
     if enforce and penetration > TOLERANCE:
         raise RuntimeError(f"static mesh penetration {penetration:.6f} exceeds tolerance")
     return {"min_z": min_z, "limit": limit, "penetration": penetration}
+
+
+def _static_plane_metric(obj, plane_z, enforce=True):
+    limit = float(plane_z) + MARGIN
+    min_z = min(point.z for point in _world_positions(obj))
+    penetration = max(0.0, limit - min_z)
+    if enforce and penetration > TOLERANCE:
+        raise RuntimeError(f"moving static mesh penetration {penetration:.6f} exceeds tolerance")
+    return {"min_z": min_z, "limit": limit, "penetration": penetration}
+
+
+def _run_moving_static_collider_case():
+    label = "moving_static_mesh"
+    _clear_scene()
+    scene = bpy.context.scene
+    scene.frame_set(1)
+    scene.frame_start = 1
+    scene.frame_end = 120
+
+    settings = scene.ssbl_preview
+    _configure_common(settings)
+    settings.static_collider_collection = _make_static_plane_collection(0.0)
+    collider = bpy.data.objects["SSBL_Object_Collision_StaticPlane"]
+    cloth = _make_grid("SSBL_Object_Collision_MovingStaticCloth", location=(0.0, 0.0, MARGIN * 0.5))
+    bpy.context.view_layer.objects.active = cloth
+    cloth.select_set(True)
+    bpy.context.view_layer.update()
+
+    original_mesh = cloth.data
+    original_before = _flat_mesh_coords(original_mesh)
+    session = ssbl.solver.start_preview(bpy.context, cloth)
+    try:
+        ssbl.solver.step_preview(bpy.context, cloth.name)
+        first_metric = _static_plane_metric(cloth, collider.location.z, enforce=True)
+        first_diag = _static_sdf_summary(cloth)
+        _assert_static_sdf_diagnostics(label, first_diag)
+
+        collider.location.z = MARGIN * 0.6
+        bpy.context.view_layer.update()
+        ssbl.solver.step_preview(bpy.context, cloth.name)
+        second_metric = _static_plane_metric(cloth, collider.location.z, enforce=True)
+        second_diag = _static_sdf_summary(cloth)
+        _assert_static_sdf_diagnostics(label, second_diag)
+    finally:
+        ssbl.solver.request_stop(cloth)
+
+    original_after = _flat_mesh_coords(original_mesh)
+    original_delta = max(
+        (abs(after - before) for before, after in zip(original_before, original_after)),
+        default=0.0,
+    )
+    if original_delta > 1e-7:
+        raise RuntimeError(f"{label} polluted the source mesh: max delta {original_delta}")
+    if second_diag["static_sdf_rebuild_count"] <= first_diag["static_sdf_rebuild_count"]:
+        raise RuntimeError(f"{label} did not rebuild SDF after collider motion: {first_diag} -> {second_diag}")
+    if second_metric["min_z"] <= first_metric["min_z"] + MARGIN * 0.3:
+        raise RuntimeError(f"{label} cloth response did not follow moved collider: {first_metric} -> {second_metric}")
+
+    return {
+        "session_object": session.object_name,
+        "first": first_metric,
+        "second": second_metric,
+        "first_static_sdf": first_diag,
+        "second_static_sdf": second_diag,
+        "original_mesh_max_abs_delta": original_delta,
+    }
 
 
 def main():
@@ -266,8 +405,26 @@ def main():
         results = {
             "ground": _run_case("ground", _ground_case, _ground_metric),
             "wall": _run_case("wall", _wall_case, _wall_metric),
-            "static_monkey": _run_case("static_monkey", _static_monkey_case, _static_monkey_metric),
-            "static_mesh": _run_case("static_mesh", _static_mesh_case, _static_mesh_metric),
+            "static_monkey": _run_case(
+                "static_monkey",
+                _static_monkey_case,
+                _static_monkey_metric,
+                expect_static_sdf=True,
+            ),
+            "static_mesh": _run_case(
+                "static_mesh",
+                _static_mesh_case,
+                _static_mesh_metric,
+                expect_static_sdf=True,
+            ),
+            "large_static_mesh": _run_case(
+                "large_static_mesh",
+                _large_static_mesh_case,
+                _static_mesh_metric,
+                expect_static_sdf=True,
+                min_static_triangles=4097,
+            ),
+            "moving_static_mesh": _run_moving_static_collider_case(),
         }
         print("SSBL_OBJECT_COLLISION_SMOKE", json.dumps(results, ensure_ascii=False))
     finally:

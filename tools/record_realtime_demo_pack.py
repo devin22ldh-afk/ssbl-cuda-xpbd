@@ -24,22 +24,24 @@ if str(TOOLS_DIR) not in sys.path:
 
 import ssbl
 from ssbl.xpbd_core import to_local
-from wring_towel_smoke import (
-    RADIAL_SEGMENTS,
-    TWIST_RADIANS,
-    WRING_FRAME_COUNT,
-    _all_finite as _wring_all_finite,
-    _make_towel,
-    _max_abs_delta,
-    _snapshot_coords,
-    _step_wring_frame,
-)
 
 
-OUTPUT_ROOT = SSBL_ROOT / "recordings" / "realtime_demo_2026-06-03"
+OUTPUT_ROOT = SSBL_ROOT / "recordings" / "realtime_demo_2026-06-05"
 RESOLUTION = (1280, 720)
 VIDEO_FPS = 24
 RESTORE_TOLERANCE = 1.0e-7
+LENGTH = 4.0
+TOWEL_RADIUS = 0.28
+X_SEGMENTS = 96
+RADIAL_SEGMENTS = 24
+PIN_BAND = 0.55
+TWIST_RADIANS = math.radians(540.0)
+WRING_FRAME_COUNT = 80
+
+SOURCE_FLAGWAVER = "https://github.com/krikienoid/flagwaver"
+SOURCE_BINROOT = "https://github.com/BinRoot/Blender-Cloth-Simulation"
+SOURCE_GARMENTLAB = "https://github.com/GarmentLab/GarmentLab"
+SOURCE_DIFFCLOTH = "https://github.com/omegaiota/DiffCloth"
 
 
 @dataclass
@@ -54,6 +56,9 @@ class DemoResult:
     name: str
     title: str
     video: str
+    source_repo: str
+    source_scene: str
+    keywords: list[str]
     frames_dir: str
     frame_count: int
     simulation_steps: int
@@ -85,6 +90,23 @@ def _material(name: str, color: tuple[float, float, float, float]) -> bpy.types.
     mat = bpy.data.materials.new(name)
     mat.diffuse_color = color
     return mat
+
+
+def _beautify_cloth(obj: bpy.types.Object, *, levels: int = 1) -> bpy.types.Object:
+    if obj is None or obj.type != "MESH" or obj.data is None:
+        return obj
+    mesh = obj.data
+    for poly in mesh.polygons:
+        poly.use_smooth = True
+    mesh.update()
+    modifier = obj.modifiers.get("SSBL_Demo_Subsurf")
+    if modifier is None:
+        modifier = obj.modifiers.new("SSBL_Demo_Subsurf", "SUBSURF")
+    modifier.levels = int(levels)
+    modifier.render_levels = int(levels)
+    modifier.subdivision_type = "CATMULL_CLARK"
+    obj.show_wire = False
+    return obj
 
 
 def _look_at(obj: bpy.types.Object, target: Vector | tuple[float, float, float]) -> None:
@@ -238,10 +260,9 @@ def _update_overlay(
     note: str,
 ) -> None:
     overlay.metrics.data.body = (
-        f"frame {frame:03d}/{total_frames:03d}   "
-        f"sim FPS {average_fps:5.1f}   "
-        f"step {last_step_ms:5.2f} ms   "
-        f"native {native_ms:5.2f} ms"
+        f"frame {frame:03d}/{total_frames:03d} | "
+        f"sim FPS {average_fps:5.1f} | "
+        f"step {last_step_ms:5.2f} ms"
     )
     overlay.notes.data.body = note
     bpy.context.view_layer.update()
@@ -401,6 +422,9 @@ def _summarize_demo(
     *,
     name: str,
     title: str,
+    source_repo: str,
+    source_scene: str,
+    keywords: list[str],
     video_path: Path,
     frames_dir: Path,
     frame_paths: list[str],
@@ -426,6 +450,9 @@ def _summarize_demo(
         name=name,
         title=title,
         video=str(video_path),
+        source_repo=source_repo,
+        source_scene=source_scene,
+        keywords=list(keywords),
         frames_dir=str(frames_dir),
         frame_count=len(frame_paths),
         simulation_steps=steps,
@@ -448,6 +475,10 @@ def _metrics_overlay(step_ms_samples: list[float], simulation_elapsed: float) ->
     return f"sim FPS {average_fps:.1f} | p95 step {_p95(step_ms_samples):.1f} ms | frame %{{n}}"
 
 
+def _keyword_line(*keywords: str) -> str:
+    return " | ".join(keyword.strip() for keyword in keywords if keyword and keyword.strip())
+
+
 def _add_world_label(text: str, location: tuple[float, float, float], camera: bpy.types.Object, mat: bpy.types.Material) -> None:
     curve = bpy.data.curves.new(f"{text}_Curve", "FONT")
     curve.body = text
@@ -468,9 +499,100 @@ def _apply_world_positions(obj: bpy.types.Object, positions_world: np.ndarray, m
     obj.data.update()
 
 
+def _rotate_yz(y: float, z: float, angle: float) -> tuple[float, float]:
+    cos_a = math.cos(angle)
+    sin_a = math.sin(angle)
+    return y * cos_a - z * sin_a, y * sin_a + z * cos_a
+
+
+def _make_towel() -> bpy.types.Object:
+    vertices = []
+    faces = []
+    for ix in range(X_SEGMENTS + 1):
+        x = -LENGTH * 0.5 + LENGTH * ix / X_SEGMENTS
+        for ir in range(RADIAL_SEGMENTS):
+            angle = math.tau * ir / RADIAL_SEGMENTS
+            y = math.cos(angle) * TOWEL_RADIUS
+            z = 1.25 + math.sin(angle) * TOWEL_RADIUS
+            vertices.append((x, y, z))
+
+    row = RADIAL_SEGMENTS
+    for ix in range(X_SEGMENTS):
+        for ir in range(RADIAL_SEGMENTS):
+            a = ix * row + ir
+            b = ix * row + ((ir + 1) % RADIAL_SEGMENTS)
+            c = (ix + 1) * row + ((ir + 1) % RADIAL_SEGMENTS)
+            d = (ix + 1) * row + ir
+            faces.append((a, b, c, d))
+
+    mesh = bpy.data.meshes.new("SSBL_Wring_Towel_Mesh")
+    mesh.from_pydata(vertices, [], faces)
+    mesh.update()
+    obj = bpy.data.objects.new("SSBL_Wring_Towel", mesh)
+    bpy.context.scene.collection.objects.link(obj)
+    bpy.context.view_layer.objects.active = obj
+    obj.select_set(True)
+
+    pin = obj.vertex_groups.new(name="ssbl_pin")
+    pin_indices = [vert.index for vert in obj.data.vertices if abs(vert.co.x) >= LENGTH * 0.5 - PIN_BAND]
+    pin.add(pin_indices, 1.0, "ADD")
+    return obj
+
+
+def _wring_all_finite(obj: bpy.types.Object) -> bool:
+    return all(
+        math.isfinite(float(component))
+        for vert in obj.data.vertices
+        for component in (vert.co.x, vert.co.y, vert.co.z)
+    )
+
+
+def _snapshot_coords(mesh: bpy.types.Mesh) -> list[float]:
+    return [component for vert in mesh.vertices for component in (vert.co.x, vert.co.y, vert.co.z)]
+
+
+def _max_abs_delta(before: list[float], after: list[float]) -> float:
+    return max((abs(float(a) - float(b)) for a, b in zip(after, before)), default=0.0)
+
+
+def _wring_pin_targets(cloth, progress: float) -> np.ndarray:
+    progress = max(0.0, min(1.0, float(progress)))
+    rest = np.asarray(cloth.positions_world[cloth.pin_indices], dtype=np.float32)
+    targets = np.array(rest, dtype=np.float32, copy=True)
+    left_limit = -LENGTH * 0.5 + PIN_BAND + 1.0e-5
+    right_limit = LENGTH * 0.5 - PIN_BAND - 1.0e-5
+    for index, point in enumerate(rest):
+        x = float(point[0])
+        if x <= left_limit:
+            angle = TWIST_RADIANS * progress
+        elif x >= right_limit:
+            angle = -TWIST_RADIANS * progress
+        else:
+            continue
+        y, z_delta = _rotate_yz(float(point[1]), float(point[2]) - 1.25, angle)
+        targets[index, 1] = y
+        targets[index, 2] = 1.25 + z_delta
+    return np.ascontiguousarray(targets, dtype=np.float32)
+
+
+def _step_wring_frame(session, obj: bpy.types.Object, frame: int, frame_count: int) -> np.ndarray:
+    slot = session.slots[obj.name]
+    progress = max(0.0, min(1.0, float(frame) / max(float(frame_count), 1.0)))
+    slot.native.update_pin_targets(slot.cloth.pin_indices, _wring_pin_targets(slot.cloth, progress))
+    slot.native.step(session.substeps, session.iterations)
+    slot.current_positions_world = np.array(slot.native.download_positions(), dtype=np.float32, copy=True)
+    _apply_world_positions(obj, slot.current_positions_world, slot.cloth.matrix_world_inv)
+    return slot.current_positions_world
+
+
 def _record_wring_towel() -> DemoResult:
-    name = "01_wring_towel_xpbd_realtime"
-    title = "SSBL XPBD realtime wring - twist deformation"
+    name = "02_wring_towel_realtime"
+    title = "SSBL realtime wring towel - hook driven twist"
+    keywords = [
+        "Hook Driven Wring",
+        "Stable Self-Collision",
+        "Twist Deformation",
+    ]
     _clear_scene()
     _case_dir, frames_dir, video_path = _ensure_output_dir(name)
     scene = bpy.context.scene
@@ -488,7 +610,7 @@ def _record_wring_towel() -> DemoResult:
     for poly in towel.data.polygons:
         radial_index = int(poly.index) % RADIAL_SEGMENTS
         poly.material_index = 1 if radial_index in (0, 1, 2) else (2 if radial_index % 6 == 0 else 0)
-    towel.show_wire = True
+    _beautify_cloth(towel)
 
     camera = _configure_scene_render(
         scene,
@@ -554,7 +676,7 @@ def _record_wring_towel() -> DemoResult:
             average_fps=avg_fps,
             last_step_ms=last_ms,
             native_ms=native_ms,
-            note=f"540 deg twist, fast self collision, {len(towel.data.vertices)} verts",
+            note=_keyword_line(*keywords),
         )
         frame_paths.append(_render_frame(scene, frames_dir, frame))
 
@@ -569,12 +691,15 @@ def _record_wring_towel() -> DemoResult:
         [
             title,
             _metrics_overlay(step_ms_samples, simulation_elapsed),
-            f"540 deg twist | self collision fast | restore delta {restore_delta:.1e}",
+            _keyword_line(*keywords),
         ],
     )
     return _summarize_demo(
         name=name,
         title=title,
+        source_repo=SOURCE_BINROOT,
+        source_scene="Two-point towel wring inspiration",
+        keywords=keywords,
         video_path=video_path,
         frames_dir=frames_dir,
         frame_paths=frame_paths,
@@ -614,7 +739,7 @@ def _grid_xy(
 def _configure_cloth_settings(settings, *, frame_count: int, pin_group: str = "") -> None:
     settings.enabled = True
     settings.pin_vertex_group = pin_group
-    settings.use_evaluated_mesh = True
+    settings.use_evaluated_mesh = False
     settings.preview_writeback_interval = 1
     settings.preview_target_fps = 60.0
     settings.dt = 1.0 / 60.0
@@ -648,10 +773,65 @@ def _slot_max_edge_ratio(slot) -> float:
     return float(np.max(finite)) if len(finite) else float("inf")
 
 
+def _make_hanging_panel(
+    name: str,
+    *,
+    location: tuple[float, float, float],
+    width: float,
+    height: float,
+    x_segments: int,
+    z_segments: int,
+    color: tuple[float, float, float, float],
+) -> bpy.types.Object:
+    verts = []
+    faces = []
+    half_w = width * 0.5
+    for iz in range(z_segments + 1):
+        z = height - height * iz / z_segments
+        for ix in range(x_segments + 1):
+            x = -half_w + width * ix / x_segments
+            verts.append((x, 0.0, z))
+    stride = x_segments + 1
+    for iz in range(z_segments):
+        for ix in range(x_segments):
+            a = iz * stride + ix
+            faces.append((a, a + 1, a + stride + 1, a + stride))
+    mesh = bpy.data.meshes.new(f"{name}_Mesh")
+    mesh.from_pydata(verts, [], faces)
+    mesh.update()
+    obj = bpy.data.objects.new(name, mesh)
+    obj.location = location
+    obj.data.materials.append(_material(f"{name}_Mat", color))
+    bpy.context.scene.collection.objects.link(obj)
+    _beautify_cloth(obj)
+    pin = obj.vertex_groups.new(name="ssbl_pin")
+    pin.add([v.index for v in obj.data.vertices if v.co.z >= height - 0.12], 1.0, "ADD")
+    return obj
+
+
+def _make_clothesline_visual() -> None:
+    rope_mat = _material("SSBL_Demo_Clothesline_Rope", (0.86, 0.74, 0.56, 1.0))
+    clip_mat = _material("SSBL_Demo_Clothesline_Clip", (0.16, 0.16, 0.18, 1.0))
+    bpy.ops.mesh.primitive_cylinder_add(vertices=24, radius=0.03, depth=4.3, location=(0.0, 0.0, 2.12), rotation=(0.0, math.pi / 2.0, 0.0))
+    rope = bpy.context.object
+    rope.name = "SSBL_Demo_Clothesline_Rope"
+    rope.data.materials.append(rope_mat)
+    for x in (-0.88, -0.08, 0.74):
+        bpy.ops.mesh.primitive_cube_add(location=(x, 0.0, 2.02), scale=(0.05, 0.04, 0.08))
+        clip = bpy.context.object
+        clip.name = f"SSBL_Demo_Clip_{int((x + 2.0) * 100):03d}"
+        clip.data.materials.append(clip_mat)
+
+
 def _record_multicloth_contact() -> DemoResult:
-    name = "02_multicloth_contact_realtime"
-    title = "SSBL realtime multi-cloth contact - layered cloth collision"
-    frame_count = 48
+    name = "03_clothesline_multicloth_realtime"
+    title = "SSBL realtime clothesline - multi-cloth contact"
+    keywords = [
+        "Multi-Cloth Contact",
+        "Clothesline Drape",
+        "Wind Sway",
+    ]
+    frame_count = 60
     _clear_scene()
     _case_dir, frames_dir, video_path = _ensure_output_dir(name)
     scene = bpy.context.scene
@@ -660,35 +840,66 @@ def _record_multicloth_contact() -> DemoResult:
     scene.frame_set(1)
     camera = _configure_scene_render(
         scene,
-        camera_location=(2.2, -3.0, 1.7),
-        target=(0.0, 0.0, 0.22),
-        ortho_scale=2.75,
+        camera_location=(3.2, -4.7, 2.7),
+        target=(0.0, 0.0, 1.15),
+        ortho_scale=4.35,
     )
     overlay = _create_overlay(scene, camera, title)
 
-    lower = _grid_xy("SSBL_Demo_Lower_Cloth", z=1.0, size=2.1, segments=34, color=(0.10, 0.32, 0.95, 1.0))
-    upper = _grid_xy("SSBL_Demo_Upper_Cloth", z=1.025, size=1.8, segments=32, color=(0.95, 0.28, 0.12, 1.0))
-    for obj, layer in ((lower, 0), (upper, 1)):
+    _make_clothesline_visual()
+    cloths = [
+        _make_hanging_panel(
+            "SSBL_Demo_Left_Laundry",
+            location=(-0.9, -0.12, 0.2),
+            width=1.12,
+            height=1.72,
+            x_segments=18,
+            z_segments=28,
+            color=(0.11, 0.30, 0.92, 1.0),
+        ),
+        _make_hanging_panel(
+            "SSBL_Demo_Center_Laundry",
+            location=(-0.02, 0.0, 0.18),
+            width=0.98,
+            height=1.62,
+            x_segments=16,
+            z_segments=26,
+            color=(0.94, 0.30, 0.16, 1.0),
+        ),
+        _make_hanging_panel(
+            "SSBL_Demo_Right_Laundry",
+            location=(0.82, 0.12, 0.22),
+            width=1.04,
+            height=1.68,
+            x_segments=18,
+            z_segments=28,
+            color=(0.96, 0.88, 0.28, 1.0),
+        ),
+    ]
+    for layer, obj in enumerate(cloths):
         obj.ssbl_collision_layer = layer
         obj.ssbl_enable_cross_cloth_collision = True
-        group = obj.vertex_groups.new(name="ssbl_pin")
-        size = 2.1 if obj == lower else 1.8
-        group.add([v.index for v in obj.data.vertices if v.co.y > size * 0.41], 1.0, "ADD")
         _configure_cloth_settings(obj.ssbl_cloth, frame_count=frame_count, pin_group="ssbl_pin")
         obj.ssbl_cloth.gravity = (0.0, 0.0, -9.8)
-        obj.ssbl_cloth.hardness = 0.55
-        obj.ssbl_cloth.collision_margin = 0.04
+        obj.ssbl_cloth.hardness = 0.42
+        obj.ssbl_cloth.use_blender_force_fields = True
+        obj.ssbl_cloth.collision_margin = 0.028
         obj.ssbl_cloth.cloth_thickness = 0.045
 
+    bpy.ops.object.effector_add(type="WIND", location=(0.0, -1.6, 1.2), rotation=(math.pi / 2.0, 0.0, 0.0))
+    wind = bpy.context.object
+    wind.name = "SSBL_Demo_Clothesline_Wind"
+    wind.field.strength = 8.0
+
     bpy.ops.object.select_all(action="DESELECT")
-    lower.select_set(True)
-    upper.select_set(True)
-    bpy.context.view_layer.objects.active = upper
-    before = {lower.name: _mesh_snapshot(lower), upper.name: _mesh_snapshot(upper)}
-    session = ssbl.solver.start_preview(bpy.context, upper)
-    if len(session.slots) != 2 or str(session.cross_cloth_mode) == "off":
+    for obj in cloths:
+        obj.select_set(True)
+    bpy.context.view_layer.objects.active = cloths[1]
+    before = {obj.name: _mesh_snapshot(obj) for obj in cloths}
+    session = ssbl.solver.start_preview(bpy.context, cloths[1])
+    if len(session.slots) != len(cloths) or str(session.cross_cloth_mode) == "off":
         raise RuntimeError(
-            f"multi-cloth demo expected two cloth slots with cross collision, got slots={len(session.slots)} "
+            f"multi-cloth demo expected three cloth slots with cross collision, got slots={len(session.slots)} "
             f"mode={session.cross_cloth_mode}"
         )
 
@@ -698,31 +909,37 @@ def _record_multicloth_contact() -> DemoResult:
     simulation_elapsed = 0.0
     max_edge_ratio = 0.0
     max_dynamic_triangles = 0
-    min_pair_gap = float("inf")
+    max_force_field_count = 0
+    min_panel_gap = float("inf")
 
     for frame in range(0, frame_count + 1):
+        if frame == 16:
+            wind.field.strength = 18.0
+        if frame == 34:
+            wind.field.strength = 28.0
         last_ms = 0.0
         native_ms = 0.0
-        diag = ssbl.solver.session_diagnostics(upper)
+        diag = ssbl.solver.session_diagnostics(cloths[1])
         if frame > 0:
             started = time.perf_counter()
-            ssbl.solver.step_preview(bpy.context, upper.name)
+            scene.frame_set(frame)
+            ssbl.solver.step_preview(bpy.context, cloths[1].name)
             elapsed = time.perf_counter() - started
             simulation_elapsed += elapsed
             last_ms = elapsed * 1000.0
-            diag = ssbl.solver.session_diagnostics(upper)
+            diag = ssbl.solver.session_diagnostics(cloths[1])
             native_ms = float(diag.step_ms)
             step_ms_samples.append(last_ms)
-        finite = finite and _finite_mesh(lower) and _finite_mesh(upper) and bool(diag.finite)
-        lower_slot = session.slots.get(lower.name)
-        upper_slot = session.slots.get(upper.name)
-        if lower_slot is not None and upper_slot is not None:
-            lower_z = np.asarray(lower_slot.current_positions_world, dtype=np.float64)[:, 2]
-            upper_z = np.asarray(upper_slot.current_positions_world, dtype=np.float64)[:, 2]
-            min_pair_gap = min(min_pair_gap, float(np.min(upper_z) - np.max(lower_z)))
+        finite = finite and all(_finite_mesh(obj) for obj in cloths) and bool(diag.finite)
         max_dynamic_triangles = max(max_dynamic_triangles, int(diag.dynamic_triangle_count))
+        max_force_field_count = max(max_force_field_count, int(diag.force_field_count))
         for slot in session.slots.values():
             max_edge_ratio = max(max_edge_ratio, _slot_max_edge_ratio(slot))
+        ordered_slots = [session.slots[obj.name] for obj in cloths]
+        for first, second in zip(ordered_slots, ordered_slots[1:]):
+            first_y = np.asarray(first.current_positions_world, dtype=np.float64)[:, 1]
+            second_y = np.asarray(second.current_positions_world, dtype=np.float64)[:, 1]
+            min_panel_gap = min(min_panel_gap, float(np.min(second_y) - np.max(first_y)))
         avg_fps = len(step_ms_samples) / max(simulation_elapsed, 1.0e-9)
         _update_overlay(
             overlay,
@@ -731,24 +948,27 @@ def _record_multicloth_contact() -> DemoResult:
             average_fps=avg_fps,
             last_step_ms=last_ms,
             native_ms=native_ms,
-            note=f"slots {len(session.slots)}, cross mode {session.cross_cloth_mode}, min gap {min_pair_gap:.4f}",
+            note=_keyword_line(*keywords),
         )
         frame_paths.append(_render_frame(scene, frames_dir, frame))
 
-    ssbl.solver.request_stop(upper)
-    restore_delta = max(_mesh_delta(lower, before[lower.name]), _mesh_delta(upper, before[upper.name]))
+    ssbl.solver.request_stop(cloths[1])
+    restore_delta = max(_mesh_delta(obj, before[obj.name]) for obj in cloths)
     _encode_video(
         frames_dir,
         video_path,
         [
             title,
             _metrics_overlay(step_ms_samples, simulation_elapsed),
-            f"slots {len(session.slots)} | cross {session.cross_cloth_mode} | dynamic triangles {max_dynamic_triangles}",
+            _keyword_line(*keywords),
         ],
     )
     return _summarize_demo(
         name=name,
         title=title,
+        source_repo=SOURCE_GARMENTLAB,
+        source_scene="Hang scene inspiration adapted to a clothesline promo setup",
+        keywords=keywords,
         video_path=video_path,
         frames_dir=frames_dir,
         frame_paths=frame_paths,
@@ -761,7 +981,9 @@ def _record_multicloth_contact() -> DemoResult:
             "cross_mode": str(session.cross_cloth_mode),
             "max_edge_ratio": max_edge_ratio,
             "max_dynamic_triangle_count": max_dynamic_triangles,
-            "min_pair_gap": min_pair_gap,
+            "max_force_field_count": max_force_field_count,
+            "min_panel_gap": min_panel_gap,
+            "final_wind_strength": float(wind.field.strength),
         },
     )
 
@@ -792,9 +1014,9 @@ def _make_grid_mesh(
     mesh.update()
     obj = bpy.data.objects.new(name, mesh)
     obj.location = center
-    obj.show_wire = True
     obj.data.materials.append(_material(f"{name}_Mat", color))
     bpy.context.scene.collection.objects.link(obj)
+    _beautify_cloth(obj)
     return obj
 
 
@@ -837,11 +1059,104 @@ def _configure_collision_settings(settings, *, frame_count: int) -> None:
     settings.cloth_thickness = 0.035
 
 
+def _make_tablecloth(size: float, color: tuple[float, float, float, float]) -> bpy.types.Object:
+    cloth = _grid_xy("SSBL_Demo_Tablecloth", z=1.28, size=size, segments=36, color=color)
+    _beautify_cloth(cloth)
+    pin = cloth.vertex_groups.new(name="ssbl_pin")
+    pin_indices = [
+        vert.index
+        for vert in cloth.data.vertices
+        if vert.co.x >= size * 0.42 and abs(vert.co.y) >= size * 0.28
+    ]
+    pin.add(pin_indices, 1.0, "ADD")
+    return cloth
+
+
+def _make_table_scene_visual() -> tuple[bpy.types.Collection, bpy.types.Object, bpy.types.Object]:
+    table_mat = _material("SSBL_Demo_Table_Wood", (0.50, 0.33, 0.17, 1.0))
+    leg_mat = _material("SSBL_Demo_Table_Leg", (0.18, 0.15, 0.12, 1.0))
+    handle_mat = _material("SSBL_Demo_Handle", (1.0, 0.74, 0.18, 1.0))
+    floor_mat = _material("SSBL_Demo_Floor", (0.08, 0.09, 0.10, 1.0))
+
+    floor = _plane_mesh(
+        "SSBL_Demo_Table_Floor",
+        [(-3.6, -3.0, 0.0), (3.6, -3.0, 0.0), (3.6, 3.0, 0.0), (-3.6, 3.0, 0.0)],
+        (0.0, 0.0, 0.0),
+        (0.08, 0.09, 0.10, 1.0),
+    )
+    floor.data.materials.clear()
+    floor.data.materials.append(floor_mat)
+
+    bpy.ops.mesh.primitive_cube_add(location=(0.0, 0.0, 0.88), scale=(0.84, 0.56, 0.26))
+    tabletop = bpy.context.object
+    tabletop.name = "SSBL_Demo_Tabletop"
+    tabletop.data.materials.append(table_mat)
+    collider_collection = _collection_with_object("SSBL_Demo_Table_Collider_Collection", tabletop)
+
+    for x in (-0.66, 0.66):
+        for y in (-0.38, 0.38):
+            bpy.ops.mesh.primitive_cube_add(location=(x, y, 0.42), scale=(0.05, 0.05, 0.42))
+            leg = bpy.context.object
+            leg.name = f"SSBL_Demo_Table_Leg_{int((x + 1.0) * 100):03d}_{int((y + 1.0) * 100):03d}"
+            leg.data.materials.append(leg_mat)
+
+    bpy.ops.mesh.primitive_uv_sphere_add(segments=20, ring_count=10, radius=0.08, location=(1.05, 0.58, 1.34))
+    handle_a = bpy.context.object
+    handle_a.name = "SSBL_Demo_Table_Handle_A"
+    handle_a.data.materials.append(handle_mat)
+
+    bpy.ops.mesh.primitive_uv_sphere_add(segments=20, ring_count=10, radius=0.08, location=(1.05, -0.58, 1.34))
+    handle_b = bpy.context.object
+    handle_b.name = "SSBL_Demo_Table_Handle_B"
+    handle_b.data.materials.append(handle_mat)
+    return collider_collection, handle_a, handle_b
+
+
+def _ease_out_cubic(progress: float) -> float:
+    clamped = max(0.0, min(1.0, float(progress)))
+    return 1.0 - (1.0 - clamped) ** 3
+
+
+def _tablecloth_pin_targets(cloth, pull_progress: float) -> np.ndarray:
+    rest = np.asarray(cloth.positions_world[cloth.pin_indices], dtype=np.float32)
+    targets = np.array(rest, dtype=np.float32, copy=True)
+    progress = _ease_out_cubic(pull_progress)
+    for index, point in enumerate(rest):
+        sign_y = 1.0 if float(point[1]) >= 0.0 else -1.0
+        targets[index, 0] = float(point[0]) + 1.35 * progress
+        targets[index, 1] = float(point[1]) + 0.10 * sign_y * progress
+        targets[index, 2] = float(point[2]) + 0.34 * progress
+    return np.ascontiguousarray(targets, dtype=np.float32)
+
+
+def _pin_cluster_centers(pin_targets: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    positive = pin_targets[pin_targets[:, 1] >= 0.0]
+    negative = pin_targets[pin_targets[:, 1] < 0.0]
+    positive_center = np.mean(positive, axis=0) if len(positive) else np.zeros(3, dtype=np.float32)
+    negative_center = np.mean(negative, axis=0) if len(negative) else np.zeros(3, dtype=np.float32)
+    return positive_center, negative_center
+
+
+def _manual_native_step(session, obj: bpy.types.Object, pin_targets: np.ndarray | None = None):
+    slot = session.slots[obj.name]
+    if pin_targets is not None and len(slot.cloth.pin_indices) > 0:
+        slot.native.update_pin_targets(slot.cloth.pin_indices, pin_targets)
+        slot.pin_targets_world = np.array(pin_targets, dtype=np.float32, copy=True)
+    slot.native.step(slot.substeps, slot.iterations)
+    slot.current_positions_world = np.array(slot.native.download_positions(), dtype=np.float32, copy=True)
+    _apply_world_positions(obj, slot.current_positions_world, slot.cloth.matrix_world_inv)
+    return slot.native.cached_diagnostics()
+
+
 def _record_object_collision_suite() -> DemoResult:
-    name = "03_object_collision_suite_realtime"
-    title = "SSBL realtime collision suite - ground, wall, static mesh"
-    frame_count = 48
-    margin = 0.035
+    name = "04_tablecloth_pull_collision_realtime"
+    title = "SSBL realtime tablecloth pull - rigid edge collision"
+    keywords = [
+        "Pinned Corner Pull",
+        "Rigid Edge Collision",
+        "Stable Drape",
+    ]
+    frame_count = 56
     _clear_scene()
     _case_dir, frames_dir, video_path = _ensure_output_dir(name)
     scene = bpy.context.scene
@@ -850,75 +1165,27 @@ def _record_object_collision_suite() -> DemoResult:
     scene.frame_set(1)
     camera = _configure_scene_render(
         scene,
-        camera_location=(0.0, -7.0, 4.2),
-        target=(0.0, 0.0, 0.38),
-        ortho_scale=5.8,
+        camera_location=(4.9, -4.8, 3.45),
+        target=(0.1, 0.0, 0.92),
+        ortho_scale=4.35,
     )
     overlay = _create_overlay(scene, camera, title)
-    label_mat = _material("SSBL_Demo_Label_White", (0.92, 0.92, 0.88, 1.0))
+    collider_collection, handle_a, handle_b = _make_table_scene_visual()
+    cloth = _make_tablecloth(2.42, (0.94, 0.92, 0.86, 1.0))
+    _configure_collision_settings(cloth.ssbl_cloth, frame_count=frame_count)
+    cloth.ssbl_cloth.pin_vertex_group = "ssbl_pin"
+    cloth.ssbl_cloth.gravity = (0.0, 0.0, -9.8)
+    cloth.ssbl_cloth.static_collider_collection = collider_collection
+    cloth.ssbl_cloth.damping = 0.992
+    cloth.ssbl_cloth.collision_margin = 0.028
+    cloth.ssbl_cloth.cloth_thickness = 0.03
 
-    ground_center = (-1.7, 2.1, 0.0)
-    _plane_mesh(
-        "Ground_Collider_Visual",
-        [(-0.58, -0.58, 0.0), (0.58, -0.58, 0.0), (0.58, 0.58, 0.0), (-0.58, 0.58, 0.0)],
-        (ground_center[0], ground_center[1], 0.0),
-        (0.18, 0.58, 0.34, 1.0),
-    )
-    ground = _make_grid_mesh("Ground_Cloth", (ground_center[0], ground_center[1], 0.82))
-    _configure_collision_settings(ground.ssbl_cloth, frame_count=frame_count)
-    ground.ssbl_cloth.use_ground = True
-    ground.ssbl_cloth.ground_height = 0.0
-    ground.ssbl_cloth.gravity = (0.0, 0.0, -9.8)
-    _add_world_label("Ground", (ground_center[0], ground_center[1], 1.42), camera, label_mat)
-
-    monkey_center = (1.7, 2.1, 0.38)
-    bpy.ops.mesh.primitive_monkey_add(size=0.7, location=monkey_center)
-    monkey = bpy.context.object
-    monkey.name = "Static_Monkey_Collider"
-    monkey.data.materials.append(_material("Static_Monkey_Mat", (0.18, 0.38, 0.9, 1.0)))
-    bpy.context.view_layer.update()
-    monkey_top_z = max((monkey.matrix_world @ Vector(corner)).z for corner in monkey.bound_box)
-    monkey_collection = _collection_with_object("SSBL_Object_Collision_Static_Monkey_Collection", monkey)
-    monkey_cloth = _make_grid_mesh("Monkey_Cloth", (monkey_center[0], monkey_center[1], monkey_top_z + margin * 0.45))
-    _configure_collision_settings(monkey_cloth.ssbl_cloth, frame_count=frame_count)
-    monkey_cloth.ssbl_cloth.static_collider_collection = monkey_collection
-    _add_world_label("Static Monkey", (monkey_center[0], monkey_center[1], 1.42), camera, label_mat)
-
-    wall_y = -2.1
-    _plane_mesh(
-        "Wall_Collider_Visual",
-        [(-0.55, 0.0, -0.55), (0.55, 0.0, -0.55), (0.55, 0.0, 0.55), (-0.55, 0.0, 0.55)],
-        (-1.7, wall_y, 0.45),
-        (0.82, 0.22, 0.18, 1.0),
-    )
-    wall = _make_grid_mesh("Wall_Cloth", (-1.7, wall_y - 0.58, 0.45))
-    _configure_collision_settings(wall.ssbl_cloth, frame_count=frame_count)
-    wall.ssbl_cloth.use_wall = True
-    wall.ssbl_cloth.wall_origin = (-1.7, wall_y, 0.0)
-    wall.ssbl_cloth.wall_normal = (0.0, -1.0, 0.0)
-    wall.ssbl_cloth.gravity = (0.0, 9.8, 0.0)
-    _add_world_label("Wall", (-1.7, wall_y, 1.42), camera, label_mat)
-
-    static_center = (1.7, -2.1, 0.0)
-    static_plane = _plane_mesh(
-        "Static_Mesh_Collider",
-        [(-0.58, -0.58, 0.0), (0.58, -0.58, 0.0), (0.58, 0.58, 0.0), (-0.58, 0.58, 0.0)],
-        (static_center[0], static_center[1], 0.32),
-        (0.08, 0.68, 0.72, 1.0),
-    )
-    static_collection = _collection_with_object("SSBL_Object_Collision_Static_Collection", static_plane)
-    static_cloth = _make_grid_mesh("Static_Mesh_Cloth", (static_center[0], static_center[1], 0.32 + margin * 0.55))
-    _configure_collision_settings(static_cloth.ssbl_cloth, frame_count=frame_count)
-    static_cloth.ssbl_cloth.static_collider_collection = static_collection
-    _add_world_label("Static Mesh", (static_center[0], static_center[1], 1.42), camera, label_mat)
-
-    cloths = [ground, monkey_cloth, wall, static_cloth]
-    before = {obj.name: _mesh_snapshot(obj) for obj in cloths}
+    before = {cloth.name: _mesh_snapshot(cloth)}
     bpy.ops.object.select_all(action="DESELECT")
-    for obj in cloths:
-        obj.select_set(True)
-    bpy.context.view_layer.objects.active = ground
-    session = ssbl.solver.start_preview(bpy.context, ground)
+    cloth.select_set(True)
+    bpy.context.view_layer.objects.active = cloth
+    session = ssbl.solver.start_preview(bpy.context, cloth)
+    initial_center_a, initial_center_b = _pin_cluster_centers(np.asarray(session.slots[cloth.name].pin_targets_world, dtype=np.float32))
 
     step_ms_samples: list[float] = []
     frame_paths: list[str] = []
@@ -926,21 +1193,31 @@ def _record_object_collision_suite() -> DemoResult:
     simulation_elapsed = 0.0
     max_penetration = 0.0
     max_static_collision_ms = 0.0
+    max_pull_distance = 0.0
 
     for frame in range(0, frame_count + 1):
         last_ms = 0.0
         native_ms = 0.0
-        diag = ssbl.solver.session_diagnostics(ground)
+        diag = session.slots[cloth.name].native.cached_diagnostics()
         if frame > 0:
+            pull_progress = 0.0 if frame <= 14 else (frame - 14) / max(frame_count - 14, 1)
+            pin_targets = _tablecloth_pin_targets(session.slots[cloth.name].cloth, pull_progress)
             started = time.perf_counter()
-            ssbl.solver.step_preview(bpy.context, ground.name)
+            diag = _manual_native_step(session, cloth, pin_targets=pin_targets)
             elapsed = time.perf_counter() - started
             simulation_elapsed += elapsed
             last_ms = elapsed * 1000.0
-            diag = ssbl.solver.session_diagnostics(ground)
             native_ms = float(diag.step_ms)
             step_ms_samples.append(last_ms)
-        finite = finite and all(_finite_mesh(obj) for obj in cloths) and bool(diag.finite)
+            center_a, center_b = _pin_cluster_centers(pin_targets)
+            handle_a.location = Vector(tuple(center_a))
+            handle_b.location = Vector(tuple(center_b))
+            max_pull_distance = max(
+                max_pull_distance,
+                float(np.linalg.norm(center_a - initial_center_a)),
+                float(np.linalg.norm(center_b - initial_center_b)),
+            )
+        finite = finite and _finite_mesh(cloth) and bool(diag.finite)
         max_penetration = max(max_penetration, float(diag.penetration_depth))
         max_static_collision_ms = max(max_static_collision_ms, float(diag.static_collision_ms))
         avg_fps = len(step_ms_samples) / max(simulation_elapsed, 1.0e-9)
@@ -951,24 +1228,27 @@ def _record_object_collision_suite() -> DemoResult:
             average_fps=avg_fps,
             last_step_ms=last_ms,
             native_ms=native_ms,
-            note=f"slots {len(session.slots)}, collision margin {margin:.3f}, penetration {diag.penetration_depth:.4f}",
+            note=_keyword_line(*keywords),
         )
         frame_paths.append(_render_frame(scene, frames_dir, frame))
 
-    ssbl.solver.request_stop(ground)
-    restore_delta = max(_mesh_delta(obj, before[obj.name]) for obj in cloths)
+    ssbl.solver.request_stop(cloth)
+    restore_delta = _mesh_delta(cloth, before[cloth.name])
     _encode_video(
         frames_dir,
         video_path,
         [
             title,
             _metrics_overlay(step_ms_samples, simulation_elapsed),
-            f"slots {len(session.slots)} | static collision {max_static_collision_ms:.1f} ms | restore delta {restore_delta:.1e}",
+            _keyword_line(*keywords),
         ],
     )
     return _summarize_demo(
         name=name,
         title=title,
+        source_repo=SOURCE_GARMENTLAB,
+        source_scene="Mobile scene inspiration adapted to a two-handle tablecloth pull",
+        keywords=keywords,
         video_path=video_path,
         frames_dir=frames_dir,
         frame_paths=frame_paths,
@@ -978,9 +1258,9 @@ def _record_object_collision_suite() -> DemoResult:
         restore_delta=restore_delta,
         metrics={
             "slots": len(session.slots),
-            "cross_mode": str(session.cross_cloth_mode),
             "max_penetration_depth": max_penetration,
             "max_static_collision_ms": max_static_collision_ms,
+            "max_pull_distance": max_pull_distance,
         },
     )
 
@@ -1005,12 +1285,18 @@ def _make_yz_flag(name: str, *, segments: int = 24, size_y: float = 1.8, size_z:
     mesh.update()
     obj = bpy.data.objects.new(name, mesh)
     obj.location = (0.0, 0.0, 0.9)
-    obj.show_wire = True
-    obj.data.materials.append(_material(f"{name}_Mat", (0.18, 0.76, 0.62, 1.0)))
+    obj.data.materials.append(_material(f"{name}_Mat_Base", (0.18, 0.76, 0.62, 1.0)))
+    obj.data.materials.append(_material(f"{name}_Mat_Accent", (0.95, 0.28, 0.14, 1.0)))
+    obj.data.materials.append(_material(f"{name}_Mat_Light", (0.94, 0.95, 0.97, 1.0)))
     bpy.context.scene.collection.objects.link(obj)
+    _beautify_cloth(obj)
     group = obj.vertex_groups.new(name="ssbl_pin")
     pin_indices = [v.index for v in obj.data.vertices if v.co.y <= -half_y + 0.02]
     group.add(pin_indices, 1.0, "ADD")
+    stride = segments
+    for poly in obj.data.polygons:
+        row = poly.index // stride
+        obj.data.polygons[poly.index].material_index = 2 if row < 4 else (1 if row % 5 == 0 else 0)
     return obj
 
 
@@ -1031,8 +1317,13 @@ def _average_x(obj: bpy.types.Object) -> float:
 
 
 def _record_force_field_tuning() -> DemoResult:
-    name = "04_force_field_tuning_realtime"
-    title = "SSBL realtime force fields - live wind and material tuning"
+    name = "01_brand_flag_wind_realtime"
+    title = "SSBL realtime flag - live wind control"
+    keywords = [
+        "Realtime Wind",
+        "Stable Flag Response",
+        "Live Tuning",
+    ]
     frame_count = 56
     _clear_scene()
     _case_dir, frames_dir, video_path = _ensure_output_dir(name)
@@ -1049,6 +1340,11 @@ def _record_force_field_tuning() -> DemoResult:
     overlay = _create_overlay(scene, camera, title)
 
     cloth = _make_yz_flag("SSBL_Demo_Force_Field_Flag")
+    bpy.ops.mesh.primitive_cylinder_add(vertices=24, radius=0.04, depth=2.4, location=(-0.08, -0.92, 1.0))
+    pole = bpy.context.object
+    pole.name = "SSBL_Demo_Flag_Pole"
+    pole.rotation_euler = (math.pi / 2.0, 0.0, 0.0)
+    pole.data.materials.append(_material("SSBL_Demo_Flag_Pole_Mat", (0.72, 0.72, 0.75, 1.0)))
     _configure_cloth_settings(cloth.ssbl_cloth, frame_count=frame_count, pin_group="ssbl_pin")
     cloth.ssbl_cloth.preview_writeback_interval = 1
     cloth.ssbl_cloth.substeps = 5
@@ -1106,7 +1402,7 @@ def _record_force_field_tuning() -> DemoResult:
             average_fps=avg_fps,
             last_step_ms=last_ms,
             native_ms=native_ms,
-            note=f"{phase}, force fields {int(diag.force_field_count)}, avg X {_average_x(cloth):.3f}",
+            note=_keyword_line(*keywords),
         )
         frame_paths.append(_render_frame(scene, frames_dir, frame))
 
@@ -1118,12 +1414,15 @@ def _record_force_field_tuning() -> DemoResult:
         [
             title,
             _metrics_overlay(step_ms_samples, simulation_elapsed),
-            f"wind {float(wind.field.strength):.0f} | force fields {max(force_field_counts) if force_field_counts else 0} | hardness {float(cloth.ssbl_cloth.hardness):.2f}",
+            _keyword_line(*keywords),
         ],
     )
     return _summarize_demo(
         name=name,
         title=title,
+        source_repo=SOURCE_FLAGWAVER,
+        source_scene="Flagwaver-style wind flag shot adapted to SSBL cloth controls",
+        keywords=keywords,
         video_path=video_path,
         frames_dir=frames_dir,
         frame_paths=frame_paths,
@@ -1141,10 +1440,212 @@ def _record_force_field_tuning() -> DemoResult:
     )
 
 
+def _make_tshirt_cloth(name: str, color: tuple[float, float, float, float]) -> bpy.types.Object:
+    x_segments = 28
+    y_segments = 28
+    width = 2.2
+    height = 2.0
+    x_values = [-width * 0.5 + width * index / x_segments for index in range(x_segments + 1)]
+    y_values = [-height * 0.5 + height * index / y_segments for index in range(y_segments + 1)]
+
+    def _inside(center_x: float, center_y: float) -> bool:
+        torso = abs(center_x) <= 0.48 and center_y <= 0.28
+        sleeves = abs(center_x) <= 0.94 and 0.02 <= center_y <= 0.62
+        shoulders = abs(center_x) <= 0.62 and 0.28 <= center_y <= 0.86
+        neck = center_y >= 0.54 and (center_x ** 2 + (center_y - 0.72) ** 2) <= 0.05
+        return (torso or sleeves or shoulders) and not neck
+
+    used: dict[tuple[int, int], int] = {}
+    vertices: list[tuple[float, float, float]] = []
+    faces: list[tuple[int, int, int, int]] = []
+
+    def _index(ix: int, iy: int) -> int:
+        key = (ix, iy)
+        existing = used.get(key)
+        if existing is not None:
+            return existing
+        new_index = len(vertices)
+        used[key] = new_index
+        vertices.append((x_values[ix], y_values[iy], 0.0))
+        return new_index
+
+    for iy in range(y_segments):
+        for ix in range(x_segments):
+            center_x = (x_values[ix] + x_values[ix + 1]) * 0.5
+            center_y = (y_values[iy] + y_values[iy + 1]) * 0.5
+            if not _inside(center_x, center_y):
+                continue
+            faces.append(
+                (
+                    _index(ix, iy),
+                    _index(ix + 1, iy),
+                    _index(ix + 1, iy + 1),
+                    _index(ix, iy + 1),
+                )
+            )
+
+    mesh = bpy.data.meshes.new(f"{name}_Mesh")
+    mesh.from_pydata(vertices, [], faces)
+    mesh.update()
+    obj = bpy.data.objects.new(name, mesh)
+    obj.location = (0.0, 0.0, 2.7)
+    obj.rotation_euler = (0.0, 0.0, math.radians(12.0))
+    obj.data.materials.append(_material(f"{name}_Mat", color))
+    bpy.context.scene.collection.objects.link(obj)
+    _beautify_cloth(obj)
+    return obj
+
+
+def _make_torso_collider() -> bpy.types.Collection:
+    torso_mat = _material("SSBL_Demo_Torso_Mat", (0.20, 0.22, 0.26, 1.0))
+    neck_mat = _material("SSBL_Demo_Neck_Mat", (0.28, 0.30, 0.34, 1.0))
+
+    bpy.ops.mesh.primitive_uv_sphere_add(segments=28, ring_count=16, radius=0.72, location=(0.0, 0.0, 1.14))
+    torso = bpy.context.object
+    torso.name = "SSBL_Demo_Torso"
+    torso.scale = (0.95, 0.72, 1.28)
+    torso.data.materials.append(torso_mat)
+
+    bpy.ops.mesh.primitive_uv_sphere_add(segments=20, ring_count=10, radius=0.22, location=(0.0, 0.0, 2.1))
+    neck = bpy.context.object
+    neck.name = "SSBL_Demo_Neck"
+    neck.scale = (0.72, 0.72, 1.05)
+    neck.data.materials.append(neck_mat)
+
+    collection = bpy.data.collections.new("SSBL_Demo_Torso_Collider_Collection")
+    bpy.context.scene.collection.children.link(collection)
+    for obj in (torso, neck):
+        try:
+            bpy.context.scene.collection.objects.unlink(obj)
+        except Exception:
+            pass
+        collection.objects.link(obj)
+    return collection
+
+
+def _record_tshirt_drape() -> DemoResult:
+    name = "05_tshirt_drape_realtime"
+    title = "SSBL realtime T-shirt drop - body contact drape"
+    keywords = [
+        "T-Shirt Drape",
+        "Body Collision",
+        "Natural Wrinkles",
+    ]
+    frame_count = 60
+    _clear_scene()
+    _case_dir, frames_dir, video_path = _ensure_output_dir(name)
+    scene = bpy.context.scene
+    scene.frame_start = 1
+    scene.frame_end = frame_count + 4
+    scene.frame_set(1)
+    camera = _configure_scene_render(
+        scene,
+        camera_location=(3.6, -4.5, 2.95),
+        target=(0.0, 0.0, 1.42),
+        ortho_scale=4.2,
+    )
+    overlay = _create_overlay(scene, camera, title)
+
+    collider_collection = _make_torso_collider()
+    cloth = _make_tshirt_cloth("SSBL_Demo_Tshirt", (0.93, 0.22, 0.18, 1.0))
+    _configure_collision_settings(cloth.ssbl_cloth, frame_count=frame_count)
+    cloth.ssbl_cloth.gravity = (0.0, 0.0, -9.8)
+    cloth.ssbl_cloth.self_collision = True
+    cloth.ssbl_cloth.self_collision_mode = "fast"
+    cloth.ssbl_cloth.self_collision_interval = 1
+    cloth.ssbl_cloth.max_self_collision_neighbors = 48
+    cloth.ssbl_cloth.static_collider_collection = collider_collection
+    cloth.ssbl_cloth.damping = 0.992
+    cloth.ssbl_cloth.collision_margin = 0.026
+    cloth.ssbl_cloth.cloth_thickness = 0.028
+    cloth.ssbl_cloth.substeps = 10
+    cloth.ssbl_cloth.iterations = 2
+
+    before = _mesh_snapshot(cloth)
+    bpy.ops.object.select_all(action="DESELECT")
+    cloth.select_set(True)
+    bpy.context.view_layer.objects.active = cloth
+    session = ssbl.solver.start_preview(bpy.context, cloth)
+
+    step_ms_samples: list[float] = []
+    frame_paths: list[str] = []
+    finite = True
+    simulation_elapsed = 0.0
+    max_static_collision_ms = 0.0
+    min_cloth_z = float("inf")
+    max_x_span = 0.0
+
+    for frame in range(0, frame_count + 1):
+        last_ms = 0.0
+        native_ms = 0.0
+        diag = ssbl.solver.session_diagnostics(cloth)
+        if frame > 0:
+            started = time.perf_counter()
+            scene.frame_set(frame)
+            ssbl.solver.step_preview(bpy.context, cloth.name)
+            elapsed = time.perf_counter() - started
+            simulation_elapsed += elapsed
+            last_ms = elapsed * 1000.0
+            diag = ssbl.solver.session_diagnostics(cloth)
+            native_ms = float(diag.step_ms)
+            step_ms_samples.append(last_ms)
+        finite = finite and _finite_mesh(cloth) and bool(diag.finite)
+        positions = np.asarray(session.slots[cloth.name].current_positions_world, dtype=np.float64)
+        if len(positions):
+            min_cloth_z = min(min_cloth_z, float(np.min(positions[:, 2])))
+            max_x_span = max(max_x_span, float(np.max(positions[:, 0]) - np.min(positions[:, 0])))
+        max_static_collision_ms = max(max_static_collision_ms, float(diag.static_collision_ms))
+        avg_fps = len(step_ms_samples) / max(simulation_elapsed, 1.0e-9)
+        _update_overlay(
+            overlay,
+            frame=frame,
+            total_frames=frame_count,
+            average_fps=avg_fps,
+            last_step_ms=last_ms,
+            native_ms=native_ms,
+            note=_keyword_line(*keywords),
+        )
+        frame_paths.append(_render_frame(scene, frames_dir, frame))
+
+    ssbl.solver.request_stop(cloth)
+    restore_delta = _mesh_delta(cloth, before)
+    _encode_video(
+        frames_dir,
+        video_path,
+        [
+            title,
+            _metrics_overlay(step_ms_samples, simulation_elapsed),
+            _keyword_line(*keywords),
+        ],
+    )
+    return _summarize_demo(
+        name=name,
+        title=title,
+        source_repo=SOURCE_DIFFCLOTH,
+        source_scene="DiffCloth T-shirt / sphere family adapted to a torso drape shot",
+        keywords=keywords,
+        video_path=video_path,
+        frames_dir=frames_dir,
+        frame_paths=frame_paths,
+        step_ms_samples=step_ms_samples,
+        simulation_elapsed=simulation_elapsed,
+        finite=finite,
+        restore_delta=restore_delta,
+        metrics={
+            "slots": len(session.slots),
+            "max_static_collision_ms": max_static_collision_ms,
+            "min_cloth_z": min_cloth_z,
+            "max_x_span": max_x_span,
+        },
+    )
+
+
 def _make_contact_sheet(results: list[DemoResult]) -> str:
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
         raise RuntimeError("ffmpeg was not found in PATH")
+    columns = 3
+    rows = max(1, int(math.ceil((len(results) * 3) / columns)))
     sheet_frames = OUTPUT_ROOT / "contact_sheet_frames"
     sheet_frames.mkdir(parents=True, exist_ok=True)
     for old in sheet_frames.glob("frame_*.*"):
@@ -1181,7 +1682,7 @@ def _make_contact_sheet(results: list[DemoResult]) -> str:
             "-i",
             str(sheet_frames / "frame_%04d.jpg"),
             "-vf",
-            "scale=320:180,tile=3x4",
+            f"scale=320:180,tile={columns}x{rows}",
             "-frames:v",
             "1",
             str(contact_sheet),
@@ -1203,10 +1704,11 @@ def main() -> None:
     started = time.perf_counter()
     try:
         for record in (
+            _record_force_field_tuning,
             _record_wring_towel,
             _record_multicloth_contact,
             _record_object_collision_suite,
-            _record_force_field_tuning,
+            _record_tshirt_drape,
         ):
             result = record()
             results.append(result)
@@ -1221,8 +1723,8 @@ def main() -> None:
         summary_path = OUTPUT_ROOT / "summary.json"
         summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
         print("SSBL_REALTIME_DEMO_PACK", json.dumps(summary, ensure_ascii=False, sort_keys=True))
-        if len(results) != 4 or not all(result.validation_passed for result in results):
-            raise RuntimeError("Realtime demo pack did not generate all four validated videos")
+        if len(results) != 5 or not all(result.validation_passed for result in results):
+            raise RuntimeError("Realtime demo pack did not generate all five validated videos")
     finally:
         try:
             ssbl.solver.cleanup_all_sessions()
