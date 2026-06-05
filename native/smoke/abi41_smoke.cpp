@@ -875,6 +875,218 @@ int run_hard_stretch_optimization_smoke() {
     return 0;
 }
 
+int run_tack_bending_smoke() {
+    {
+        std::vector<float> positions = {
+            0.0f, 0.0f, 0.0f,
+            2.0f, 0.0f, 0.0f,
+        };
+        std::vector<float> inv_mass = {0.0f, 1.0f};
+        std::vector<int> lra_edges = {0, 1};
+        std::vector<float> lra_rest = {0.50f};
+
+        SsblXpbdConfig cfg{};
+        cfg.vertex_count = 2;
+        cfg.lra_count = 1;
+        cfg.dt = 1.0f / 60.0f;
+        cfg.damping = 1.0f;
+        cfg.lra_compliance = 1.0e-9f;
+
+        SsblXpbdMesh mesh{};
+        mesh.positions = positions.data();
+        mesh.inv_mass = inv_mass.data();
+        mesh.lra_edges = lra_edges.data();
+        mesh.lra_rest_lengths = lra_rest.data();
+
+        void* solver = ssbl_create_solver(&cfg, &mesh);
+        if (!solver) {
+            std::fprintf(stderr, "SSBL_ABI41_TACK_BENDING_ERROR LRA create: %s\n", ssbl_last_error());
+            return 110;
+        }
+        int pins[] = {0};
+        float pin_positions[] = {0.0f, 0.0f, 0.0f};
+        if (!ssbl_update_pin_targets(solver, pins, pin_positions, 1)) {
+            std::fprintf(stderr, "SSBL_ABI41_TACK_BENDING_ERROR LRA pins: %s\n", ssbl_last_error());
+            ssbl_destroy_solver(solver);
+            return 111;
+        }
+        if (!ssbl_step_solver_ex(solver, 1, 1, 1, 1)) {
+            std::fprintf(stderr, "SSBL_ABI41_TACK_BENDING_ERROR LRA step: %s\n", ssbl_last_error());
+            ssbl_destroy_solver(solver);
+            return 112;
+        }
+        std::vector<float> out(positions.size(), 0.0f);
+        if (!ssbl_download_positions(solver, out.data(), static_cast<int>(out.size()))) {
+            std::fprintf(stderr, "SSBL_ABI41_TACK_BENDING_ERROR LRA download: %s\n", ssbl_last_error());
+            ssbl_destroy_solver(solver);
+            return 113;
+        }
+        SsblXpbdDiagnostics diag{};
+        if (!ssbl_get_diagnostics(solver, &diag)) {
+            std::fprintf(stderr, "SSBL_ABI41_TACK_BENDING_ERROR LRA diagnostics: %s\n", ssbl_last_error());
+            ssbl_destroy_solver(solver);
+            return 114;
+        }
+        ssbl_destroy_solver(solver);
+        if (!finite_positions(out) || !diag.finite_flag || diag.abi41_lra_tack_count <= 0 || !(out[3] < positions[3] - 0.005f)) {
+            std::fprintf(
+                stderr,
+                "SSBL_ABI41_TACK_BENDING_ERROR LRA mismatch x=%.6f count=%lld finite=%d guarded=%lld\n",
+                out[3],
+                diag.abi41_lra_tack_count,
+                diag.finite_flag,
+                diag.abi41_tack_jitter_guarded
+            );
+            return 115;
+        }
+    }
+
+    {
+        std::vector<float> positions = {
+            1.0f, 0.0f, 0.0f,
+            2.0f, 0.0f, 0.0f,
+        };
+        std::vector<float> inv_mass = {0.0f, 1.0f};
+        std::vector<int> lra_edges = {0, 1};
+        std::vector<float> lra_rest = {0.25f};
+
+        SsblXpbdConfig cfg{};
+        cfg.vertex_count = 2;
+        cfg.lra_count = 1;
+        cfg.dt = 1.0f / 60.0f;
+        cfg.damping = 1.0f;
+        cfg.lra_compliance = 1.0e-9f;
+
+        SsblXpbdMesh mesh{};
+        mesh.positions = positions.data();
+        mesh.inv_mass = inv_mass.data();
+        mesh.lra_edges = lra_edges.data();
+        mesh.lra_rest_lengths = lra_rest.data();
+
+        void* solver = ssbl_create_solver(&cfg, &mesh);
+        if (!solver) {
+            std::fprintf(stderr, "SSBL_ABI41_TACK_BENDING_ERROR animated create: %s\n", ssbl_last_error());
+            return 116;
+        }
+        int pins[] = {0};
+        float moved_pin[] = {1.0f, 0.0f, 0.0f};
+        if (!ssbl_update_pin_targets(solver, pins, moved_pin, 1)) {
+            std::fprintf(stderr, "SSBL_ABI41_TACK_BENDING_ERROR animated pins: %s\n", ssbl_last_error());
+            ssbl_destroy_solver(solver);
+            return 117;
+        }
+        if (!ssbl_step_solver_ex(solver, 1, 1, 1, 1)) {
+            std::fprintf(stderr, "SSBL_ABI41_TACK_BENDING_ERROR animated step: %s\n", ssbl_last_error());
+            ssbl_destroy_solver(solver);
+            return 118;
+        }
+        std::vector<float> out(positions.size(), 0.0f);
+        if (!ssbl_download_positions(solver, out.data(), static_cast<int>(out.size()))) {
+            std::fprintf(stderr, "SSBL_ABI41_TACK_BENDING_ERROR animated download: %s\n", ssbl_last_error());
+            ssbl_destroy_solver(solver);
+            return 119;
+        }
+        SsblXpbdDiagnostics diag{};
+        if (!ssbl_get_diagnostics(solver, &diag)) {
+            std::fprintf(stderr, "SSBL_ABI41_TACK_BENDING_ERROR animated diagnostics: %s\n", ssbl_last_error());
+            ssbl_destroy_solver(solver);
+            return 120;
+        }
+        ssbl_destroy_solver(solver);
+        if (!finite_positions(out) || !diag.finite_flag || diag.abi41_lra_tack_count <= 0 || !(out[3] < positions[3] - 0.005f)) {
+            std::fprintf(
+                stderr,
+                "SSBL_ABI41_TACK_BENDING_ERROR animated mismatch pin=%.6f dynamic=%.6f count=%lld\n",
+                out[0],
+                out[3],
+                diag.abi41_lra_tack_count
+            );
+            return 121;
+        }
+    }
+
+    {
+        std::vector<float> rest_positions = {
+            0.0f, 0.0f, 0.0f,
+            1.0f, 0.0f, 0.0f,
+            0.0f, 1.0f, 0.0f,
+            1.0f, 1.0f, 0.0f,
+        };
+        std::vector<float> folded_positions = rest_positions;
+        folded_positions[11] = 1.0f;
+        std::vector<float> inv_mass = {0.0f, 1.0f, 1.0f, 1.0f};
+        std::vector<int> triangles = {0, 1, 2, 1, 3, 2};
+        std::vector<int> bends = {0, 3};
+        const float rest_diag = std::sqrt(2.0f);
+        std::vector<float> bend_rest = {rest_diag};
+
+        SsblXpbdConfig cfg{};
+        cfg.vertex_count = 4;
+        cfg.bend_count = 1;
+        cfg.triangle_count = 2;
+        cfg.dt = 1.0f / 60.0f;
+        cfg.damping = 1.0f;
+        cfg.bend_compliance = 1.0e-9f;
+
+        SsblXpbdMesh mesh{};
+        mesh.positions = rest_positions.data();
+        mesh.inv_mass = inv_mass.data();
+        mesh.bends = bends.data();
+        mesh.bend_rest_lengths = bend_rest.data();
+        mesh.triangles = triangles.data();
+
+        void* solver = ssbl_create_solver(&cfg, &mesh);
+        if (!solver) {
+            std::fprintf(stderr, "SSBL_ABI41_TACK_BENDING_ERROR bend create: %s\n", ssbl_last_error());
+            return 122;
+        }
+        if (!ssbl_update_positions(solver, folded_positions.data(), static_cast<int>(folded_positions.size()))) {
+            std::fprintf(stderr, "SSBL_ABI41_TACK_BENDING_ERROR bend upload: %s\n", ssbl_last_error());
+            ssbl_destroy_solver(solver);
+            return 123;
+        }
+        const float initial_error = std::fabs(distance3(folded_positions, 0, 3) - rest_diag);
+        if (!ssbl_step_solver_ex(solver, 1, 1, 1, 1)) {
+            std::fprintf(stderr, "SSBL_ABI41_TACK_BENDING_ERROR bend step: %s\n", ssbl_last_error());
+            ssbl_destroy_solver(solver);
+            return 124;
+        }
+        std::vector<float> out(folded_positions.size(), 0.0f);
+        if (!ssbl_download_positions(solver, out.data(), static_cast<int>(out.size()))) {
+            std::fprintf(stderr, "SSBL_ABI41_TACK_BENDING_ERROR bend download: %s\n", ssbl_last_error());
+            ssbl_destroy_solver(solver);
+            return 125;
+        }
+        SsblXpbdDiagnostics diag{};
+        if (!ssbl_get_diagnostics(solver, &diag)) {
+            std::fprintf(stderr, "SSBL_ABI41_TACK_BENDING_ERROR bend diagnostics: %s\n", ssbl_last_error());
+            ssbl_destroy_solver(solver);
+            return 126;
+        }
+        ssbl_destroy_solver(solver);
+        const float final_error = std::fabs(distance3(out, 0, 3) - rest_diag);
+        if (!finite_positions(out)
+            || !diag.finite_flag
+            || diag.abi41_bending_texture_ready != 1
+            || diag.abi41_bending_wing_count <= 0
+            || !(final_error < initial_error)) {
+            std::fprintf(
+                stderr,
+                "SSBL_ABI41_TACK_BENDING_ERROR bend mismatch err=%.6f->%.6f wings=%lld tex=%lld guarded=%lld\n",
+                initial_error,
+                final_error,
+                diag.abi41_bending_wing_count,
+                diag.abi41_bending_texture_ready,
+                diag.abi41_bending_guarded
+            );
+            return 127;
+        }
+    }
+
+    std::printf("SSBL_ABI41_TACK_BENDING_OK lra=1 animated=1 bending=1\n");
+    return 0;
+}
+
 int run_overpressure_smoke() {
     auto run_case = [](bool reversed, float* out_average_z) -> int {
         std::vector<float> positions = {
@@ -969,6 +1181,10 @@ int main() {
     int pressure_result = run_overpressure_smoke();
     if (pressure_result != 0) {
         return pressure_result;
+    }
+    int tack_bending_result = run_tack_bending_smoke();
+    if (tack_bending_result != 0) {
+        return tack_bending_result;
     }
     int static_sdf_result = run_static_sdf_smoke();
     if (static_sdf_result != 0) {

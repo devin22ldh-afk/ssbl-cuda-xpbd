@@ -304,6 +304,11 @@ def record_viewport_tag_ms(object_name: str, elapsed_ms: float) -> None:
         abi41_pcg_initial_residual=diag.abi41_pcg_initial_residual,
         abi41_pcg_final_residual=diag.abi41_pcg_final_residual,
         abi41_pcg_max_delta=diag.abi41_pcg_max_delta,
+        abi41_lra_tack_count=diag.abi41_lra_tack_count,
+        abi41_bending_wing_count=diag.abi41_bending_wing_count,
+        abi41_bending_texture_ready=diag.abi41_bending_texture_ready,
+        abi41_tack_jitter_guarded=diag.abi41_tack_jitter_guarded,
+        abi41_bending_guarded=diag.abi41_bending_guarded,
         frame_ms=diag.frame_ms,
         frame_set_ms=diag.frame_set_ms,
         input_refresh_ms=diag.input_refresh_ms,
@@ -2258,6 +2263,11 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
     abi41_pcg_initial_residual = 0.0
     abi41_pcg_final_residual = 0.0
     abi41_pcg_max_delta = 0.0
+    abi41_lra_tack_count = 0
+    abi41_bending_wing_count = 0
+    abi41_bending_texture_ready = 0
+    abi41_tack_jitter_guarded = 0
+    abi41_bending_guarded = 0
     finite = True
     writeback_performed = False
     diag_started = time.perf_counter()
@@ -2369,6 +2379,11 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
         abi41_pcg_initial_residual = max(abi41_pcg_initial_residual, float(diag.abi41_pcg_initial_residual))
         abi41_pcg_final_residual = max(abi41_pcg_final_residual, float(diag.abi41_pcg_final_residual))
         abi41_pcg_max_delta = max(abi41_pcg_max_delta, float(diag.abi41_pcg_max_delta))
+        abi41_lra_tack_count += int(diag.abi41_lra_tack_count)
+        abi41_bending_wing_count += int(diag.abi41_bending_wing_count)
+        abi41_bending_texture_ready = max(abi41_bending_texture_ready, int(diag.abi41_bending_texture_ready))
+        abi41_tack_jitter_guarded += int(diag.abi41_tack_jitter_guarded)
+        abi41_bending_guarded += int(diag.abi41_bending_guarded)
         finite = finite and bool(diag.finite)
         writeback_performed = writeback_performed or bool(diag.writeback_performed)
         if diag.min_gap is not None:
@@ -2483,6 +2498,11 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
         abi41_pcg_initial_residual=abi41_pcg_initial_residual,
         abi41_pcg_final_residual=abi41_pcg_final_residual,
         abi41_pcg_max_delta=abi41_pcg_max_delta,
+        abi41_lra_tack_count=abi41_lra_tack_count,
+        abi41_bending_wing_count=abi41_bending_wing_count,
+        abi41_bending_texture_ready=abi41_bending_texture_ready,
+        abi41_tack_jitter_guarded=abi41_tack_jitter_guarded,
+        abi41_bending_guarded=abi41_bending_guarded,
         finite=finite,
         frame_ms=perf.frame_ms if perf is not None else 0.0,
         frame_set_ms=perf.frame_set_ms if perf is not None else 0.0,

@@ -301,6 +301,11 @@ def main() -> None:
     max_dynamic_particle_count = 0
     max_dynamic_particle_contacts = 0
     max_dynamic_particle_overflow = 0
+    total_abi41_lra_tack_count = 0
+    total_abi41_bending_wing_count = 0
+    max_abi41_bending_texture_ready = 0
+    total_abi41_tack_jitter_guarded = 0
+    total_abi41_bending_guarded = 0
     min_aabb_distance = float("inf")
     min_surface_distance = float("inf")
     max_near_contact_vertices = 0
@@ -319,6 +324,14 @@ def main() -> None:
         max_dynamic_particle_count = max(max_dynamic_particle_count, int(diag.dynamic_particle_count))
         max_dynamic_particle_contacts = max(max_dynamic_particle_contacts, int(diag.dynamic_particle_contacts))
         max_dynamic_particle_overflow = max(max_dynamic_particle_overflow, int(diag.dynamic_particle_overflow))
+        total_abi41_lra_tack_count += int(getattr(diag, "abi41_lra_tack_count", 0))
+        total_abi41_bending_wing_count += int(getattr(diag, "abi41_bending_wing_count", 0))
+        max_abi41_bending_texture_ready = max(
+            max_abi41_bending_texture_ready,
+            int(getattr(diag, "abi41_bending_texture_ready", 0)),
+        )
+        total_abi41_tack_jitter_guarded += int(getattr(diag, "abi41_tack_jitter_guarded", 0))
+        total_abi41_bending_guarded += int(getattr(diag, "abi41_bending_guarded", 0))
         for slot in session.slots.values():
             max_edge_ratio = max(max_edge_ratio, _slot_max_edge_ratio(slot))
         active_slot = session.slots.get(active_obj.name)
@@ -372,6 +385,11 @@ def main() -> None:
             "dynamic_particle_collision_ms": float(diag.dynamic_particle_collision_ms),
             "resolved_contacts": int(diag.resolved_contacts),
             "candidate_count": int(diag.candidate_count),
+            "abi41_lra_tack_count": int(getattr(diag, "abi41_lra_tack_count", 0)),
+            "abi41_bending_wing_count": int(getattr(diag, "abi41_bending_wing_count", 0)),
+            "abi41_bending_texture_ready": int(getattr(diag, "abi41_bending_texture_ready", 0)),
+            "abi41_tack_jitter_guarded": int(getattr(diag, "abi41_tack_jitter_guarded", 0)),
+            "abi41_bending_guarded": int(getattr(diag, "abi41_bending_guarded", 0)),
             "min_gap": None if diag.min_gap is None else float(diag.min_gap),
             "aabb_distance": aabb_distance,
             "min_surface_distance": surface_metrics["min_surface_distance"],
@@ -414,6 +432,11 @@ def main() -> None:
         "max_dynamic_particle_count": int(max_dynamic_particle_count),
         "max_dynamic_particle_contacts": int(max_dynamic_particle_contacts),
         "max_dynamic_particle_overflow": int(max_dynamic_particle_overflow),
+        "total_abi41_lra_tack_count": int(total_abi41_lra_tack_count),
+        "total_abi41_bending_wing_count": int(total_abi41_bending_wing_count),
+        "max_abi41_bending_texture_ready": int(max_abi41_bending_texture_ready),
+        "total_abi41_tack_jitter_guarded": int(total_abi41_tack_jitter_guarded),
+        "total_abi41_bending_guarded": int(total_abi41_bending_guarded),
         "finite": bool(finite),
         "stopped": bool(stopped),
         "restore_delta_cube": _restore_mesh_delta(cube, before_cube),
@@ -422,6 +445,11 @@ def main() -> None:
         "final_dynamic_particle_count": int(final_diag.dynamic_particle_count),
         "final_dynamic_particle_contacts": int(final_diag.dynamic_particle_contacts),
         "final_dynamic_particle_overflow": int(final_diag.dynamic_particle_overflow),
+        "final_abi41_lra_tack_count": int(getattr(final_diag, "abi41_lra_tack_count", 0)),
+        "final_abi41_bending_wing_count": int(getattr(final_diag, "abi41_bending_wing_count", 0)),
+        "final_abi41_bending_texture_ready": int(getattr(final_diag, "abi41_bending_texture_ready", 0)),
+        "final_abi41_tack_jitter_guarded": int(getattr(final_diag, "abi41_tack_jitter_guarded", 0)),
+        "final_abi41_bending_guarded": int(getattr(final_diag, "abi41_bending_guarded", 0)),
         "final_analytic_collision_ms": float(final_diag.analytic_collision_ms),
         "final_dynamic_collision_ms": float(final_diag.dynamic_collision_ms),
         "final_dynamic_particle_collision_ms": float(final_diag.dynamic_particle_collision_ms),

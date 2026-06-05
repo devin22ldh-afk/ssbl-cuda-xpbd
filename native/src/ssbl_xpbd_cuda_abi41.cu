@@ -50,8 +50,14 @@ constexpr int kAbi41CountTrianglePairOverflow = 8;
 constexpr int kAbi41CountSelfCandidates = 9;
 constexpr int kAbi41CountSelfOverflow = 10;
 constexpr int kAbi41CountStaticSdfContacts = 11;
-constexpr int kAbi41CountSlots = 12;
+constexpr int kAbi41CountLraTacks = 12;
+constexpr int kAbi41CountBendingWings = 13;
+constexpr int kAbi41CountTackGuards = 14;
+constexpr int kAbi41CountBendingGuards = 15;
+constexpr int kAbi41CountSlots = 16;
 constexpr float kAbi41SpringRelaxation = 0.18f;
+constexpr float kAbi41BendRelaxation = 0.10f;
+constexpr float kAbi41TackRelaxation = 0.35f;
 constexpr float kAbi41SelfAveragingClampScale = 0.35f;
 constexpr int kAbi41PcgMaxIterations = 1;
 constexpr int kAbi41PcgReductionDAD = 0;
@@ -114,6 +120,13 @@ struct TriangleProximityPair {
     Vec3 delta;
 };
 
+struct ReconPair {
+    int x;
+    int y;
+};
+
+static_assert(sizeof(ReconPair) == 8, "ReconPair must match ABI int2 stride.");
+
 struct ReconCSRTextureObject {
     cudaTextureObject_t tex = 0;
 
@@ -131,6 +144,19 @@ struct ReconCSRTextureObject {
     }
 };
 
+struct ReconBendingWingTextureObject {
+    cudaTextureObject_t index_tex = 0;
+    cudaTextureObject_t param_tex = 0;
+
+    __device__ __forceinline__ uint4 getIndices(unsigned int index) const {
+        return tex1Dfetch<uint4>(index_tex, static_cast<int>(index));
+    }
+
+    __device__ __forceinline__ float2 getParams(unsigned int index) const {
+        return tex1Dfetch<float2>(param_tex, static_cast<int>(index));
+    }
+};
+
 struct Abi41Solver {
     SsblXpbdConfig cfg{};
     Vec3* pos = nullptr;
@@ -140,6 +166,10 @@ struct Abi41Solver {
     float* inv_mass = nullptr;
     unsigned int* state_flags = nullptr;
     ReconSpring* springs = nullptr;
+    ReconPair* bends = nullptr;
+    float* bend_rest = nullptr;
+    ReconPair* lra_edges = nullptr;
+    float* lra_rest = nullptr;
     ReconTriangle* triangles = nullptr;
     int* surface_vertex_offsets = nullptr;
     int* surface_vertex_triangles = nullptr;
@@ -238,6 +268,12 @@ struct Abi41Solver {
     cudaTextureObject_t pcg_offdiag_texture = 0;
     int pcg_csr_nnz = 0;
     int pcg_texture_ready = 0;
+    uint4* bending_wing_indices = nullptr;
+    float2* bending_wing_params = nullptr;
+    cudaTextureObject_t bending_wing_index_texture = 0;
+    cudaTextureObject_t bending_wing_param_texture = 0;
+    int bending_wing_count = 0;
+    int bending_texture_ready = 0;
     SsblXpbdRuntimeColliders runtime_colliders{};
     unsigned long long* abi41_counts = nullptr;
     SsblXpbdDiagnostics diag{};
@@ -304,9 +340,9 @@ __host__ __device__ float dot(Vec3 a, Vec3 b) {
 
 __host__ __device__ Vec3 cross(Vec3 a, Vec3 b) {
     return make_vec3(
-        a.y * b.z - a.z * b.y,
-        a.z * b.x - a.x * b.z,
-        a.x * b.y - a.y * b.x
+        fma_rn(a.y, b.z, -(a.z * b.y)),
+        fma_rn(a.z, b.x, -(a.x * b.z)),
+        fma_rn(a.x, b.y, -(a.y * b.x))
     );
 }
 
@@ -332,6 +368,12 @@ __device__ void atomic_add(Vec3* dst, Vec3 value) {
     atomicAdd(&dst->x, value.x);
     atomicAdd(&dst->y, value.y);
     atomicAdd(&dst->z, value.z);
+}
+
+__device__ void abi41_count(Abi41Solver solver, int slot) {
+    if (solver.abi41_counts && slot >= 0 && slot < kAbi41CountSlots) {
+        atomicAdd(&solver.abi41_counts[slot], 1ull);
+    }
 }
 
 __device__ float length(Vec3 value) {
@@ -1082,6 +1124,226 @@ __global__ void abi41_spring_project_kernel(Abi41Solver solver, float dt) {
     }
     if (wj > 0.0f) {
         atomic_add(&solver.pos[j], mul(corr, wj));
+    }
+}
+
+__global__ void abi41_lra_tack_project_kernel(Abi41Solver solver, float dt) {
+    const int cidx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (cidx >= solver.cfg.lra_count || !solver.lra_edges || !solver.lra_rest) {
+        return;
+    }
+
+    const ReconPair pair = solver.lra_edges[cidx];
+    const int i = pair.x;
+    const int j = pair.y;
+    if (i < 0 || j < 0 || i >= solver.cfg.vertex_count || j >= solver.cfg.vertex_count || i == j) {
+        abi41_count(solver, kAbi41CountTackGuards);
+        return;
+    }
+
+    float wi = solver.inv_mass[i];
+    float wj = solver.inv_mass[j];
+    if (solver.state_flags) {
+        if ((solver.state_flags[i] & ssbl_abi41::kPinnedOrKinematicFlag) != 0u) {
+            wi = 0.0f;
+        }
+        if ((solver.state_flags[j] & ssbl_abi41::kPinnedOrKinematicFlag) != 0u) {
+            wj = 0.0f;
+        }
+    }
+    const float weight = wi + wj;
+    if (!isfinite(weight) || weight <= 0.0f) {
+        abi41_count(solver, kAbi41CountTackGuards);
+        return;
+    }
+
+    const Vec3 anchor = solver.pos[i];
+    const Vec3 dynamic = solver.pos[j];
+    if (!finite_vec(anchor) || !finite_vec(dynamic)) {
+        abi41_count(solver, kAbi41CountTackGuards);
+        return;
+    }
+    Vec3 dx = sub(dynamic, anchor);
+    const float len_sq = fma_rn(dx.x, dx.x, fma_rn(dx.y, dx.y, dx.z * dx.z));
+    const float rest = solver.lra_rest[cidx];
+    if (!isfinite(len_sq) || len_sq <= 1.0e-10f || !isfinite(rest) || rest <= kEps) {
+        abi41_count(solver, kAbi41CountTackGuards);
+        return;
+    }
+    const float inv_len = rsqrtf(len_sq);
+    const float len = len_sq * inv_len;
+    const float stretch = len - rest;
+    if (!isfinite(stretch) || stretch <= 0.0f) {
+        return;
+    }
+    dx = mul(dx, inv_len);
+
+    const float base_compliance = fmaxf(solver.cfg.lra_compliance, 1.0e-12f);
+    const float tack_stiffness = (1.0f / base_compliance) * 500000.0f;
+    const float effective_alpha = (base_compliance / 500000.0f) / fmaxf(dt * dt, kEps);
+    const float stiffness_weight = tack_stiffness / fmaxf(tack_stiffness + 500000.0f, 1.0f);
+    const float dlambda = -stretch / fmaxf(weight + effective_alpha, kEps);
+    Vec3 corr = mul(dx, kAbi41TackRelaxation * stiffness_weight * dlambda);
+    if (!finite_vec(corr)) {
+        abi41_count(solver, kAbi41CountTackGuards);
+        return;
+    }
+
+    const float corr_len = length(corr);
+    const float max_corr = fmaxf(
+        5.0e-4f,
+        fminf(fmaxf(rest, solver.cfg.cloth_thickness) * 0.20f, 0.035f)
+    );
+    if (!isfinite(corr_len) || corr_len <= 0.0f) {
+        return;
+    }
+    if (corr_len > max_corr) {
+        corr = mul(corr, max_corr / fmaxf(corr_len, kEps));
+        abi41_count(solver, kAbi41CountTackGuards);
+    }
+    if (wi > 0.0f) {
+        atomic_add(&solver.pos[i], mul(corr, -wi));
+    }
+    if (wj > 0.0f) {
+        atomic_add(&solver.pos[j], mul(corr, wj));
+    }
+    abi41_count(solver, kAbi41CountLraTacks);
+}
+
+__global__ void abi41_bend_project_kernel(Abi41Solver solver, float dt) {
+    const int bidx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (bidx >= solver.cfg.bend_count || !solver.bends || !solver.bend_rest) {
+        return;
+    }
+    const ReconPair pair = solver.bends[bidx];
+    const int i = pair.x;
+    const int j = pair.y;
+    if (i < 0 || j < 0 || i >= solver.cfg.vertex_count || j >= solver.cfg.vertex_count || i == j) {
+        abi41_count(solver, kAbi41CountBendingGuards);
+        return;
+    }
+    float wi = solver.inv_mass[i];
+    float wj = solver.inv_mass[j];
+    if (solver.state_flags) {
+        if ((solver.state_flags[i] & ssbl_abi41::kPinnedOrKinematicFlag) != 0u) {
+            wi = 0.0f;
+        }
+        if ((solver.state_flags[j] & ssbl_abi41::kPinnedOrKinematicFlag) != 0u) {
+            wj = 0.0f;
+        }
+    }
+    const float weight = wi + wj;
+    if (!isfinite(weight) || weight <= 0.0f) {
+        return;
+    }
+    const float rest = solver.bend_rest[bidx];
+    if (!isfinite(rest) || rest <= kEps) {
+        abi41_count(solver, kAbi41CountBendingGuards);
+        return;
+    }
+    const Vec3 pi = solver.pos[i];
+    const Vec3 pj = solver.pos[j];
+    if (!finite_vec(pi) || !finite_vec(pj)) {
+        abi41_count(solver, kAbi41CountBendingGuards);
+        return;
+    }
+    const Vec3 delta = sub(pj, pi);
+    const float len_sq = fma_rn(delta.x, delta.x, fma_rn(delta.y, delta.y, delta.z * delta.z));
+    if (!isfinite(len_sq) || len_sq <= 1.0e-10f) {
+        abi41_count(solver, kAbi41CountBendingGuards);
+        return;
+    }
+    const float inv_len = rsqrtf(len_sq);
+    const float len = len_sq * inv_len;
+    const float c = len - rest;
+    if (!isfinite(c) || fabsf(c) <= 1.0e-6f) {
+        return;
+    }
+    const float alpha = fmaxf(solver.cfg.bend_compliance, 0.0f) / fmaxf(dt * dt, kEps);
+    const float dlambda = -c / fmaxf(weight + alpha, kEps);
+    Vec3 corr = mul(delta, kAbi41BendRelaxation * dlambda * inv_len);
+    if (!finite_vec(corr)) {
+        abi41_count(solver, kAbi41CountBendingGuards);
+        return;
+    }
+    const float corr_len = length(corr);
+    const float max_corr = fmaxf(
+        2.5e-4f,
+        fminf(fmaxf(rest, solver.cfg.cloth_thickness) * 0.08f, 0.020f)
+    );
+    if (!isfinite(corr_len) || corr_len <= 0.0f) {
+        return;
+    }
+    if (corr_len > max_corr) {
+        corr = mul(corr, max_corr / fmaxf(corr_len, kEps));
+        abi41_count(solver, kAbi41CountBendingGuards);
+    }
+    if (wi > 0.0f) {
+        atomic_add(&solver.pos[i], mul(corr, -wi));
+    }
+    if (wj > 0.0f) {
+        atomic_add(&solver.pos[j], mul(corr, wj));
+    }
+    abi41_count(solver, kAbi41CountBendingWings);
+}
+
+__global__ void abi41_bending_wing_measure_kernel(Abi41Solver solver) {
+    const int widx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (widx >= solver.bending_wing_count
+        || solver.bending_texture_ready == 0
+        || solver.bending_wing_index_texture == 0
+        || solver.bending_wing_param_texture == 0) {
+        return;
+    }
+
+    ReconBendingWingTextureObject texture;
+    texture.index_tex = solver.bending_wing_index_texture;
+    texture.param_tex = solver.bending_wing_param_texture;
+    const uint4 idx = texture.getIndices(static_cast<unsigned int>(widx));
+    const float2 params = texture.getParams(static_cast<unsigned int>(widx));
+    const int i0 = static_cast<int>(idx.x);
+    const int i1 = static_cast<int>(idx.y);
+    const int i2 = static_cast<int>(idx.z);
+    const int i3 = static_cast<int>(idx.w);
+    if (i0 < 0 || i1 < 0 || i2 < 0 || i3 < 0
+        || i0 >= solver.cfg.vertex_count || i1 >= solver.cfg.vertex_count
+        || i2 >= solver.cfg.vertex_count || i3 >= solver.cfg.vertex_count) {
+        abi41_count(solver, kAbi41CountBendingGuards);
+        return;
+    }
+
+    const Vec3 p1 = solver.pos[i0];
+    const Vec3 p2 = solver.pos[i1];
+    const Vec3 p3 = solver.pos[i2];
+    const Vec3 p4 = solver.pos[i3];
+    if (!finite_vec(p1) || !finite_vec(p2) || !finite_vec(p3) || !finite_vec(p4)) {
+        abi41_count(solver, kAbi41CountBendingGuards);
+        return;
+    }
+    const Vec3 e1 = sub(p2, p1);
+    const Vec3 e2 = sub(p3, p1);
+    const Vec3 e3 = sub(p4, p1);
+    Vec3 n1 = cross(e1, e2);
+    Vec3 n2 = cross(e1, e3);
+    const float n1_sq = fma_rn(n1.x, n1.x, fma_rn(n1.y, n1.y, n1.z * n1.z));
+    const float n2_sq = fma_rn(n2.x, n2.x, fma_rn(n2.y, n2.y, n2.z * n2.z));
+    if (!isfinite(n1_sq) || !isfinite(n2_sq) || n1_sq <= 1.0e-12f || n2_sq <= 1.0e-12f) {
+        abi41_count(solver, kAbi41CountBendingGuards);
+        return;
+    }
+    const float inv_len_n1 = rsqrtf(n1_sq);
+    const float inv_len_n2 = rsqrtf(n2_sq);
+    n1 = mul(n1, inv_len_n1);
+    n2 = mul(n2, inv_len_n2);
+    const float d = fminf(1.0f, fmaxf(-1.0f, dot(n1, n2)));
+    const float angle = acosf(d);
+    const float error = angle - params.x;
+    if (!isfinite(error) || !isfinite(params.y)) {
+        abi41_count(solver, kAbi41CountBendingGuards);
+        return;
+    }
+    if (fabsf(error) > 1.0e-5f && params.y > 0.0f) {
+        abi41_count(solver, kAbi41CountBendingWings);
     }
 }
 
@@ -3465,6 +3727,191 @@ void destroy_pcg_texture(Abi41Solver* solver) {
     }
 }
 
+void destroy_bending_textures(Abi41Solver* solver) {
+    if (!solver) {
+        return;
+    }
+    if (solver->bending_wing_index_texture != 0) {
+        cudaDestroyTextureObject(solver->bending_wing_index_texture);
+        solver->bending_wing_index_texture = 0;
+    }
+    if (solver->bending_wing_param_texture != 0) {
+        cudaDestroyTextureObject(solver->bending_wing_param_texture);
+        solver->bending_wing_param_texture = 0;
+    }
+    solver->bending_texture_ready = 0;
+}
+
+template <typename T>
+bool create_linear_texture(T* device_ptr, int count, cudaTextureObject_t* out_texture, const char* label) {
+    if (!out_texture) {
+        return set_error("invalid texture target");
+    }
+    *out_texture = 0;
+    if (!device_ptr || count <= 0) {
+        return true;
+    }
+    cudaResourceDesc resource_desc{};
+    resource_desc.resType = cudaResourceTypeLinear;
+    resource_desc.res.linear.devPtr = device_ptr;
+    resource_desc.res.linear.desc = cudaCreateChannelDesc<T>();
+    resource_desc.res.linear.sizeInBytes = sizeof(T) * static_cast<size_t>(count);
+    cudaTextureDesc texture_desc{};
+    texture_desc.readMode = cudaReadModeElementType;
+    return set_cuda_error(cudaCreateTextureObject(out_texture, &resource_desc, &texture_desc, nullptr), label);
+}
+
+unsigned long long edge_key(int a, int b) {
+    const unsigned int lo = static_cast<unsigned int>(std::min(a, b));
+    const unsigned int hi = static_cast<unsigned int>(std::max(a, b));
+    return (static_cast<unsigned long long>(lo) << 32) | static_cast<unsigned long long>(hi);
+}
+
+float rest_dihedral_angle(
+    const Vec3* rest_positions,
+    int shared0,
+    int shared1,
+    int opposite0,
+    int opposite1,
+    int vertex_count
+) {
+    if (!rest_positions
+        || shared0 < 0 || shared1 < 0 || opposite0 < 0 || opposite1 < 0
+        || shared0 >= vertex_count || shared1 >= vertex_count
+        || opposite0 >= vertex_count || opposite1 >= vertex_count) {
+        return 0.0f;
+    }
+    const Vec3 p1 = rest_positions[shared0];
+    const Vec3 p2 = rest_positions[shared1];
+    const Vec3 p3 = rest_positions[opposite0];
+    const Vec3 p4 = rest_positions[opposite1];
+    const Vec3 e1 = sub(p2, p1);
+    const Vec3 e2 = sub(p3, p1);
+    const Vec3 e3 = sub(p4, p1);
+    Vec3 n1 = cross(e1, e2);
+    Vec3 n2 = cross(e1, e3);
+    const float n1_sq = dot(n1, n1);
+    const float n2_sq = dot(n2, n2);
+    if (!std::isfinite(n1_sq) || !std::isfinite(n2_sq) || n1_sq <= 1.0e-12f || n2_sq <= 1.0e-12f) {
+        return 0.0f;
+    }
+    n1 = mul(n1, 1.0f / std::sqrt(n1_sq));
+    n2 = mul(n2, 1.0f / std::sqrt(n2_sq));
+    const float d = std::max(-1.0f, std::min(1.0f, dot(n1, n2)));
+    return std::acos(d);
+}
+
+bool prepare_bending_wing_buffers(
+    Abi41Solver* solver,
+    const std::vector<ReconTriangle>& triangles,
+    const Vec3* rest_positions
+) {
+    if (!solver) {
+        return set_error("invalid bending wing setup");
+    }
+    destroy_bending_textures(solver);
+    cudaFree(solver->bending_wing_indices);
+    cudaFree(solver->bending_wing_params);
+    solver->bending_wing_indices = nullptr;
+    solver->bending_wing_params = nullptr;
+    solver->bending_wing_count = 0;
+    solver->bending_texture_ready = 0;
+    if (solver->cfg.triangle_count <= 1 || triangles.size() <= 1 || !rest_positions) {
+        return true;
+    }
+
+    struct EdgeOwner {
+        int shared0;
+        int shared1;
+        int opposite;
+    };
+    std::unordered_map<unsigned long long, EdgeOwner> owners;
+    owners.reserve(triangles.size() * 3u);
+    std::vector<uint4> wing_indices;
+    std::vector<float2> wing_params;
+    const int vertex_count = solver->cfg.vertex_count;
+    for (const ReconTriangle& tri : triangles) {
+        const int a = static_cast<int>(tri.v0);
+        const int b = static_cast<int>(tri.v1);
+        const int c = static_cast<int>(tri.v2);
+        const int ids[3] = {a, b, c};
+        if (a < 0 || b < 0 || c < 0 || a >= vertex_count || b >= vertex_count || c >= vertex_count) {
+            continue;
+        }
+        for (int edge = 0; edge < 3; ++edge) {
+            const int x = ids[edge];
+            const int y = ids[(edge + 1) % 3];
+            const int opposite = ids[(edge + 2) % 3];
+            const unsigned long long key = edge_key(x, y);
+            const int shared0 = std::min(x, y);
+            const int shared1 = std::max(x, y);
+            auto it = owners.find(key);
+            if (it == owners.end()) {
+                owners.emplace(key, EdgeOwner{shared0, shared1, opposite});
+                continue;
+            }
+            const EdgeOwner owner = it->second;
+            if (owner.opposite == opposite) {
+                continue;
+            }
+            const float rest_angle = rest_dihedral_angle(
+                rest_positions,
+                owner.shared0,
+                owner.shared1,
+                owner.opposite,
+                opposite,
+                vertex_count
+            );
+            const float stiffness = 1.0f / std::max(std::max(solver->cfg.bend_compliance, 0.0f), 1.0e-9f);
+            wing_indices.push_back(make_uint4(
+                static_cast<unsigned int>(owner.shared0),
+                static_cast<unsigned int>(owner.shared1),
+                static_cast<unsigned int>(owner.opposite),
+                static_cast<unsigned int>(opposite)
+            ));
+            wing_params.push_back(make_float2(rest_angle, std::isfinite(stiffness) ? stiffness : 1.0f));
+        }
+    }
+    if (wing_indices.empty()) {
+        return true;
+    }
+
+    solver->bending_wing_count = static_cast<int>(wing_indices.size());
+    bool ok = alloc_and_copy(
+            &solver->bending_wing_indices,
+            wing_indices.data(),
+            solver->bending_wing_count,
+            "bending wing index allocation"
+        ) && alloc_and_copy(
+            &solver->bending_wing_params,
+            wing_params.data(),
+            solver->bending_wing_count,
+            "bending wing param allocation"
+        );
+    if (!ok) {
+        return false;
+    }
+    if (!create_linear_texture(
+            solver->bending_wing_indices,
+            solver->bending_wing_count,
+            &solver->bending_wing_index_texture,
+            "create bending wing index texture")
+        || !create_linear_texture(
+            solver->bending_wing_params,
+            solver->bending_wing_count,
+            &solver->bending_wing_param_texture,
+            "create bending wing param texture")) {
+        return false;
+    }
+    if (solver->bending_wing_index_texture == 0 || solver->bending_wing_param_texture == 0) {
+        return set_error("bending wing texture creation returned an empty texture");
+    }
+    solver->bending_texture_ready = 1;
+    solver->diag.abi41_bending_wing_count = solver->bending_wing_count;
+    solver->diag.abi41_bending_texture_ready = 1;
+    return true;
+}
+
 bool prepare_pcg_stretch_buffers(
     Abi41Solver* solver,
     const std::vector<ReconSpring>& springs
@@ -3742,6 +4189,15 @@ bool fetch_abi41_counts(Abi41Solver* solver) {
     );
     solver->diag.abi41_pcg_csr_nnz = solver->pcg_csr_nnz;
     solver->diag.abi41_pcg_texture_ready = solver->pcg_texture_ready;
+    solver->diag.abi41_lra_tack_count = static_cast<long long>(counts[kAbi41CountLraTacks]);
+    solver->diag.abi41_bending_wing_count = static_cast<long long>(
+        counts[kAbi41CountBendingWings] > 0ull
+            ? counts[kAbi41CountBendingWings]
+            : static_cast<unsigned long long>(std::max(solver->bending_wing_count, 0))
+    );
+    solver->diag.abi41_bending_texture_ready = solver->bending_texture_ready;
+    solver->diag.abi41_tack_jitter_guarded = static_cast<long long>(counts[kAbi41CountTackGuards]);
+    solver->diag.abi41_bending_guarded = static_cast<long long>(counts[kAbi41CountBendingGuards]);
     if (solver->pcg_guard_count) {
         unsigned long long guarded = 0;
         if (!set_cuda_error(
@@ -3773,6 +4229,10 @@ void free_solver(Abi41Solver* solver) {
     cudaFree(solver->inv_mass);
     cudaFree(solver->state_flags);
     cudaFree(solver->springs);
+    cudaFree(solver->bends);
+    cudaFree(solver->bend_rest);
+    cudaFree(solver->lra_edges);
+    cudaFree(solver->lra_rest);
     cudaFree(solver->triangles);
     cudaFree(solver->surface_vertex_offsets);
     cudaFree(solver->surface_vertex_triangles);
@@ -3823,6 +4283,9 @@ void free_solver(Abi41Solver* solver) {
     cudaFree(solver->pcg_reductions);
     cudaFree(solver->pcg_max_delta_device);
     cudaFree(solver->pcg_guard_count);
+    destroy_bending_textures(solver);
+    cudaFree(solver->bending_wing_indices);
+    cudaFree(solver->bending_wing_params);
     cudaFree(solver->force_fields);
     cudaFree(solver->abi41_counts);
     delete solver;
@@ -3989,9 +4452,17 @@ extern "C" SSBL_API void* ssbl_create_solver(const SsblXpbdConfig* config, const
     solver->cfg = *config;
     solver->cfg.vertex_count = std::max(solver->cfg.vertex_count, 0);
     solver->cfg.edge_count = std::max(solver->cfg.edge_count, 0);
+    solver->cfg.bend_count = std::max(solver->cfg.bend_count, 0);
+    solver->cfg.lra_count = std::max(solver->cfg.lra_count, 0);
     solver->cfg.triangle_count = std::max(solver->cfg.triangle_count, 0);
     solver->cfg.damping = std::isfinite(solver->cfg.damping) ? solver->cfg.damping : 1.0f;
     solver->cfg.damping = std::max(0.0f, std::min(solver->cfg.damping, 1.0f));
+    if (!std::isfinite(solver->cfg.bend_compliance) || solver->cfg.bend_compliance < 0.0f) {
+        solver->cfg.bend_compliance = 0.0f;
+    }
+    if (!std::isfinite(solver->cfg.lra_compliance) || solver->cfg.lra_compliance < 0.0f) {
+        solver->cfg.lra_compliance = 0.0f;
+    }
     if (!std::isfinite(solver->cfg.stretch_optimization_strength)) {
         solver->cfg.stretch_optimization_strength = 0.0f;
     }
@@ -4027,6 +4498,16 @@ extern "C" SSBL_API void* ssbl_create_solver(const SsblXpbdConfig* config, const
         float rest = mesh->edge_rest_lengths ? mesh->edge_rest_lengths[e] : 0.0f;
         springs.push_back(ReconSpring{static_cast<unsigned int>(std::max(i, 0)), static_cast<unsigned int>(std::max(j, 0)), rest});
     }
+    if (solver->cfg.bend_count > 0 && (!mesh->bends || !mesh->bend_rest_lengths)) {
+        set_error("ABI39 recon bend constraints require bend pairs and rest lengths");
+        free_solver(solver);
+        return nullptr;
+    }
+    if (solver->cfg.lra_count > 0 && (!mesh->lra_edges || !mesh->lra_rest_lengths)) {
+        set_error("ABI39 recon LRA constraints require edge pairs and rest lengths");
+        free_solver(solver);
+        return nullptr;
+    }
     std::vector<ReconTriangle> triangles;
     triangles.reserve(static_cast<size_t>(solver->cfg.triangle_count));
     for (int t = 0; t < solver->cfg.triangle_count; ++t) {
@@ -4047,6 +4528,10 @@ extern "C" SSBL_API void* ssbl_create_solver(const SsblXpbdConfig* config, const
         && alloc_and_copy(&solver->inv_mass, mesh->inv_mass, n, "inverse mass allocation")
         && alloc_and_copy(&solver->state_flags, flags.data(), n, "state flag allocation")
         && alloc_and_copy(&solver->springs, springs.data(), solver->cfg.edge_count, "spring allocation")
+        && alloc_and_copy(&solver->bends, reinterpret_cast<const ReconPair*>(mesh->bends), solver->cfg.bend_count, "bend pair allocation")
+        && alloc_and_copy(&solver->bend_rest, mesh->bend_rest_lengths, solver->cfg.bend_count, "bend rest allocation")
+        && alloc_and_copy(&solver->lra_edges, reinterpret_cast<const ReconPair*>(mesh->lra_edges), solver->cfg.lra_count, "LRA pair allocation")
+        && alloc_and_copy(&solver->lra_rest, mesh->lra_rest_lengths, solver->cfg.lra_count, "LRA rest allocation")
         && alloc_and_copy(&solver->triangles, triangles.data(), solver->cfg.triangle_count, "triangle allocation")
         && build_surface_vertex_triangles(solver, n, triangles)
         && alloc_and_copy(&solver->triangle_pairs, static_cast<const TriangleProximityPair*>(nullptr), solver->triangle_pair_capacity, "triangle pair allocation")
@@ -4069,6 +4554,9 @@ extern "C" SSBL_API void* ssbl_create_solver(const SsblXpbdConfig* config, const
         ok = false;
     }
     if (ok && !prepare_pcg_stretch_buffers(solver, springs)) {
+        ok = false;
+    }
+    if (ok && !prepare_bending_wing_buffers(solver, triangles, reinterpret_cast<const Vec3*>(mesh->positions))) {
         ok = false;
     }
     if (!ok || !reset_abi41_counts(solver)) {
@@ -4227,6 +4715,9 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
     iterations = std::max(iterations, 1);
     int v_blocks = block_count(solver->cfg.vertex_count);
     int e_blocks = block_count(solver->cfg.edge_count);
+    int b_blocks = block_count(solver->cfg.bend_count);
+    int lra_blocks = block_count(solver->cfg.lra_count);
+    int wing_blocks = block_count(solver->bending_wing_count);
     int p_blocks = block_count(solver->pin_count);
     float sub_dt = solver->cfg.dt / static_cast<float>(substeps);
     for (int s = 0; s < substeps; ++s) {
@@ -4252,6 +4743,16 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
                 if (!run_abi41_hard_stretch_pcg(solver, v_blocks, e_blocks)) {
                     return 0;
                 }
+            }
+            const bool run_final_abi41_constraints = (s == substeps - 1 && it == iterations - 1);
+            if (run_final_abi41_constraints && solver->cfg.lra_count > 0) {
+                abi41_lra_tack_project_kernel<<<lra_blocks, kThreads>>>(*solver, sub_dt);
+            }
+            if (run_final_abi41_constraints && solver->bending_wing_count > 0 && solver->bending_texture_ready != 0) {
+                abi41_bending_wing_measure_kernel<<<wing_blocks, kThreads>>>(*solver);
+            }
+            if (run_final_abi41_constraints && solver->cfg.bend_count > 0) {
+                abi41_bend_project_kernel<<<b_blocks, kThreads>>>(*solver, sub_dt);
             }
             if (solver->pin_count > 0) {
                 abi41_pin_project_kernel<<<p_blocks, kThreads>>>(*solver);

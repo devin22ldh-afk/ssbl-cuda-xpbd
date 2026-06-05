@@ -179,6 +179,11 @@ typedef struct SsblXpbdDiagnostics {
     float abi41_pcg_initial_residual;
     float abi41_pcg_final_residual;
     float abi41_pcg_max_delta;
+    long long abi41_lra_tack_count;
+    long long abi41_bending_wing_count;
+    long long abi41_bending_texture_ready;
+    long long abi41_tack_jitter_guarded;
+    long long abi41_bending_guarded;
 } SsblXpbdDiagnostics;
 
 typedef struct SsblXpbdMesh {

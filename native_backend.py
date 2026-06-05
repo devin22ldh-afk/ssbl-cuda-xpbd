@@ -274,6 +274,11 @@ class _NativeDiagnostics(ctypes.Structure):
         ("abi41_pcg_initial_residual", ctypes.c_float),
         ("abi41_pcg_final_residual", ctypes.c_float),
         ("abi41_pcg_max_delta", ctypes.c_float),
+        ("abi41_lra_tack_count", ctypes.c_longlong),
+        ("abi41_bending_wing_count", ctypes.c_longlong),
+        ("abi41_bending_texture_ready", ctypes.c_longlong),
+        ("abi41_tack_jitter_guarded", ctypes.c_longlong),
+        ("abi41_bending_guarded", ctypes.c_longlong),
     ]
 
 
@@ -393,6 +398,11 @@ class NativeStepDiagnostics:
     abi41_pcg_initial_residual: float = 0.0
     abi41_pcg_final_residual: float = 0.0
     abi41_pcg_max_delta: float = 0.0
+    abi41_lra_tack_count: int = 0
+    abi41_bending_wing_count: int = 0
+    abi41_bending_texture_ready: int = 0
+    abi41_tack_jitter_guarded: int = 0
+    abi41_bending_guarded: int = 0
     frame_ms: float = 0.0
     frame_set_ms: float = 0.0
     input_refresh_ms: float = 0.0
@@ -1025,6 +1035,11 @@ class NativeXpbdSolver:
             abi41_pcg_initial_residual=float(raw.abi41_pcg_initial_residual),
             abi41_pcg_final_residual=float(raw.abi41_pcg_final_residual),
             abi41_pcg_max_delta=float(raw.abi41_pcg_max_delta),
+            abi41_lra_tack_count=int(raw.abi41_lra_tack_count),
+            abi41_bending_wing_count=int(raw.abi41_bending_wing_count),
+            abi41_bending_texture_ready=int(raw.abi41_bending_texture_ready),
+            abi41_tack_jitter_guarded=int(raw.abi41_tack_jitter_guarded),
+            abi41_bending_guarded=int(raw.abi41_bending_guarded),
         )
         self._last_diagnostics = diag
         return diag
