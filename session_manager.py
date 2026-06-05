@@ -319,11 +319,6 @@ def preview_warnings(obj: bpy.types.Object, settings) -> list[str]:
     if obj is None or obj.type != "MESH":
         return warnings
     scene = bpy.context.scene
-    closed_mesh = _mesh_is_probably_closed(obj.data)
-    self_mode = str(getattr(settings, "self_collision_mode", "off")).lower()
-    self_collision_enabled = bool(getattr(settings, "self_collision", False)) or self_mode != "off"
-    if closed_mesh and self_collision_enabled and not bool(getattr(settings, "use_volume_pressure", False)):
-        warnings.append("Closed meshes with self collision usually also need volume preservation enabled.")
     if len(obj.data.polygons) > 10000:
         warnings.append("Large meshes may need optimized preview settings for stable realtime playback.")
     if bool(getattr(settings, "use_ground", False)):
@@ -1075,10 +1070,7 @@ def _solver_options_signature(options, settings=None) -> tuple:
         int(options.self_collision_interval),
         int(options.max_self_collision_neighbors),
         bool(options.use_volume_pressure),
-        round(float(options.volume_compliance), 12),
         round(float(options.pressure_strength), 6),
-        round(float(options.volume_target_scale), 6),
-        int(options.volume_solve_interval),
         int(options.self_probe_interval),
         int(options.self_surface_pair_interval),
         bool(options.self_sleep_enabled),

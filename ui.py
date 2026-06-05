@@ -51,7 +51,7 @@ class SSBL_PT_physics_panel(bpy.types.Panel):
 
 
 class SSBL_PT_material(bpy.types.Panel):
-    bl_label = "材料与体积"
+    bl_label = "Material / Inflation"
     bl_parent_id = "SSBL_PT_physics_panel"
     bl_space_type = "PROPERTIES"
     bl_region_type = "WINDOW"
@@ -70,7 +70,6 @@ class SSBL_PT_material(bpy.types.Panel):
         if settings.use_volume_pressure:
             col = layout.column(align=True)
             col.prop(settings, "pressure_strength")
-            col.prop(settings, "volume_target_scale")
 
 
 class SSBL_PT_collision(bpy.types.Panel):
@@ -190,13 +189,6 @@ class SSBL_PT_advanced(bpy.types.Panel):
         col.prop(settings, "iterations")
         col.prop(settings, "damping")
         col.prop(settings, "density")
-
-        if settings.use_volume_pressure:
-            layout.separator()
-            col = layout.column(align=True)
-            col.label(text="体积:")
-            col.prop(settings, "volume_compliance")
-            col.prop(settings, "volume_solve_interval")
 
         layout.separator()
         col = layout.column(align=True)

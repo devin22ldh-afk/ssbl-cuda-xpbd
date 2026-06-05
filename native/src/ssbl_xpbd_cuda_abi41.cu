@@ -88,6 +88,9 @@ struct Abi41Solver {
     unsigned int* state_flags = nullptr;
     ReconSpring* springs = nullptr;
     ReconTriangle* triangles = nullptr;
+    int* surface_vertex_offsets = nullptr;
+    int* surface_vertex_triangles = nullptr;
+    int surface_vertex_triangle_count = 0;
     int* self_bucket_counts = nullptr;
     int* self_bucket_indices = nullptr;
     int* self_cell_coords = nullptr;
@@ -254,6 +257,56 @@ __device__ Vec3 normalize_or(Vec3 value, Vec3 fallback) {
     return mul(value, 1.0f / len);
 }
 
+__device__ int surface_normal_at_vertex(Abi41Solver solver, int vertex, Vec3* out_normal) {
+    if (!out_normal
+        || vertex < 0
+        || vertex >= solver.cfg.vertex_count
+        || !solver.surface_vertex_offsets
+        || !solver.surface_vertex_triangles
+        || !solver.triangles
+        || !solver.pos) {
+        return 0;
+    }
+    int start = solver.surface_vertex_offsets[vertex];
+    int end = solver.surface_vertex_offsets[vertex + 1];
+    if (end <= start) {
+        return 0;
+    }
+
+    Vec3 accumulated = make_vec3(0.0f, 0.0f, 0.0f);
+    for (int cursor = start; cursor < end; ++cursor) {
+        int t = solver.surface_vertex_triangles[cursor];
+        if (t < 0 || t >= solver.cfg.triangle_count) {
+            continue;
+        }
+        ReconTriangle tri = solver.triangles[t];
+        int i0 = static_cast<int>(tri.v0);
+        int i1 = static_cast<int>(tri.v1);
+        int i2 = static_cast<int>(tri.v2);
+        if (i0 < 0 || i0 >= solver.cfg.vertex_count
+            || i1 < 0 || i1 >= solver.cfg.vertex_count
+            || i2 < 0 || i2 >= solver.cfg.vertex_count) {
+            continue;
+        }
+        Vec3 p0 = solver.pos[i0];
+        Vec3 p1 = solver.pos[i1];
+        Vec3 p2 = solver.pos[i2];
+        Vec3 normal = cross(sub(p1, p0), sub(p2, p0));
+        float len_sq = dot(normal, normal);
+        if (!isfinite(len_sq) || len_sq <= 1.0e-10f) {
+            continue;
+        }
+        accumulated = add(accumulated, mul(normal, rsqrtf(len_sq)));
+    }
+
+    float accum_len_sq = dot(accumulated, accumulated);
+    if (!isfinite(accum_len_sq) || accum_len_sq <= 1.0e-10f) {
+        return 0;
+    }
+    *out_normal = mul(accumulated, rsqrtf(accum_len_sq));
+    return 1;
+}
+
 __device__ float fract01(float value) {
     return value - floorf(value);
 }
@@ -309,7 +362,13 @@ __device__ Vec3 limit_force_field_acceleration(Vec3 value) {
     return mul(value, kAbi41MaxForceFieldAcceleration / fmaxf(len, kEps));
 }
 
-__device__ Vec3 evaluate_force_field(const SsblXpbdForceField& field, Vec3 p, Vec3 velocity) {
+__device__ Vec3 evaluate_force_field(
+    const SsblXpbdForceField& field,
+    Vec3 p,
+    Vec3 velocity,
+    Vec3 surface_normal,
+    int has_surface_normal
+) {
     if (!isfinite(field.strength) || field.strength == 0.0f) {
         return make_vec3(0.0f, 0.0f, 0.0f);
     }
@@ -325,7 +384,19 @@ __device__ Vec3 evaluate_force_field(const SsblXpbdForceField& field, Vec3 p, Ve
     }
 
     if (field.type == kAbi41ForceFieldWind) {
-        return mul(normalize_or(array_vec3(field.direction), make_vec3(0.0f, 0.0f, 0.0f)), strength);
+        if (!has_surface_normal) {
+            return make_vec3(0.0f, 0.0f, 0.0f);
+        }
+        Vec3 wind_dir = normalize_or(array_vec3(field.direction), make_vec3(0.0f, 0.0f, 0.0f));
+        float projection = dot(wind_dir, surface_normal);
+        if (!isfinite(projection) || projection <= 0.0f) {
+            return make_vec3(0.0f, 0.0f, 0.0f);
+        }
+        float magnitude = strength * projection;
+        if (field.noise > 0.0f) {
+            magnitude *= fmaxf(0.0f, 1.0f + field.noise * force_field_noise(p, field.seed, 0.0f));
+        }
+        return limit_force_field_acceleration(mul(wind_dir, magnitude));
     }
     if (field.type == kAbi41ForceFieldForce || field.type == kAbi41ForceFieldCharge) {
         Vec3 source_delta = field.use_2d_force ? radial_delta : delta;
@@ -403,7 +474,13 @@ __device__ Vec3 evaluate_force_field(const SsblXpbdForceField& field, Vec3 p, Ve
     return make_vec3(0.0f, 0.0f, 0.0f);
 }
 
-__device__ Vec3 force_field_acceleration(Abi41Solver solver, Vec3 p, Vec3 velocity) {
+__device__ Vec3 force_field_acceleration(
+    Abi41Solver solver,
+    Vec3 p,
+    Vec3 velocity,
+    Vec3 surface_normal,
+    int has_surface_normal
+) {
     Vec3 acceleration = make_vec3(0.0f, 0.0f, 0.0f);
     if (!solver.force_fields || solver.force_field_count <= 0) {
         return acceleration;
@@ -413,7 +490,13 @@ __device__ Vec3 force_field_acceleration(Abi41Solver solver, Vec3 p, Vec3 veloci
         count = kAbi41MaxForceFields;
     }
     for (int index = 0; index < count; ++index) {
-        acceleration = add(acceleration, evaluate_force_field(solver.force_fields[index], p, velocity));
+        acceleration = add(acceleration, evaluate_force_field(
+            solver.force_fields[index],
+            p,
+            velocity,
+            surface_normal,
+            has_surface_normal
+        ));
     }
     return limit_force_field_acceleration(acceleration);
 }
@@ -506,8 +589,20 @@ __global__ void abi41_integrate_kernel(Abi41Solver solver, float dt) {
         solver.pos[i] = solver.rest[i];
         return;
     }
+    Vec3 surface_normal = make_vec3(0.0f, 0.0f, 0.0f);
+    int has_surface_normal = surface_normal_at_vertex(solver, i, &surface_normal);
     Vec3 acceleration = make_vec3(solver.cfg.gravity[0], solver.cfg.gravity[1], solver.cfg.gravity[2]);
-    acceleration = add(acceleration, force_field_acceleration(solver, solver.pos[i], solver.vel[i]));
+    if (solver.cfg.use_volume_pressure && solver.cfg.pressure_strength > 0.0f && has_surface_normal) {
+        float pressure_force = fmaxf(solver.cfg.pressure_strength, 0.0f);
+        acceleration = add(acceleration, mul(surface_normal, pressure_force * solver.inv_mass[i]));
+    }
+    acceleration = add(acceleration, force_field_acceleration(
+        solver,
+        solver.pos[i],
+        solver.vel[i],
+        surface_normal,
+        has_surface_normal
+    ));
     Vec3 v = add(solver.vel[i], mul(acceleration, dt));
     v = mul(v, solver.cfg.damping);
     solver.vel[i] = v;
@@ -2576,6 +2671,66 @@ bool upload_pins(Abi41Solver* solver, const int* indices, const float* positions
     return true;
 }
 
+bool build_surface_vertex_triangles(
+    Abi41Solver* solver,
+    int vertex_count,
+    const std::vector<ReconTriangle>& triangles
+) {
+    if (!solver || vertex_count <= 0 || triangles.empty()) {
+        return true;
+    }
+    std::vector<int> counts(vertex_count, 0);
+    for (const ReconTriangle& tri : triangles) {
+        const int i0 = static_cast<int>(tri.v0);
+        const int i1 = static_cast<int>(tri.v1);
+        const int i2 = static_cast<int>(tri.v2);
+        if (i0 >= 0 && i0 < vertex_count) {
+            ++counts[i0];
+        }
+        if (i1 >= 0 && i1 < vertex_count) {
+            ++counts[i1];
+        }
+        if (i2 >= 0 && i2 < vertex_count) {
+            ++counts[i2];
+        }
+    }
+
+    std::vector<int> offsets(vertex_count + 1, 0);
+    for (int i = 0; i < vertex_count; ++i) {
+        offsets[i + 1] = offsets[i] + counts[i];
+    }
+    std::vector<int> cursor(offsets.begin(), offsets.end());
+    std::vector<int> incident(offsets.back(), -1);
+    for (int t = 0; t < static_cast<int>(triangles.size()); ++t) {
+        const ReconTriangle tri = triangles[t];
+        const int i0 = static_cast<int>(tri.v0);
+        const int i1 = static_cast<int>(tri.v1);
+        const int i2 = static_cast<int>(tri.v2);
+        if (i0 >= 0 && i0 < vertex_count) {
+            incident[cursor[i0]++] = t;
+        }
+        if (i1 >= 0 && i1 < vertex_count) {
+            incident[cursor[i1]++] = t;
+        }
+        if (i2 >= 0 && i2 < vertex_count) {
+            incident[cursor[i2]++] = t;
+        }
+    }
+
+    solver->surface_vertex_triangle_count = static_cast<int>(incident.size());
+    return alloc_and_copy(
+        &solver->surface_vertex_offsets,
+        offsets.data(),
+        vertex_count + 1,
+        "surface vertex offset allocation"
+    ) && alloc_and_copy(
+        &solver->surface_vertex_triangles,
+        incident.data(),
+        solver->surface_vertex_triangle_count,
+        "surface incident triangle allocation"
+    );
+}
+
 bool reset_abi41_counts(Abi41Solver* solver) {
     if (!solver->abi41_counts) {
         return true;
@@ -2631,6 +2786,8 @@ void free_solver(Abi41Solver* solver) {
     cudaFree(solver->state_flags);
     cudaFree(solver->springs);
     cudaFree(solver->triangles);
+    cudaFree(solver->surface_vertex_offsets);
+    cudaFree(solver->surface_vertex_triangles);
     cudaFree(solver->self_bucket_counts);
     cudaFree(solver->self_bucket_indices);
     cudaFree(solver->self_cell_coords);
@@ -2884,6 +3041,7 @@ extern "C" SSBL_API void* ssbl_create_solver(const SsblXpbdConfig* config, const
         && alloc_and_copy(&solver->state_flags, flags.data(), n, "state flag allocation")
         && alloc_and_copy(&solver->springs, springs.data(), solver->cfg.edge_count, "spring allocation")
         && alloc_and_copy(&solver->triangles, triangles.data(), solver->cfg.triangle_count, "triangle allocation")
+        && build_surface_vertex_triangles(solver, n, triangles)
         && alloc_and_copy(&solver->static_triangles, reinterpret_cast<const Vec3*>(mesh->static_triangles), solver->cfg.static_triangle_count * 3, "static triangle allocation")
         && alloc_and_copy(&solver->triangle_pairs, static_cast<const TriangleProximityPair*>(nullptr), solver->triangle_pair_capacity, "triangle pair allocation")
         && alloc_and_copy(&solver->triangle_pair_count, static_cast<const int*>(nullptr), 1, "triangle pair count allocation")

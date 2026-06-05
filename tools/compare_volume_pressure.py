@@ -1,6 +1,5 @@
 import json
 import math
-import os
 import sys
 
 import bpy
@@ -11,75 +10,78 @@ if ADDONS_ROOT not in sys.path:
     sys.path.insert(0, ADDONS_ROOT)
 
 import ssbl
-from ssbl import xpbd_core
 
 
-def _find_target():
-    obj = bpy.data.objects.get("Suzanne")
-    if obj is not None and obj.type == "MESH":
-        return obj
-    active = bpy.context.active_object
-    if active is not None and active.type == "MESH":
-        return active
-    raise RuntimeError("Suzanne mesh not found")
+def _clear_scene():
+    bpy.ops.object.select_all(action="SELECT")
+    bpy.ops.object.delete()
 
 
-def _ensure_pin_group(obj, settings):
-    group_name = str(settings.pin_vertex_group or "ssbl_pin")
-    settings.pin_vertex_group = group_name
-    if obj.vertex_groups.get(group_name) is not None:
-        return
-    z_values = [vert.co.z for vert in obj.data.vertices]
-    threshold = max(z_values) - (max(z_values) - min(z_values)) * 0.18
-    indices = [vert.index for vert in obj.data.vertices if vert.co.z >= threshold]
-    if not indices:
-        indices = [max(obj.data.vertices, key=lambda vert: vert.co.z).index]
-    group = obj.vertex_groups.new(name=group_name)
-    group.add(indices, 1.0, "ADD")
+def _make_open_grid(name: str) -> bpy.types.Object:
+    size = 4
+    verts = []
+    faces = []
+    for y in range(size + 1):
+        for x in range(size + 1):
+            verts.append((float(x) / float(size), float(y) / float(size), 0.0))
+    for y in range(size):
+        for x in range(size):
+            a = y * (size + 1) + x
+            b = a + 1
+            d = a + (size + 1)
+            c = d + 1
+            faces.append((a, b, c, d))
+    mesh = bpy.data.meshes.new(f"{name}Mesh")
+    mesh.from_pydata(verts, [], faces)
+    mesh.update()
+    obj = bpy.data.objects.new(name, mesh)
+    bpy.context.scene.collection.objects.link(obj)
+    bpy.context.view_layer.objects.active = obj
+    obj.select_set(True)
+    return obj
 
 
-def _world_positions(obj):
-    return [obj.matrix_world @ vert.co for vert in obj.data.vertices]
+def _average_axis(obj: bpy.types.Object, axis_name: str) -> float:
+    return sum(float(getattr(vertex.co, axis_name)) for vertex in obj.data.vertices) / max(len(obj.data.vertices), 1)
 
 
-def _signed_volume(obj, triangles):
-    points = _world_positions(obj)
-    total = 0.0
-    for a_i, b_i, c_i in triangles:
-        a = points[int(a_i)]
-        b = points[int(b_i)]
-        c = points[int(c_i)]
-        total += a.dot(b.cross(c)) / 6.0
-    return total
-
-
-def _bbox(obj):
-    points = _world_positions(obj)
-    mins = [min(point[index] for point in points) for index in range(3)]
-    maxs = [max(point[index] for point in points) for index in range(3)]
-    return {
-        "min": mins,
-        "max": maxs,
-        "size": [maxs[index] - mins[index] for index in range(3)],
-    }
-
-
-def _finite(obj):
+def _finite(obj: bpy.types.Object) -> bool:
     return all(
         math.isfinite(float(component))
-        for vert in obj.data.vertices
-        for component in (vert.co.x, vert.co.y, vert.co.z)
+        for vertex in obj.data.vertices
+        for component in (vertex.co.x, vertex.co.y, vertex.co.z)
     )
 
 
-def _int_env(name, default):
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        return default
+def _run_case(enabled: bool) -> dict[str, object]:
+    _clear_scene()
+    obj = _make_open_grid("SSBL_Overpressure_On" if enabled else "SSBL_Overpressure_Off")
+    settings = bpy.context.scene.ssbl_preview
+    settings.frame_count = 30
+    settings.use_evaluated_mesh = False
+    settings.pin_vertex_group = ""
+    settings.use_ground = False
+    settings.self_collision = False
+    settings.gravity = (0.0, 0.0, 0.0)
+    settings.damping = 1.0
+    settings.substeps = 2
+    settings.iterations = 1
+    settings.preview_writeback_interval = 1
+    settings.use_volume_pressure = bool(enabled)
+    settings.pressure_strength = 90.0 if enabled else 0.0
+
+    ssbl.solver.start_preview(bpy.context, obj)
+    for _index in range(12):
+        ssbl.solver.step_preview(bpy.context, obj.name)
+    diag = ssbl.solver.session_diagnostics(obj)
+    result = {
+        "enabled": bool(enabled),
+        "finite": bool(_finite(obj) and diag.finite),
+        "average_z": _average_axis(obj, "z"),
+        "force_field_count": int(diag.force_field_count),
+    }
+    ssbl.solver.request_stop(obj)
+    return result
 
 
 def main():
@@ -88,58 +90,28 @@ def main():
     except Exception:
         pass
     ssbl.register()
-
-    scene = bpy.context.scene
-    obj = _find_target()
-    bpy.context.view_layer.objects.active = obj
-    obj.select_set(True)
-    settings = scene.ssbl_preview
-    settings.frame_count = 120
-    settings.use_ground = False
-    settings.self_collision_mode = "fast"
-    settings.self_collision_interval = 2
-    settings.max_self_collision_neighbors = 32
-    settings.substeps = _int_env("SSBL_COMPARE_SUBSTEPS", int(settings.substeps))
-    settings.iterations = _int_env("SSBL_COMPARE_ITERATIONS", int(settings.iterations))
-    _ensure_pin_group(obj, settings)
-
-    triangles = xpbd_core.triangulated_faces(obj.data)
-    rest_volume = _signed_volume(obj, triangles)
-    results = []
-
-    for enabled in (False, True):
-        settings.use_volume_pressure = enabled
-        settings.volume_compliance = 1e-6
-        settings.pressure_strength = 1.0
-        settings.volume_target_scale = 1.0
-        ssbl.solver.start_preview(bpy.context, obj)
-        for _index in range(60):
-            ssbl.solver.step_preview(bpy.context, obj.name)
-        volume = _signed_volume(obj, triangles)
-        results.append(
-            {
-                "volume_pressure": enabled,
-                "finite": _finite(obj),
-                "volume": volume,
-                "volume_ratio": volume / rest_volume if abs(rest_volume) > 1e-12 else None,
-                "bbox": _bbox(obj),
-            }
-        )
-        ssbl.solver.request_stop(obj)
-
-    print(
-        "SSBL_VOLUME_COMPARE",
-        json.dumps(
-            {
-                "rest_volume": rest_volume,
-                "substeps": int(settings.substeps),
-                "iterations": int(settings.iterations),
-                "results": results,
-            },
-            ensure_ascii=False,
-        ),
-    )
-    ssbl.unregister()
+    try:
+        off = _run_case(False)
+        on = _run_case(True)
+        result = {
+            "off": off,
+            "on": on,
+            "average_z_delta": float(on["average_z"]) - float(off["average_z"]),
+        }
+        print("SSBL_OVERPRESSURE_COMPARE", json.dumps(result, ensure_ascii=False, sort_keys=True))
+        if not (
+            off["finite"]
+            and on["finite"]
+            and abs(float(off["average_z"])) < 1.0e-4
+            and result["average_z_delta"] > 0.01
+        ):
+            raise RuntimeError(f"Overpressure comparison failed: {result}")
+    finally:
+        try:
+            ssbl.solver.cleanup_all_sessions()
+        except Exception:
+            pass
+        ssbl.unregister()
 
 
 if __name__ == "__main__":

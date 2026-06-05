@@ -69,7 +69,7 @@ def _make_cloth(
     return obj
 
 
-def _add_wind(name: str, strength: float, rotation=(0.0, math.pi / 2.0, 0.0)) -> bpy.types.Object:
+def _add_wind(name: str, strength: float, rotation=(0.0, 0.0, 0.0)) -> bpy.types.Object:
     bpy.ops.object.effector_add(type="WIND", location=(0.0, 0.0, 0.0), rotation=rotation)
     obj = bpy.context.object
     obj.name = name
@@ -109,7 +109,7 @@ def _run_preview(scene: bpy.types.Scene, obj: bpy.types.Object, steps: int = 5) 
     }
 
 
-def _read_pc2_average_x(path: str, sample_index: int) -> float:
+def _read_pc2_average_axis(path: str, sample_index: int, axis: int) -> float:
     with open(path, "rb") as handle:
         signature, version, vertex_count, start, sample_rate, sample_count = struct.unpack("<12siiffi", handle.read(32))
         if signature.rstrip(b"\0") != b"POINTCACHE2":
@@ -117,8 +117,8 @@ def _read_pc2_average_x(path: str, sample_index: int) -> float:
         sample_index = max(0, min(int(sample_index), int(sample_count) - 1))
         handle.seek(32 + sample_index * int(vertex_count) * 3 * 4)
         values = struct.unpack("<" + "f" * int(vertex_count) * 3, handle.read(int(vertex_count) * 3 * 4))
-    xs = values[0::3]
-    return sum(xs) / max(len(xs), 1)
+    samples = values[int(axis)::3]
+    return sum(samples) / max(len(samples), 1)
 
 
 def main() -> None:
@@ -138,6 +138,11 @@ def main() -> None:
         on_cloth = _make_cloth("SSBL_Force_On")
         _add_wind("SSBL_Wind_On", 30.0)
         on = _run_preview(scene, on_cloth)
+
+        _clear_scene()
+        back_cloth = _make_cloth("SSBL_Force_Back")
+        _add_wind("SSBL_Wind_Back", 30.0, rotation=(0.0, math.pi, 0.0))
+        back = _run_preview(scene, back_cloth)
 
         _clear_scene()
         weighted_cloth = _make_cloth("SSBL_Force_Weighted")
@@ -240,21 +245,23 @@ def main() -> None:
         bake_cloth = _make_cloth("SSBL_Force_Bake")
         _add_wind("SSBL_Wind_Bake", 40.0)
         cache_path = ssbl.solver.bake_xpbd_cache(bpy.context, bake_cloth)
-        first_sample_x = _read_pc2_average_x(cache_path, 0)
-        last_sample_x = _read_pc2_average_x(cache_path, 3)
+        first_sample_z = _read_pc2_average_axis(cache_path, 0, 2)
+        last_sample_z = _read_pc2_average_axis(cache_path, 3, 2)
         cache_exists = os.path.exists(cache_path)
         ssbl.solver.clear_xpbd_cache(bake_cloth)
 
         result = {
             "off": off,
             "on": on,
-            "preview_delta_x": on["avg_x"] - off["avg_x"],
+            "preview_delta_z": on["avg_z"] - off["avg_z"],
+            "back": back,
+            "back_preview_delta_z": back["avg_z"] - off["avg_z"],
             "weighted": weighted,
             "weighted_strength": weighted_strength,
-            "weighted_preview_delta_x": weighted["avg_x"] - off["avg_x"],
+            "weighted_preview_delta_z": weighted["avg_z"] - off["avg_z"],
             "all_zero": all_zero,
             "all_zero_strength": all_zero_strength,
-            "all_zero_preview_delta_x": all_zero["avg_x"] - off["avg_x"],
+            "all_zero_preview_delta_z": all_zero["avg_z"] - off["avg_z"],
             "gravity_zero": gravity_zero,
             "gravity_on": gravity_on,
             "gravity_delta_z": gravity_zero["avg_z"] - gravity_on["avg_z"],
@@ -265,8 +272,8 @@ def main() -> None:
             "visible_weight_order": visible_weight_order,
             "supported_field_count": len(supported_batch.fields),
             "unsupported_field_count": int(supported_batch.unsupported_count),
-            "bake_first_sample_x": first_sample_x,
-            "bake_last_sample_x": last_sample_x,
+            "bake_first_sample_z": first_sample_z,
+            "bake_last_sample_z": last_sample_z,
             "bake_cache_exists": cache_exists,
         }
         print("SSBL_FORCE_FIELD_SMOKE", json.dumps(result, ensure_ascii=False, sort_keys=True))
@@ -275,16 +282,19 @@ def main() -> None:
             and on["finite"]
             and on["force_field_count"] == 1
             and on["unsupported_force_field_count"] == 0
-            and result["preview_delta_x"] > 0.02
+            and result["preview_delta_z"] > 0.02
+            and back["finite"]
+            and back["force_field_count"] == 1
+            and abs(result["back_preview_delta_z"]) < 1.0e-4
             and weighted["finite"]
             and weighted["force_field_count"] == 1
             and abs(result["weighted_strength"] - 7.5) < 1.0e-4
-            and result["weighted_preview_delta_x"] > 0.005
-            and result["weighted_preview_delta_x"] < result["preview_delta_x"]
+            and result["weighted_preview_delta_z"] > 0.005
+            and result["weighted_preview_delta_z"] < result["preview_delta_z"]
             and all_zero["finite"]
             and all_zero["force_field_count"] == 1
             and abs(result["all_zero_strength"]) < 1.0e-6
-            and abs(result["all_zero_preview_delta_x"]) < 1.0e-4
+            and abs(result["all_zero_preview_delta_z"]) < 1.0e-4
             and gravity_zero["finite"]
             and gravity_on["finite"]
             and result["gravity_delta_z"] > 0.02
@@ -296,7 +306,7 @@ def main() -> None:
             and result["supported_field_count"] == created_supported
             and result["unsupported_field_count"] == created_unsupported
             and result["bake_cache_exists"]
-            and result["bake_last_sample_x"] > result["bake_first_sample_x"] + 0.005
+            and result["bake_last_sample_z"] > result["bake_first_sample_z"] + 0.005
         ):
             raise RuntimeError(f"Force field smoke failed: {result}")
     finally:

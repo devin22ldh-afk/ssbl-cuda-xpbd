@@ -388,15 +388,7 @@ class NativeStepDiagnostics:
 _LIB = None
 _LOAD_ERROR = ""
 _ABI41_DLL_NAME = "ssbl_xpbd_cuda_abi38.dll"
-_LEGACY_DLL_NAME = "ssbl_xpbd_cuda_abi36.dll"
 _CAP_STRETCH_OPTIMIZATION = 1 << 0
-
-
-def _env_bool(name: str, default: bool = False) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return bool(default)
-    return value.strip().lower() not in {"", "0", "false", "no", "off"}
 
 
 def dll_path() -> str:
@@ -405,13 +397,7 @@ def dll_path() -> str:
         return override
     root = os.path.dirname(os.path.abspath(__file__))
     native_bin = os.path.join(root, "native", "bin")
-    legacy = os.path.join(native_bin, _LEGACY_DLL_NAME)
-    if _env_bool("SSBL_LEGACY_NATIVE", False):
-        return legacy
-    recon = os.path.join(native_bin, _ABI41_DLL_NAME)
-    if os.path.exists(recon):
-        return recon
-    return legacy
+    return os.path.join(native_bin, _ABI41_DLL_NAME)
 
 
 def status() -> NativeStatus:
@@ -433,7 +419,7 @@ def _load_library():
     path = dll_path()
     if not os.path.exists(path):
         raise NativeBackendUnavailable(
-            "Missing CUDA solver DLL. Install CUDA Toolkit, CMake, and VS Build Tools, then run native/build_recon.ps1 or native/build.ps1."
+            "Missing ABI38 CUDA solver DLL. Install CUDA Toolkit, CMake, and VS Build Tools, then run native/build_recon.ps1."
         )
 
     try:

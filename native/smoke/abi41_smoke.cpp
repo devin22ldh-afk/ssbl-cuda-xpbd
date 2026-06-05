@@ -553,6 +553,85 @@ int run_hard_stretch_optimization_smoke() {
     return 0;
 }
 
+int run_overpressure_smoke() {
+    auto run_case = [](bool reversed, float* out_average_z) -> int {
+        std::vector<float> positions = {
+            0.0f, 0.0f, 0.0f,
+            1.0f, 0.0f, 0.0f,
+            0.0f, 1.0f, 0.0f,
+        };
+        std::vector<float> inv_mass = {1.0f, 1.0f, 1.0f};
+        std::vector<int> triangles = reversed
+            ? std::vector<int>{0, 2, 1}
+            : std::vector<int>{0, 1, 2};
+
+        SsblXpbdConfig cfg{};
+        cfg.vertex_count = 3;
+        cfg.triangle_count = 1;
+        cfg.dt = 1.0f / 60.0f;
+        cfg.damping = 1.0f;
+        cfg.use_volume_pressure = 1;
+        cfg.pressure_strength = 120.0f;
+
+        SsblXpbdMesh mesh{};
+        mesh.positions = positions.data();
+        mesh.inv_mass = inv_mass.data();
+        mesh.triangles = triangles.data();
+
+        void* solver = ssbl_create_solver(&cfg, &mesh);
+        if (!solver) {
+            std::fprintf(stderr, "SSBL_ABI41_OVERPRESSURE_ERROR create: %s\n", ssbl_last_error());
+            return 70;
+        }
+        if (!ssbl_step_solver_ex(solver, 1, 1, 1, 1)) {
+            std::fprintf(stderr, "SSBL_ABI41_OVERPRESSURE_ERROR step: %s\n", ssbl_last_error());
+            ssbl_destroy_solver(solver);
+            return 71;
+        }
+        std::vector<float> out(positions.size(), 0.0f);
+        if (!ssbl_download_positions(solver, out.data(), static_cast<int>(out.size()))) {
+            std::fprintf(stderr, "SSBL_ABI41_OVERPRESSURE_ERROR download: %s\n", ssbl_last_error());
+            ssbl_destroy_solver(solver);
+            return 72;
+        }
+        SsblXpbdDiagnostics diag{};
+        if (!ssbl_get_diagnostics(solver, &diag)) {
+            std::fprintf(stderr, "SSBL_ABI41_OVERPRESSURE_ERROR diagnostics: %s\n", ssbl_last_error());
+            ssbl_destroy_solver(solver);
+            return 73;
+        }
+        ssbl_destroy_solver(solver);
+        if (!finite_positions(out) || !diag.finite_flag) {
+            std::fprintf(stderr, "SSBL_ABI41_OVERPRESSURE_ERROR non-finite output\n");
+            return 74;
+        }
+        *out_average_z = (out[2] + out[5] + out[8]) / 3.0f;
+        return 0;
+    };
+
+    float forward_z = 0.0f;
+    float reversed_z = 0.0f;
+    int result = run_case(false, &forward_z);
+    if (result != 0) {
+        return result;
+    }
+    result = run_case(true, &reversed_z);
+    if (result != 0) {
+        return result;
+    }
+    if (!(forward_z > 0.005f && reversed_z < -0.005f)) {
+        std::fprintf(
+            stderr,
+            "SSBL_ABI41_OVERPRESSURE_ERROR wrong normal response forward=%.6f reversed=%.6f\n",
+            forward_z,
+            reversed_z
+        );
+        return 75;
+    }
+    std::printf("SSBL_ABI41_OVERPRESSURE_OK forward_z=%.5f reversed_z=%.5f\n", forward_z, reversed_z);
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -564,6 +643,10 @@ int main() {
     int stretch_result = run_hard_stretch_optimization_smoke();
     if (stretch_result != 0) {
         return stretch_result;
+    }
+    int pressure_result = run_overpressure_smoke();
+    if (pressure_result != 0) {
+        return pressure_result;
     }
 
     std::vector<float> positions = {

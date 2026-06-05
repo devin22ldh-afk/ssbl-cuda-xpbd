@@ -360,15 +360,7 @@ def _build_cloth_data_uncached(
     pin_mask = pin_mask_from_group(obj, str(settings.pin_vertex_group).strip(), len(local))
     if np.all(pin_mask):
         raise ValueError("所有顶点都被固定了，没有可模拟的部分")
-    use_volume_pressure = bool(getattr(settings, "use_volume_pressure", False))
     rest_volume = signed_mesh_volume(world, triangles)
-    if use_volume_pressure:
-        if not is_closed_triangle_mesh(triangles):
-            raise ValueError("体积压力需要闭合流形网格；暂不支持开口布片网格。")
-        if abs(rest_volume) <= 1.0e-7:
-            raise ValueError("体积压力需要非零的静止有符号体积；请检查网格法线和拓扑。")
-        if np.count_nonzero(~pin_mask) < 4:
-            raise ValueError("体积压力至少需要四个未固定顶点才能保持体积。")
 
     edges, edge_rest = edge_constraints(triangles, world)
     edges, edge_rest, edge_color_offsets = color_distance_constraints(edges, edge_rest, len(world))
@@ -511,15 +503,7 @@ def _build_cloth_data_from_mesh(
     if np.all(pin_mask):
         raise ValueError("All vertices are pinned; there is no simulated cloth region.")
 
-    use_volume_pressure = bool(getattr(settings, "use_volume_pressure", False))
     rest_volume = signed_mesh_volume(world, triangles)
-    if use_volume_pressure:
-        if not is_closed_triangle_mesh(triangles):
-            raise ValueError("Volume pressure requires a closed triangle mesh.")
-        if abs(rest_volume) <= 1.0e-7:
-            raise ValueError("Volume pressure requires a non-zero signed rest volume.")
-        if np.count_nonzero(~pin_mask) < 4:
-            raise ValueError("Volume pressure needs at least four unpinned vertices.")
 
     edge_rest = _distance_rest_lengths(edges, world)
     bend_rest = _distance_rest_lengths(bends, world)
@@ -928,7 +912,7 @@ def settings_to_options(settings, runtime_mode_override: str | None = None) -> S
         fast_self_collision_passes=min(max(int(getattr(settings, "fast_self_collision_passes", 4)), 1), 8),
         use_volume_pressure=bool(getattr(settings, "use_volume_pressure", False)),
         volume_compliance=float(getattr(settings, "volume_compliance", 1e-6)),
-        pressure_strength=max(float(getattr(settings, "pressure_strength", 1.0)), 0.0),
+        pressure_strength=max(float(getattr(settings, "pressure_strength", 0.02)), 0.0),
         volume_target_scale=float(getattr(settings, "volume_target_scale", 1.0)),
         volume_solve_interval=max(int(getattr(settings, "volume_solve_interval", 1)), 1),
         self_probe_interval=max(int(getattr(settings, "self_probe_interval", 1)), 1),

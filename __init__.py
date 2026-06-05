@@ -415,40 +415,43 @@ class SSBL_PreviewSettings(PropertyGroup):
         description="内部隐藏字段；硬度会自动控制抗拉长 tether",
     )
     use_volume_pressure: BoolProperty(
-        name="充气 / 体积保持",
+        name="Inflation / Overpressure",
         default=False,
-        description="为 Suzanne 这类闭合软壳保持有符号体积；常规开口布料默认关闭",
+        description="Apply SSBL-style outward overpressure along cloth surface normals",
     )
     volume_compliance: FloatProperty(
-        name="体积柔顺度",
+        name="Legacy volume compliance",
         default=1e-6,
         min=0.0,
         soft_max=1e-3,
         precision=6,
-        description="全局体积保持的 XPBD 柔顺度；值越小体积保持越强",
+        options={"HIDDEN"},
+        description="Legacy field kept for old .blend compatibility; ignored by ABI38 overpressure",
     )
     pressure_strength: FloatProperty(
-        name="充气强度",
-        default=1.0,
+        name="Overpressure strength",
+        default=0.02,
         min=0.0,
         soft_max=2.0,
         precision=3,
-        description="缩放每次投影施加的体积修正强度",
+        description="Outward force strength applied along the cloth surface normal",
     )
     volume_target_scale: FloatProperty(
-        name="目标体积比例",
+        name="Legacy volume target scale",
         default=1.0,
         min=0.05,
         soft_max=2.0,
         precision=3,
-        description="目标体积相对于静止有符号体积的倍数",
+        options={"HIDDEN"},
+        description="Legacy field kept for old .blend compatibility; ignored by ABI38 overpressure",
     )
     volume_solve_interval: IntProperty(
-        name="Volume solve interval",
+        name="Legacy volume solve interval",
         default=1,
         min=1,
         soft_max=8,
-        description="Run global volume projection every N substeps; 1 preserves the original behavior",
+        options={"HIDDEN"},
+        description="Legacy field kept for old .blend compatibility; ignored by ABI38 overpressure",
     )
     gravity: FloatVectorProperty(
         name="Gravity",
