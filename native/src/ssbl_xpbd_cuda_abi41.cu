@@ -47,6 +47,18 @@ constexpr int kAbi41CountSelfOverflow = 10;
 constexpr int kAbi41CountSlots = 11;
 constexpr float kAbi41SpringRelaxation = 0.18f;
 constexpr float kAbi41SelfAveragingClampScale = 0.35f;
+constexpr int kAbi41MaxForceFields = 64;
+constexpr int kAbi41ForceFieldWind = 1;
+constexpr int kAbi41ForceFieldForce = 2;
+constexpr int kAbi41ForceFieldVortex = 3;
+constexpr int kAbi41ForceFieldTurbulence = 4;
+constexpr int kAbi41ForceFieldCharge = 5;
+constexpr int kAbi41ForceFieldHarmonic = 6;
+constexpr int kAbi41ForceFieldLennardJ = 7;
+constexpr int kAbi41ForceFieldMagnet = 8;
+constexpr int kAbi41ForceFieldDrag = 9;
+constexpr int kAbi41ForceFieldTexture = 10;
+constexpr float kAbi41MaxForceFieldAcceleration = 5000.0f;
 
 std::string g_last_error;
 
@@ -138,6 +150,8 @@ struct Abi41Solver {
     TriangleProximityPair* triangle_pairs = nullptr;
     int* triangle_pair_count = nullptr;
     int triangle_pair_capacity = 0;
+    SsblXpbdForceField* force_fields = nullptr;
+    int force_field_capacity = 0;
     int force_field_count = 0;
     int unsupported_force_field_count = 0;
     int* pin_indices = nullptr;
@@ -200,6 +214,8 @@ __host__ __device__ Vec3 cross(Vec3 a, Vec3 b) {
     );
 }
 
+__host__ __device__ float clamp01(float value);
+
 __host__ __device__ int cell_coord(float value, float cell_size) {
     return static_cast<int>(floorf(value / fmaxf(cell_size, kEps)));
 }
@@ -220,6 +236,182 @@ __device__ void atomic_add(Vec3* dst, Vec3 value) {
 
 __device__ float length(Vec3 value) {
     return sqrtf(fmaxf(dot(value, value), 0.0f));
+}
+
+__device__ Vec3 array_vec3(const float values[3]) {
+    return make_vec3(values[0], values[1], values[2]);
+}
+
+__device__ Vec3 normalize_or(Vec3 value, Vec3 fallback) {
+    float len = length(value);
+    if (!isfinite(len) || len <= kEps) {
+        return fallback;
+    }
+    return mul(value, 1.0f / len);
+}
+
+__device__ float fract01(float value) {
+    return value - floorf(value);
+}
+
+__device__ float force_field_noise(Vec3 p, int seed, float salt) {
+    float value = sinf(
+        p.x * 12.9898f
+        + p.y * 78.233f
+        + p.z * 37.719f
+        + (static_cast<float>(seed) + salt) * 19.191f
+    ) * 43758.5453f;
+    return fract01(value) * 2.0f - 1.0f;
+}
+
+__device__ float force_field_falloff(const SsblXpbdForceField& field, float distance, float radial_distance) {
+    if (!isfinite(distance)) {
+        return 0.0f;
+    }
+    float min_distance = fmaxf(field.distance_min, 0.0f);
+    float max_distance = fmaxf(field.distance_max, 0.0f);
+    float radial_min = fmaxf(field.radial_min, 0.0f);
+    float radial_max = fmaxf(field.radial_max, 0.0f);
+    if (field.use_max_distance && max_distance > 0.0f && distance >= max_distance) {
+        return 0.0f;
+    }
+    if (field.use_radial_max && radial_max > 0.0f && radial_distance >= radial_max) {
+        return 0.0f;
+    }
+
+    float attenuation = 1.0f;
+    if (field.use_max_distance && max_distance > min_distance && distance > min_distance) {
+        attenuation *= clamp01((max_distance - distance) / fmaxf(max_distance - min_distance, kEps));
+    }
+    if (field.use_min_distance && field.falloff_power > 0.0f && distance > min_distance) {
+        float reference = fmaxf(min_distance, 1.0e-4f);
+        attenuation *= powf(reference / fmaxf(distance, reference), field.falloff_power);
+    }
+    if (field.use_radial_max && radial_max > radial_min && radial_distance > radial_min) {
+        attenuation *= clamp01((radial_max - radial_distance) / fmaxf(radial_max - radial_min, kEps));
+    }
+    if (field.use_radial_min && field.radial_falloff > 0.0f && radial_distance > radial_min) {
+        float reference = fmaxf(radial_min, 1.0e-4f);
+        attenuation *= powf(reference / fmaxf(radial_distance, reference), field.radial_falloff);
+    }
+    return isfinite(attenuation) ? attenuation : 0.0f;
+}
+
+__device__ Vec3 limit_force_field_acceleration(Vec3 value) {
+    float len = length(value);
+    if (!isfinite(len) || len <= kAbi41MaxForceFieldAcceleration) {
+        return isfinite(len) ? value : make_vec3(0.0f, 0.0f, 0.0f);
+    }
+    return mul(value, kAbi41MaxForceFieldAcceleration / fmaxf(len, kEps));
+}
+
+__device__ Vec3 evaluate_force_field(const SsblXpbdForceField& field, Vec3 p, Vec3 velocity) {
+    if (!isfinite(field.strength) || field.strength == 0.0f) {
+        return make_vec3(0.0f, 0.0f, 0.0f);
+    }
+    Vec3 origin = array_vec3(field.origin);
+    Vec3 delta = sub(p, origin);
+    Vec3 axis = normalize_or(array_vec3(field.axis), make_vec3(0.0f, 0.0f, 1.0f));
+    Vec3 radial_delta = field.use_2d_force ? sub(delta, mul(axis, dot(delta, axis))) : delta;
+    float distance = length(delta);
+    float radial_distance = length(radial_delta);
+    float strength = field.strength * force_field_falloff(field, distance, radial_distance);
+    if (strength == 0.0f || !isfinite(strength)) {
+        return make_vec3(0.0f, 0.0f, 0.0f);
+    }
+
+    if (field.type == kAbi41ForceFieldWind) {
+        return mul(normalize_or(array_vec3(field.direction), make_vec3(0.0f, 0.0f, 0.0f)), strength);
+    }
+    if (field.type == kAbi41ForceFieldForce || field.type == kAbi41ForceFieldCharge) {
+        Vec3 source_delta = field.use_2d_force ? radial_delta : delta;
+        float source_distance = field.use_2d_force ? radial_distance : distance;
+        if (source_distance <= 1.0e-6f) {
+            return make_vec3(0.0f, 0.0f, 0.0f);
+        }
+        float scale = strength / fmaxf(source_distance, kEps);
+        if (field.type == kAbi41ForceFieldCharge) {
+            scale /= fmaxf(source_distance * source_distance, 0.01f);
+        }
+        return limit_force_field_acceleration(mul(source_delta, scale));
+    }
+    if (field.type == kAbi41ForceFieldVortex) {
+        Vec3 radial = sub(delta, mul(axis, dot(delta, axis)));
+        if (dot(radial, radial) <= 1.0e-10f) {
+            return make_vec3(0.0f, 0.0f, 0.0f);
+        }
+        Vec3 tangent = normalize_or(cross(axis, radial), make_vec3(0.0f, 0.0f, 0.0f));
+        return mul(tangent, strength);
+    }
+    if (field.type == kAbi41ForceFieldHarmonic) {
+        float source_distance = field.use_2d_force ? radial_distance : distance;
+        Vec3 source_delta = field.use_2d_force ? radial_delta : delta;
+        if (source_distance <= 1.0e-6f) {
+            return make_vec3(0.0f, 0.0f, 0.0f);
+        }
+        Vec3 direction = mul(source_delta, 1.0f / fmaxf(source_distance, kEps));
+        float rest_length = fmaxf(field.rest_length, 0.0f);
+        float spring = -strength * (source_distance - rest_length);
+        float damping = -dot(velocity, direction) * fmaxf(field.harmonic_damping, 0.0f) * fabsf(strength);
+        return limit_force_field_acceleration(mul(direction, spring + damping));
+    }
+    if (field.type == kAbi41ForceFieldLennardJ) {
+        if (distance <= 1.0e-6f) {
+            return make_vec3(0.0f, 0.0f, 0.0f);
+        }
+        Vec3 direction = mul(delta, 1.0f / fmaxf(distance, kEps));
+        float radius = fmaxf(field.rest_length, fmaxf(field.size, 0.1f));
+        float ratio = fminf(radius / fmaxf(distance, 1.0e-3f), 6.0f);
+        float ratio2 = ratio * ratio;
+        float ratio6 = ratio2 * ratio2 * ratio2;
+        float magnitude = strength * (ratio6 * ratio6 - ratio6);
+        return limit_force_field_acceleration(mul(direction, magnitude));
+    }
+    if (field.type == kAbi41ForceFieldMagnet) {
+        Vec3 magnetic_axis = normalize_or(array_vec3(field.direction), make_vec3(0.0f, 0.0f, 0.0f));
+        return limit_force_field_acceleration(mul(cross(velocity, magnetic_axis), strength));
+    }
+    if (field.type == kAbi41ForceFieldDrag) {
+        float speed = length(velocity);
+        if (speed <= 1.0e-6f) {
+            return make_vec3(0.0f, 0.0f, 0.0f);
+        }
+        float linear = fmaxf(field.linear_drag, 0.0f);
+        float quadratic = fmaxf(field.quadratic_drag, 0.0f);
+        if (linear <= 0.0f && quadratic <= 0.0f) {
+            linear = fabsf(strength);
+        }
+        return limit_force_field_acceleration(mul(velocity, -(linear + quadratic * speed)));
+    }
+    if (field.type == kAbi41ForceFieldTurbulence || field.type == kAbi41ForceFieldTexture) {
+        float frequency = fmaxf(fmaxf(field.noise, field.texture_nabla), 0.25f);
+        if (field.size > 1.0e-6f) {
+            frequency = fmaxf(frequency, 1.0f / field.size);
+        }
+        Vec3 q = mul(delta, frequency);
+        Vec3 noise_vec = make_vec3(
+            force_field_noise(q, field.seed, 0.0f),
+            force_field_noise(q, field.seed, 7.0f),
+            force_field_noise(q, field.seed, 13.0f)
+        );
+        return limit_force_field_acceleration(mul(noise_vec, strength));
+    }
+    return make_vec3(0.0f, 0.0f, 0.0f);
+}
+
+__device__ Vec3 force_field_acceleration(Abi41Solver solver, Vec3 p, Vec3 velocity) {
+    Vec3 acceleration = make_vec3(0.0f, 0.0f, 0.0f);
+    if (!solver.force_fields || solver.force_field_count <= 0) {
+        return acceleration;
+    }
+    int count = solver.force_field_count;
+    if (count > kAbi41MaxForceFields) {
+        count = kAbi41MaxForceFields;
+    }
+    for (int index = 0; index < count; ++index) {
+        acceleration = add(acceleration, evaluate_force_field(solver.force_fields[index], p, velocity));
+    }
+    return limit_force_field_acceleration(acceleration);
 }
 
 __device__ void atomic_max_float(float* dst, float value) {
@@ -310,8 +502,9 @@ __global__ void abi41_integrate_kernel(Abi41Solver solver, float dt) {
         solver.pos[i] = solver.rest[i];
         return;
     }
-    Vec3 gravity = make_vec3(solver.cfg.gravity[0], solver.cfg.gravity[1], solver.cfg.gravity[2]);
-    Vec3 v = add(solver.vel[i], mul(gravity, dt));
+    Vec3 acceleration = make_vec3(solver.cfg.gravity[0], solver.cfg.gravity[1], solver.cfg.gravity[2]);
+    acceleration = add(acceleration, force_field_acceleration(solver, solver.pos[i], solver.vel[i]));
+    Vec3 v = add(solver.vel[i], mul(acceleration, dt));
     v = mul(v, solver.cfg.damping);
     solver.vel[i] = v;
     solver.pos[i] = add(solver.pos[i], mul(v, dt));
@@ -1826,6 +2019,52 @@ bool alloc_and_copy(T** dst, const T* src, int count, const char* label) {
     return true;
 }
 
+bool upload_force_fields(
+    Abi41Solver* solver,
+    const SsblXpbdForceField* force_fields,
+    int force_field_count,
+    int unsupported_force_field_count
+) {
+    if (!solver) {
+        return set_error("invalid force field update");
+    }
+    if (force_field_count < 0 || force_field_count > kAbi41MaxForceFields) {
+        return set_error("force field count exceeds SSBL maximum");
+    }
+    solver->unsupported_force_field_count = std::max(unsupported_force_field_count, 0);
+    if (force_field_count <= 0) {
+        solver->force_field_count = 0;
+        return true;
+    }
+    if (!force_fields) {
+        return set_error("missing force field data");
+    }
+    if (force_field_count > solver->force_field_capacity) {
+        cudaFree(solver->force_fields);
+        solver->force_fields = nullptr;
+        solver->force_field_capacity = 0;
+        cudaError_t err = cudaMalloc(
+            reinterpret_cast<void**>(&solver->force_fields),
+            sizeof(SsblXpbdForceField) * force_field_count
+        );
+        if (!set_cuda_error(err, "force field allocation")) {
+            return false;
+        }
+        solver->force_field_capacity = force_field_count;
+    }
+    if (!set_cuda_error(
+            cudaMemcpy(
+                solver->force_fields,
+                force_fields,
+                sizeof(SsblXpbdForceField) * force_field_count,
+                cudaMemcpyHostToDevice),
+            "upload force fields")) {
+        return false;
+    }
+    solver->force_field_count = force_field_count;
+    return true;
+}
+
 int next_power_of_two(int value) {
     int result = 1;
     value = std::max(value, 1);
@@ -2354,6 +2593,7 @@ void free_solver(Abi41Solver* solver) {
     cudaFree(solver->dynamic_particle_cell_coords);
     cudaFree(solver->triangle_pairs);
     cudaFree(solver->triangle_pair_count);
+    cudaFree(solver->force_fields);
     cudaFree(solver->pin_indices);
     cudaFree(solver->pin_targets);
     cudaFree(solver->abi41_counts);
@@ -2698,12 +2938,16 @@ extern "C" SSBL_API int ssbl_update_frame_inputs(void* handle, const SsblXpbdFra
         && !upload_static_triangles(solver, inputs->static_triangles, inputs->static_triangle_count)) {
         return 0;
     }
-    if (inputs->update_force_fields) {
-        solver->force_field_count = std::max(inputs->force_field_count, 0);
-        solver->unsupported_force_field_count = std::max(inputs->unsupported_force_field_count, 0);
-        solver->diag.force_field_count = solver->force_field_count;
-        solver->diag.unsupported_force_field_count = solver->unsupported_force_field_count;
+    if (inputs->update_force_fields
+        && !upload_force_fields(
+            solver,
+            inputs->force_fields,
+            inputs->force_field_count,
+            inputs->unsupported_force_field_count)) {
+        return 0;
     }
+    solver->diag.force_field_count = solver->force_field_count;
+    solver->diag.unsupported_force_field_count = solver->unsupported_force_field_count;
     return 1;
 }
 
