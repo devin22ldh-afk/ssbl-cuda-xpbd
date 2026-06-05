@@ -201,12 +201,16 @@ def _run_vertex_vertex_smoke() -> None:
         "candidate_count": int(diag.candidate_count),
         "resolved_contacts": int(diag.resolved_contacts),
         "abi41_soft_contact_count": int(diag.abi41_soft_contact_count),
+        "abi41_exact_impulse_contact_count": int(diag.abi41_exact_impulse_contact_count),
+        "abi41_max_smoothed_delta": float(diag.abi41_max_smoothed_delta),
         "fast_soft_repulsion_candidates": int(diag.fast_soft_repulsion_candidates),
     }
     if not finite:
         raise RuntimeError(f"non-finite ABI37 self collision output: {json.dumps(result)}")
-    if diag.abi41_soft_contact_count <= 0 or diag.fast_soft_repulsion_candidates <= 0:
+    if diag.abi41_soft_contact_count + diag.abi41_exact_impulse_contact_count <= 0 or diag.fast_soft_repulsion_candidates <= 0:
         raise RuntimeError(f"ABI37 self collision did not report contacts: {json.dumps(result)}")
+    if not diag.abi41_max_smoothed_delta > 0.0:
+        raise RuntimeError(f"ABI37 self collision did not report smoothed delta: {json.dumps(result)}")
     if not final_gap > initial_gap + 1.0e-4:
         raise RuntimeError(f"ABI37 self collision did not separate vertices: {json.dumps(result)}")
     if not all(math.isfinite(float(value)) for value in (initial_gap, final_gap)):
@@ -242,12 +246,16 @@ def _run_vertex_triangle_smoke() -> None:
         "candidate_count": int(diag.candidate_count),
         "resolved_contacts": int(diag.resolved_contacts),
         "abi41_soft_contact_count": int(diag.abi41_soft_contact_count),
+        "abi41_exact_impulse_contact_count": int(diag.abi41_exact_impulse_contact_count),
+        "abi41_max_smoothed_delta": float(diag.abi41_max_smoothed_delta),
         "fast_soft_repulsion_candidates": int(diag.fast_soft_repulsion_candidates),
     }
     if not finite:
         raise RuntimeError(f"non-finite ABI37 self VT output: {json.dumps(result)}")
     if diag.abi41_soft_contact_count <= 0 or diag.fast_soft_repulsion_candidates <= 0:
         raise RuntimeError(f"ABI37 self VT did not report contacts: {json.dumps(result)}")
+    if not diag.abi41_max_smoothed_delta > 0.0:
+        raise RuntimeError(f"ABI37 self VT did not report smoothed delta: {json.dumps(result)}")
     if not final_height > initial_height + 1.0e-4:
         raise RuntimeError(f"ABI37 self VT did not separate from triangle: {json.dumps(result)}")
     if not all(math.isfinite(float(value)) for value in (initial_height, final_height)):
@@ -283,13 +291,17 @@ def _run_edge_edge_smoke() -> None:
         "candidate_count": int(diag.candidate_count),
         "resolved_contacts": int(diag.resolved_contacts),
         "abi41_soft_contact_count": int(diag.abi41_soft_contact_count),
+        "abi41_exact_impulse_contact_count": int(diag.abi41_exact_impulse_contact_count),
         "abi41_edge_edge_contact_count": int(diag.abi41_edge_edge_contact_count),
+        "abi41_max_smoothed_delta": float(diag.abi41_max_smoothed_delta),
         "fast_soft_repulsion_candidates": int(diag.fast_soft_repulsion_candidates),
     }
     if not finite:
         raise RuntimeError(f"non-finite ABI37 self EE output: {json.dumps(result)}")
     if diag.abi41_edge_edge_contact_count <= 0 or diag.resolved_contacts <= 0:
         raise RuntimeError(f"ABI37 self EE did not report contacts: {json.dumps(result)}")
+    if not diag.abi41_max_smoothed_delta > 0.0:
+        raise RuntimeError(f"ABI37 self EE did not report smoothed delta: {json.dumps(result)}")
     if not final_height > initial_height + 1.0e-4:
         raise RuntimeError(f"ABI37 self EE did not separate crossing edges: {json.dumps(result)}")
     if not all(math.isfinite(float(value)) for value in (initial_height, final_height)):

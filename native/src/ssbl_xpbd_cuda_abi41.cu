@@ -29,6 +29,7 @@ constexpr int kAbi41MinSelfTriangleHashBuckets = 1024;
 constexpr int kAbi41SelfEdgeHashMinCount = 64;
 constexpr int kAbi41SelfEdgeHashBucketSlots = 32;
 constexpr int kAbi41MinSelfEdgeHashBuckets = 1024;
+constexpr int kAbi41SelfCollisionNeighborSlots = 32;
 constexpr int kAbi41TriangleHashMinCount = 64;
 constexpr int kAbi41TriangleHashBucketSlots = 32;
 constexpr int kAbi41MinTriangleHashBuckets = 1024;
@@ -45,6 +46,7 @@ constexpr int kAbi41CountSelfCandidates = 9;
 constexpr int kAbi41CountSelfOverflow = 10;
 constexpr int kAbi41CountSlots = 11;
 constexpr float kAbi41SpringRelaxation = 0.18f;
+constexpr float kAbi41SelfAveragingClampScale = 0.35f;
 
 std::string g_last_error;
 
@@ -95,6 +97,13 @@ struct Abi41Solver {
     int self_edge_hash_bucket_count = 0;
     int self_edge_hash_ready = 0;
     float self_edge_hash_cell_size = 0.0f;
+    unsigned int* self_collision_counts = nullptr;
+    unsigned int* self_collision_indices = nullptr;
+    float* self_collision_radii = nullptr;
+    Vec3* self_accumulated_delta = nullptr;
+    float* self_accumulated_weight = nullptr;
+    Vec3* self_averaged_delta = nullptr;
+    float* self_max_smoothed_delta_device = nullptr;
     Vec3* static_triangles = nullptr;
     int* static_triangle_bucket_counts = nullptr;
     int* static_triangle_bucket_indices = nullptr;
@@ -207,6 +216,39 @@ __device__ void atomic_add(Vec3* dst, Vec3 value) {
     atomicAdd(&dst->x, value.x);
     atomicAdd(&dst->y, value.y);
     atomicAdd(&dst->z, value.z);
+}
+
+__device__ float length(Vec3 value) {
+    return sqrtf(fmaxf(dot(value, value), 0.0f));
+}
+
+__device__ void atomic_max_float(float* dst, float value) {
+    if (!dst || value <= 0.0f) {
+        return;
+    }
+    int* address_as_int = reinterpret_cast<int*>(dst);
+    int old = *address_as_int;
+    while (value > __int_as_float(old)) {
+        const int assumed = old;
+        old = atomicCAS(address_as_int, assumed, __float_as_int(value));
+        if (old == assumed) {
+            break;
+        }
+    }
+}
+
+__device__ void abi41_accumulate_self_delta(Abi41Solver solver, int vertex, Vec3 delta, float weight = 1.0f) {
+    if (vertex < 0
+        || vertex >= solver.cfg.vertex_count
+        || !solver.self_accumulated_delta
+        || !solver.self_accumulated_weight
+        || solver.inv_mass[vertex] <= 0.0f
+        || (solver.state_flags[vertex] & ssbl_abi41::kPinnedOrKinematicFlag) != 0u
+        || weight <= 0.0f) {
+        return;
+    }
+    atomic_add(&solver.self_accumulated_delta[vertex], delta);
+    atomicAdd(&solver.self_accumulated_weight[vertex], weight);
 }
 
 __device__ Vec3 closest_point_on_triangle(Vec3 p, Vec3 a, Vec3 b, Vec3 c) {
@@ -1009,70 +1051,56 @@ __global__ void abi41_build_self_triangle_hash_kernel(Abi41Solver solver) {
     }
 }
 
-__device__ bool abi41_apply_soft_self_pair(Abi41Solver solver, int i, int j, float target, float onset) {
-    if (j <= i || j >= solver.cfg.vertex_count || target <= 0.0f || onset <= target) {
+__device__ bool abi41_self_neighbor_valid(Abi41Solver solver, int source, int other, float target, float onset) {
+    if (source < 0
+        || other < 0
+        || source >= solver.cfg.vertex_count
+        || other >= solver.cfg.vertex_count
+        || source == other
+        || target <= 0.0f
+        || onset <= target
+        || solver.inv_mass[source] <= 0.0f
+        || (solver.state_flags[source] & ssbl_abi41::kPinnedOrKinematicFlag) != 0u) {
         return false;
     }
-    const float wi = solver.inv_mass[i];
-    const float wj = solver.inv_mass[j];
-    if (wi <= 0.0f && wj <= 0.0f) {
-        return false;
-    }
-
-    const Vec3 rest_delta = sub(solver.rest[i], solver.rest[j]);
+    const Vec3 rest_delta = sub(solver.rest[source], solver.rest[other]);
     const float rest_skip = fmaxf(onset * 1.25f, target * 2.5f);
     if (dot(rest_delta, rest_delta) < rest_skip * rest_skip) {
         return false;
     }
-
-    const Vec3 pi = solver.pos[i];
-    const Vec3 pj = solver.pos[j];
-    const Vec3 d = sub(pi, pj);
-    const float dist_sq = dot(d, d);
-    float dist = sqrtf(fmaxf(dist_sq, kEps));
-    if (dist >= onset) {
-        return false;
-    }
-    atomicAdd(&solver.abi41_counts[kAbi41CountSelfCandidates], 1ull);
-
-    Vec3 normal = make_vec3(0.0f, 0.0f, 1.0f);
-    if (dist_sq > kEps) {
-        normal = mul(d, 1.0f / dist);
-    } else {
-        const float rest_len_sq = dot(rest_delta, rest_delta);
-        if (rest_len_sq > kEps) {
-            normal = mul(rest_delta, rsqrtf(rest_len_sq));
-        }
-        dist = 0.0f;
-    }
-
-    const float penetration = target - dist;
-    float push = 0.0f;
-    if (penetration > 0.0f) {
-        push = fminf(penetration * 0.45f + target * 0.02f, target * 0.35f);
-    } else {
-        const float x = 1.0f - fminf(dist / onset, 1.0f);
-        push = fminf(x * x * target * 0.10f, target * 0.06f);
-    }
-    const float total = wi + wj;
-    if (push <= 0.0f || total <= 0.0f) {
-        return true;
-    }
-
-    const Vec3 delta = mul(normal, push / total);
-    if (wi > 0.0f) {
-        atomic_add(&solver.pos[i], mul(delta, wi));
-    }
-    if (wj > 0.0f) {
-        atomic_add(&solver.pos[j], mul(delta, -wj));
-    }
-    atomicAdd(&solver.abi41_counts[kAbi41CountSoftContacts], 1ull);
-    return true;
+    const Vec3 current_delta = sub(solver.pos[source], solver.pos[other]);
+    const Vec3 previous_delta = sub(solver.prev[source], solver.prev[other]);
+    return dot(current_delta, current_delta) < onset * onset
+        || dot(previous_delta, previous_delta) < onset * onset;
 }
 
-__global__ void abi41_soft_vertex_repulsion_hash_kernel(Abi41Solver solver) {
+__global__ void abi41_reset_self_accumulation_kernel(Abi41Solver solver) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= solver.cfg.vertex_count
+    if (i >= solver.cfg.vertex_count) {
+        return;
+    }
+    if (solver.self_collision_counts) {
+        solver.self_collision_counts[i] = 0u;
+    }
+    if (solver.self_collision_radii) {
+        solver.self_collision_radii[i] = abi41_self_contact_radius(solver.cfg) * 0.5f;
+    }
+    if (solver.self_accumulated_delta) {
+        solver.self_accumulated_delta[i] = make_vec3(0.0f, 0.0f, 0.0f);
+    }
+    if (solver.self_accumulated_weight) {
+        solver.self_accumulated_weight[i] = 0.0f;
+    }
+    if (solver.self_averaged_delta) {
+        solver.self_averaged_delta[i] = make_vec3(0.0f, 0.0f, 0.0f);
+    }
+}
+
+__global__ void abi41_build_self_neighbor_table_hash_kernel(Abi41Solver solver) {
+    const int source = blockIdx.x * blockDim.x + threadIdx.x;
+    if (source >= solver.cfg.vertex_count
+        || !solver.self_collision_counts
+        || !solver.self_collision_indices
         || !solver.self_bucket_counts
         || !solver.self_bucket_indices
         || !solver.self_cell_coords
@@ -1081,70 +1109,214 @@ __global__ void abi41_soft_vertex_repulsion_hash_kernel(Abi41Solver solver) {
     }
     const float target = abi41_self_contact_radius(solver.cfg);
     if (target <= 0.0f) {
+        solver.self_collision_counts[source] = 0u;
         return;
     }
     const float onset = fmaxf(target * 1.8f, target + kEps);
-    const Vec3 p = solver.pos[i];
+    const Vec3 p = solver.pos[source];
     const int cx = cell_coord(p.x, solver.self_hash_cell_size);
     const int cy = cell_coord(p.y, solver.self_hash_cell_size);
     const int cz = cell_coord(p.z, solver.self_hash_cell_size);
-    int max_neighbors = solver.cfg.max_self_collision_neighbors;
-    if (max_neighbors < 1) {
-        max_neighbors = 1;
-    }
-    if (max_neighbors > kAbi41SelfHashBucketSlots) {
-        max_neighbors = kAbi41SelfHashBucketSlots;
-    }
-    int accepted = 0;
-    for (int dz = -1; dz <= 1 && accepted < max_neighbors; ++dz) {
-        for (int dy = -1; dy <= 1 && accepted < max_neighbors; ++dy) {
-            for (int dx = -1; dx <= 1 && accepted < max_neighbors; ++dx) {
+    unsigned int accepted = 0u;
+    for (int dz = -1; dz <= 1 && accepted < kAbi41SelfCollisionNeighborSlots; ++dz) {
+        for (int dy = -1; dy <= 1 && accepted < kAbi41SelfCollisionNeighborSlots; ++dy) {
+            for (int dx = -1; dx <= 1 && accepted < kAbi41SelfCollisionNeighborSlots; ++dx) {
                 const int qx = cx + dx;
                 const int qy = cy + dy;
                 const int qz = cz + dz;
                 const unsigned int bucket = hash_cell(qx, qy, qz, solver.self_hash_bucket_count);
                 const int stored = solver.self_bucket_counts[bucket];
                 const int limit = stored < kAbi41SelfHashBucketSlots ? stored : kAbi41SelfHashBucketSlots;
-                for (int slot = 0; slot < limit && accepted < max_neighbors; ++slot) {
-                    const int j = solver.self_bucket_indices[static_cast<int>(bucket) * kAbi41SelfHashBucketSlots + slot];
-                    if (solver.self_cell_coords[j * 3 + 0] != qx
-                        || solver.self_cell_coords[j * 3 + 1] != qy
-                        || solver.self_cell_coords[j * 3 + 2] != qz) {
+                for (int slot = 0; slot < limit && accepted < kAbi41SelfCollisionNeighborSlots; ++slot) {
+                    const int other = solver.self_bucket_indices[static_cast<int>(bucket) * kAbi41SelfHashBucketSlots + slot];
+                    if (solver.self_cell_coords[other * 3 + 0] != qx
+                        || solver.self_cell_coords[other * 3 + 1] != qy
+                        || solver.self_cell_coords[other * 3 + 2] != qz
+                        || !abi41_self_neighbor_valid(solver, source, other, target, onset)) {
                         continue;
                     }
-                    if (abi41_apply_soft_self_pair(solver, i, j, target, onset)) {
-                        ++accepted;
-                    }
+                    solver.self_collision_indices[source * kAbi41SelfCollisionNeighborSlots + static_cast<int>(accepted)] =
+                        static_cast<unsigned int>(other);
+                    ++accepted;
                 }
             }
         }
     }
+    if (accepted >= kAbi41SelfCollisionNeighborSlots) {
+        atomicAdd(&solver.abi41_counts[kAbi41CountSelfOverflow], 1ull);
+    }
+    solver.self_collision_counts[source] = accepted;
 }
 
-__global__ void abi41_soft_vertex_repulsion_kernel(Abi41Solver solver) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    int n = solver.cfg.vertex_count;
-    if (i >= n) {
+__global__ void abi41_build_self_neighbor_table_kernel(Abi41Solver solver) {
+    const int source = blockIdx.x * blockDim.x + threadIdx.x;
+    if (source >= solver.cfg.vertex_count || !solver.self_collision_counts || !solver.self_collision_indices) {
         return;
     }
     const float target = abi41_self_contact_radius(solver.cfg);
     if (target <= 0.0f) {
+        solver.self_collision_counts[source] = 0u;
         return;
     }
     const float onset = fmaxf(target * 1.8f, target + kEps);
-    int max_neighbors = solver.cfg.max_self_collision_neighbors;
-    if (max_neighbors < 1) {
-        max_neighbors = 1;
+    unsigned int accepted = 0u;
+    for (int other = 0; other < solver.cfg.vertex_count && accepted < kAbi41SelfCollisionNeighborSlots; ++other) {
+        if (!abi41_self_neighbor_valid(solver, source, other, target, onset)) {
+            continue;
+        }
+        solver.self_collision_indices[source * kAbi41SelfCollisionNeighborSlots + static_cast<int>(accepted)] =
+            static_cast<unsigned int>(other);
+        ++accepted;
     }
-    if (max_neighbors > kAbi41SelfHashBucketSlots) {
-        max_neighbors = kAbi41SelfHashBucketSlots;
+    if (accepted >= kAbi41SelfCollisionNeighborSlots) {
+        atomicAdd(&solver.abi41_counts[kAbi41CountSelfOverflow], 1ull);
     }
-    int accepted = 0;
-    for (int j = i + 1; j < n && accepted < max_neighbors; ++j) {
-        if (abi41_apply_soft_self_pair(solver, i, j, target, onset)) {
-            ++accepted;
+    solver.self_collision_counts[source] = accepted;
+}
+
+__global__ void abi41_set_self_collision_repulsion_kernel(Abi41Solver solver) {
+    const int source = blockIdx.x * blockDim.x + threadIdx.x;
+    if (source >= solver.cfg.vertex_count
+        || !solver.self_collision_counts
+        || !solver.self_collision_indices
+        || !solver.self_collision_radii) {
+        return;
+    }
+    if (solver.inv_mass[source] <= 0.0f
+        || (solver.state_flags[source] & ssbl_abi41::kPinnedOrKinematicFlag) != 0u) {
+        return;
+    }
+    const unsigned int contact_count = solver.self_collision_counts[source];
+    if (contact_count == 0u) {
+        return;
+    }
+
+    const Vec3 p_curr = solver.pos[source];
+    const Vec3 p_prev = solver.prev[source];
+    const float r_self = solver.self_collision_radii[source];
+    const unsigned int limit = contact_count < kAbi41SelfCollisionNeighborSlots
+        ? contact_count
+        : static_cast<unsigned int>(kAbi41SelfCollisionNeighborSlots);
+    for (unsigned int n = 0; n < limit; ++n) {
+        const int other = static_cast<int>(solver.self_collision_indices[source * kAbi41SelfCollisionNeighborSlots + static_cast<int>(n)]);
+        if (other < 0 || other >= solver.cfg.vertex_count || other == source) {
+            continue;
+        }
+        atomicAdd(&solver.abi41_counts[kAbi41CountSelfCandidates], 1ull);
+        const Vec3 q_curr = solver.pos[other];
+        const Vec3 q_prev = solver.prev[other];
+        const float thickness = r_self + solver.self_collision_radii[other];
+        if (thickness <= 0.0f) {
+            continue;
+        }
+
+        Vec3 response = make_vec3(0.0f, 0.0f, 0.0f);
+        bool hit = false;
+        const Vec3 d_ref = sub(p_prev, q_prev);
+        const float c_coeff = dot(d_ref, d_ref) - thickness * thickness;
+        const Vec3 disp_self = sub(p_curr, p_prev);
+        const Vec3 disp_other = sub(q_curr, q_prev);
+        const Vec3 rel_disp = sub(disp_self, disp_other);
+        const float a_coeff = dot(rel_disp, rel_disp);
+        const float b_coeff = dot(d_ref, rel_disp);
+
+        if (c_coeff >= 0.0f && b_coeff < 0.0f && a_coeff > 1.0e-5f) {
+            const float discriminant = b_coeff * b_coeff - a_coeff * c_coeff;
+            if (discriminant >= 0.0f) {
+                const float t = (-b_coeff - sqrtf(discriminant)) / a_coeff;
+                if (t > 0.0f && t <= 1.0f) {
+                    const float s = 1.0f - t;
+                    const Vec3 p_hit = add(mul(p_prev, s), mul(p_curr, t));
+                    const Vec3 q_hit = add(mul(q_prev, s), mul(q_curr, t));
+                    Vec3 normal = sub(p_hit, q_hit);
+                    const float normal_len_sq = dot(normal, normal);
+                    if (normal_len_sq > kEps) {
+                        normal = mul(normal, rsqrtf(normal_len_sq));
+                        const Vec3 vel_p = sub(p_curr, p_hit);
+                        const Vec3 vel_q = sub(q_curr, q_hit);
+                        float v_normal = dot(sub(vel_p, vel_q), normal);
+                        if (v_normal > 0.0f) {
+                            const bool other_pinned = solver.inv_mass[other] <= 0.0f
+                                || (solver.state_flags[other] & ssbl_abi41::kPinnedOrKinematicFlag) != 0u;
+                            const float scale = other_pinned ? 1.0f : 0.5f;
+                            response = mul(normal, -v_normal * scale);
+                            hit = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!hit) {
+            Vec3 delta = sub(p_curr, q_curr);
+            const float dist_sq = dot(delta, delta);
+            if (dist_sq >= thickness * thickness) {
+                continue;
+            }
+            Vec3 normal = make_vec3(0.0f, 0.0f, 1.0f);
+            float dist = sqrtf(fmaxf(dist_sq, kEps));
+            if (dist_sq > kEps) {
+                normal = mul(delta, 1.0f / dist);
+            } else {
+                const Vec3 rest_delta = sub(solver.rest[source], solver.rest[other]);
+                const float rest_len_sq = dot(rest_delta, rest_delta);
+                if (rest_len_sq > kEps) {
+                    normal = mul(rest_delta, rsqrtf(rest_len_sq));
+                }
+                dist = 0.0f;
+            }
+            const bool other_pinned = solver.inv_mass[other] <= 0.0f
+                || (solver.state_flags[other] & ssbl_abi41::kPinnedOrKinematicFlag) != 0u;
+            const float scale = other_pinned ? 1.0f : 0.5f;
+            response = mul(normal, fminf((thickness - dist) * scale, thickness * kAbi41SelfAveragingClampScale));
+            hit = true;
+        }
+
+        if (hit && dot(response, response) > kEps) {
+            const float max_len = fmaxf(thickness * kAbi41SelfAveragingClampScale, 1.0e-4f);
+            const float response_len = length(response);
+            if (response_len > max_len) {
+                response = mul(response, max_len / response_len);
+            }
+            abi41_accumulate_self_delta(solver, source, response, 1.0f);
+            atomicAdd(&solver.abi41_counts[kAbi41CountExactImpulseContacts], 1ull);
         }
     }
+}
+
+__global__ void abi41_averaging_position_kernel(Abi41Solver solver) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= solver.cfg.vertex_count || !solver.self_accumulated_delta || !solver.self_accumulated_weight || !solver.self_averaged_delta) {
+        return;
+    }
+    solver.self_averaged_delta[i] = make_vec3(0.0f, 0.0f, 0.0f);
+    if (solver.inv_mass[i] <= 0.0f || (solver.state_flags[i] & ssbl_abi41::kPinnedOrKinematicFlag) != 0u) {
+        return;
+    }
+    const float weight = solver.self_accumulated_weight[i];
+    if (weight <= 0.0f) {
+        return;
+    }
+    Vec3 averaged = mul(solver.self_accumulated_delta[i], 1.0f / weight);
+    const float target = abi41_self_contact_radius(solver.cfg);
+    const float max_delta = fmaxf(target * kAbi41SelfAveragingClampScale, 1.0e-4f);
+    const float delta_len = length(averaged);
+    if (delta_len > max_delta) {
+        averaged = mul(averaged, max_delta / delta_len);
+    }
+    solver.self_averaged_delta[i] = averaged;
+    atomic_max_float(solver.self_max_smoothed_delta_device, length(averaged));
+}
+
+__global__ void abi41_apply_self_averaged_delta_kernel(Abi41Solver solver) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= solver.cfg.vertex_count || !solver.self_averaged_delta) {
+        return;
+    }
+    if (solver.inv_mass[i] <= 0.0f || (solver.state_flags[i] & ssbl_abi41::kPinnedOrKinematicFlag) != 0u) {
+        return;
+    }
+    solver.pos[i] = add(solver.pos[i], solver.self_averaged_delta[i]);
 }
 
 __device__ bool abi41_apply_soft_vertex_triangle_pair(
@@ -1228,16 +1400,16 @@ __device__ bool abi41_apply_soft_vertex_triangle_pair(
 
     const Vec3 delta = mul(normal, push / total);
     if (wv > 0.0f) {
-        atomic_add(&solver.pos[vertex], mul(delta, wv));
+        abi41_accumulate_self_delta(solver, vertex, mul(delta, wv), 1.0f);
     }
     if (wta > 0.0f) {
-        atomic_add(&solver.pos[ia], mul(delta, -wta));
+        abi41_accumulate_self_delta(solver, ia, mul(delta, -wta), 1.0f);
     }
     if (wtb > 0.0f) {
-        atomic_add(&solver.pos[ib], mul(delta, -wtb));
+        abi41_accumulate_self_delta(solver, ib, mul(delta, -wtb), 1.0f);
     }
     if (wtc > 0.0f) {
-        atomic_add(&solver.pos[ic], mul(delta, -wtc));
+        abi41_accumulate_self_delta(solver, ic, mul(delta, -wtc), 1.0f);
     }
     atomicAdd(&solver.abi41_counts[kAbi41CountSoftContacts], 1ull);
     return true;
@@ -1535,16 +1707,16 @@ __device__ bool abi41_apply_soft_edge_edge_pair(Abi41Solver solver, int edge_a_i
 
     const Vec3 delta = mul(normal, push / total);
     if (wa0 > 0.0f) {
-        atomic_add(&solver.pos[a0], mul(delta, wa0));
+        abi41_accumulate_self_delta(solver, a0, mul(delta, wa0), 1.0f);
     }
     if (wa1 > 0.0f) {
-        atomic_add(&solver.pos[a1], mul(delta, wa1));
+        abi41_accumulate_self_delta(solver, a1, mul(delta, wa1), 1.0f);
     }
     if (wb0 > 0.0f) {
-        atomic_add(&solver.pos[b0], mul(delta, -wb0));
+        abi41_accumulate_self_delta(solver, b0, mul(delta, -wb0), 1.0f);
     }
     if (wb1 > 0.0f) {
-        atomic_add(&solver.pos[b1], mul(delta, -wb1));
+        abi41_accumulate_self_delta(solver, b1, mul(delta, -wb1), 1.0f);
     }
     atomicAdd(&solver.abi41_counts[kAbi41CountEdgeEdgeContacts], 1ull);
     return true;
@@ -1908,6 +2080,26 @@ bool build_self_collision_hash(Abi41Solver* solver) {
     return set_cuda_error(cudaGetLastError(), "build self collision hash");
 }
 
+bool reset_self_accumulation(Abi41Solver* solver) {
+    if (!solver || solver->cfg.vertex_count <= 0 || !solver->self_accumulated_delta || !solver->self_accumulated_weight) {
+        return true;
+    }
+    abi41_reset_self_accumulation_kernel<<<block_count(solver->cfg.vertex_count), kThreads>>>(*solver);
+    return set_cuda_error(cudaGetLastError(), "reset self accumulation");
+}
+
+bool build_self_neighbor_table(Abi41Solver* solver) {
+    if (!solver || solver->cfg.vertex_count <= 0 || !solver->self_collision_counts || !solver->self_collision_indices) {
+        return true;
+    }
+    if (solver->self_hash_ready != 0) {
+        abi41_build_self_neighbor_table_hash_kernel<<<block_count(solver->cfg.vertex_count), kThreads>>>(*solver);
+    } else {
+        abi41_build_self_neighbor_table_kernel<<<block_count(solver->cfg.vertex_count), kThreads>>>(*solver);
+    }
+    return set_cuda_error(cudaGetLastError(), "build self neighbor table");
+}
+
 bool prepare_self_triangle_hash_buffers(Abi41Solver* solver) {
     if (!solver) {
         return true;
@@ -2080,7 +2272,14 @@ bool reset_abi41_counts(Abi41Solver* solver) {
     if (!solver->abi41_counts) {
         return true;
     }
-    return set_cuda_error(cudaMemset(solver->abi41_counts, 0, sizeof(unsigned long long) * kAbi41CountSlots), "reset recon diagnostics");
+    if (!set_cuda_error(cudaMemset(solver->abi41_counts, 0, sizeof(unsigned long long) * kAbi41CountSlots), "reset recon diagnostics")) {
+        return false;
+    }
+    if (solver->self_max_smoothed_delta_device
+        && !set_cuda_error(cudaMemset(solver->self_max_smoothed_delta_device, 0, sizeof(float)), "reset self max smoothed delta")) {
+        return false;
+    }
+    return true;
 }
 
 bool fetch_abi41_counts(Abi41Solver* solver) {
@@ -2094,6 +2293,12 @@ bool fetch_abi41_counts(Abi41Solver* solver) {
     solver->diag.abi41_edge_edge_contact_count = static_cast<long long>(counts[kAbi41CountEdgeEdgeContacts]);
     solver->diag.abi41_hard_projection_fallbacks = static_cast<long long>(counts[kAbi41CountHardFallbacks]);
     solver->diag.abi41_max_smoothed_delta = 0.0f;
+    if (solver->self_max_smoothed_delta_device
+        && !set_cuda_error(
+            cudaMemcpy(&solver->diag.abi41_max_smoothed_delta, solver->self_max_smoothed_delta_device, sizeof(float), cudaMemcpyDeviceToHost),
+            "fetch self max smoothed delta")) {
+        return false;
+    }
     solver->diag.fast_soft_repulsion_candidates = static_cast<long long>(counts[kAbi41CountSelfCandidates]);
     solver->diag.fast_soft_repulsion_applied = static_cast<long long>(counts[kAbi41CountSoftContacts]);
     solver->diag.dynamic_particle_candidate_count = static_cast<long long>(counts[kAbi41CountDynamicParticleCandidates]);
@@ -2127,6 +2332,13 @@ void free_solver(Abi41Solver* solver) {
     cudaFree(solver->self_edge_bucket_counts);
     cudaFree(solver->self_edge_bucket_indices);
     cudaFree(solver->self_edge_cell_coords);
+    cudaFree(solver->self_collision_counts);
+    cudaFree(solver->self_collision_indices);
+    cudaFree(solver->self_collision_radii);
+    cudaFree(solver->self_accumulated_delta);
+    cudaFree(solver->self_accumulated_weight);
+    cudaFree(solver->self_averaged_delta);
+    cudaFree(solver->self_max_smoothed_delta_device);
     cudaFree(solver->static_triangles);
     cudaFree(solver->static_triangle_bucket_counts);
     cudaFree(solver->static_triangle_bucket_indices);
@@ -2357,7 +2569,14 @@ extern "C" SSBL_API void* ssbl_create_solver(const SsblXpbdConfig* config, const
         && alloc_and_copy(&solver->static_triangles, reinterpret_cast<const Vec3*>(mesh->static_triangles), solver->cfg.static_triangle_count * 3, "static triangle allocation")
         && alloc_and_copy(&solver->triangle_pairs, static_cast<const TriangleProximityPair*>(nullptr), solver->triangle_pair_capacity, "triangle pair allocation")
         && alloc_and_copy(&solver->triangle_pair_count, static_cast<const int*>(nullptr), 1, "triangle pair count allocation")
-        && alloc_and_copy(&solver->abi41_counts, static_cast<const unsigned long long*>(nullptr), kAbi41CountSlots, "recon diagnostic allocation");
+        && alloc_and_copy(&solver->abi41_counts, static_cast<const unsigned long long*>(nullptr), kAbi41CountSlots, "recon diagnostic allocation")
+        && alloc_and_copy(&solver->self_collision_counts, static_cast<const unsigned int*>(nullptr), n, "self collision count allocation")
+        && alloc_and_copy(&solver->self_collision_indices, static_cast<const unsigned int*>(nullptr), n * kAbi41SelfCollisionNeighborSlots, "self collision index allocation")
+        && alloc_and_copy(&solver->self_collision_radii, static_cast<const float*>(nullptr), n, "self collision radius allocation")
+        && alloc_and_copy(&solver->self_accumulated_delta, static_cast<const Vec3*>(nullptr), n, "self accumulated delta allocation")
+        && alloc_and_copy(&solver->self_accumulated_weight, static_cast<const float*>(nullptr), n, "self accumulated weight allocation")
+        && alloc_and_copy(&solver->self_averaged_delta, static_cast<const Vec3*>(nullptr), n, "self averaged delta allocation")
+        && alloc_and_copy(&solver->self_max_smoothed_delta_device, static_cast<const float*>(nullptr), 1, "self max smoothed delta allocation");
     if (ok && !prepare_self_collision_hash_buffers(solver)) {
         ok = false;
     }
@@ -2579,11 +2798,10 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
                     solver->diag.self_hash_ms += elapsed_ms_since(self_hash_started);
                 }
                 const auto self_solve_started = std::chrono::high_resolution_clock::now();
-                if (solver->self_hash_ready != 0) {
-                    abi41_soft_vertex_repulsion_hash_kernel<<<v_blocks, kThreads>>>(*solver);
-                } else {
-                    abi41_soft_vertex_repulsion_kernel<<<v_blocks, kThreads>>>(*solver);
+                if (!reset_self_accumulation(solver) || !build_self_neighbor_table(solver)) {
+                    return 0;
                 }
+                abi41_set_self_collision_repulsion_kernel<<<v_blocks, kThreads>>>(*solver);
                 if (solver->cfg.triangle_count > 0) {
                     if (solver->self_triangle_hash_ready != 0) {
                         abi41_soft_vertex_triangle_repulsion_hash_kernel<<<v_blocks, kThreads>>>(*solver);
@@ -2598,6 +2816,8 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
                         abi41_soft_edge_edge_repulsion_kernel<<<e_blocks, kThreads>>>(*solver);
                     }
                 }
+                abi41_averaging_position_kernel<<<v_blocks, kThreads>>>(*solver);
+                abi41_apply_self_averaged_delta_kernel<<<v_blocks, kThreads>>>(*solver);
                 solver->diag.self_solve_ms += elapsed_ms_since(self_solve_started);
             }
             if (!set_cuda_error(cudaGetLastError(), "launch ABI37 recon constraints")) {

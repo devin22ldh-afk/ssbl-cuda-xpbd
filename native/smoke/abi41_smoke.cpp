@@ -94,9 +94,14 @@ int run_self_collision_smoke() {
         std::fprintf(stderr, "SSBL_ABI41_SELF_COLLISION_ERROR non-finite output\n");
         return 25;
     }
-    if (diag.abi41_soft_contact_count <= 0 || diag.fast_soft_repulsion_candidates <= 0) {
+    if (diag.abi41_soft_contact_count + diag.abi41_exact_impulse_contact_count <= 0
+        || diag.fast_soft_repulsion_candidates <= 0) {
         std::fprintf(stderr, "SSBL_ABI41_SELF_COLLISION_ERROR no soft contacts\n");
         return 26;
+    }
+    if (!(diag.abi41_max_smoothed_delta > 0.0f)) {
+        std::fprintf(stderr, "SSBL_ABI41_SELF_COLLISION_ERROR no smoothed delta\n");
+        return 28;
     }
     if (!(final_gap > initial_gap + 1.0e-4f)) {
         std::fprintf(
@@ -108,10 +113,12 @@ int run_self_collision_smoke() {
         return 27;
     }
     std::printf(
-        "SSBL_ABI41_SELF_COLLISION_OK vertices=%d contacts=%lld candidates=%lld gap=%.5f->%.5f\n",
+        "SSBL_ABI41_SELF_COLLISION_OK vertices=%d soft=%lld exact=%lld candidates=%lld max_delta=%.5f gap=%.5f->%.5f\n",
         kVertexCount,
         diag.abi41_soft_contact_count,
+        diag.abi41_exact_impulse_contact_count,
         diag.fast_soft_repulsion_candidates,
+        diag.abi41_max_smoothed_delta,
         initial_gap,
         final_gap
     );
@@ -219,6 +226,10 @@ int run_self_vertex_triangle_smoke() {
         std::fprintf(stderr, "SSBL_ABI41_SELF_VT_ERROR no VT soft contacts\n");
         return 36;
     }
+    if (!(diag.abi41_max_smoothed_delta > 0.0f)) {
+        std::fprintf(stderr, "SSBL_ABI41_SELF_VT_ERROR no smoothed delta\n");
+        return 38;
+    }
     if (!(final_height > initial_height + 1.0e-4f)) {
         std::fprintf(
             stderr,
@@ -229,11 +240,13 @@ int run_self_vertex_triangle_smoke() {
         return 37;
     }
     std::printf(
-        "SSBL_ABI41_SELF_VT_OK vertices=%d triangles=%d contacts=%lld candidates=%lld height=%.5f->%.5f\n",
+        "SSBL_ABI41_SELF_VT_OK vertices=%d triangles=%d soft=%lld exact=%lld candidates=%lld max_delta=%.5f height=%.5f->%.5f\n",
         kVertexCount,
         kTriangleCount,
         diag.abi41_soft_contact_count,
+        diag.abi41_exact_impulse_contact_count,
         diag.fast_soft_repulsion_candidates,
+        diag.abi41_max_smoothed_delta,
         initial_height,
         final_height
     );
@@ -361,6 +374,10 @@ int run_self_edge_edge_smoke() {
         std::fprintf(stderr, "SSBL_ABI41_SELF_EE_ERROR no EE contacts\n");
         return 46;
     }
+    if (!(diag.abi41_max_smoothed_delta > 0.0f)) {
+        std::fprintf(stderr, "SSBL_ABI41_SELF_EE_ERROR no smoothed delta\n");
+        return 48;
+    }
     if (!(final_height > initial_height + 1.0e-4f)) {
         std::fprintf(
             stderr,
@@ -372,11 +389,12 @@ int run_self_edge_edge_smoke() {
         return 47;
     }
     std::printf(
-        "SSBL_ABI41_SELF_EE_OK vertices=%d edges=%d contacts=%lld candidates=%lld height=%.5f->%.5f\n",
+        "SSBL_ABI41_SELF_EE_OK vertices=%d edges=%d edge_contacts=%lld candidates=%lld max_delta=%.5f height=%.5f->%.5f\n",
         kVertexCount,
         kEdgeCount,
         diag.abi41_edge_edge_contact_count,
         diag.fast_soft_repulsion_candidates,
+        diag.abi41_max_smoothed_delta,
         initial_height,
         final_height
     );
