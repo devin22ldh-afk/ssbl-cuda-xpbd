@@ -296,11 +296,18 @@ def main() -> None:
     finite = True
     first_dynamic_frame = None
     max_analytic_collision_ms = 0.0
+    max_native_cuda_step_call_ms = 0.0
+    max_dynamic_upload_ms = 0.0
+    max_dynamic_collider_pack_ms = 0.0
+    max_dynamic_triangle_upload_ms = 0.0
+    max_dynamic_particle_upload_ms = 0.0
     max_dynamic_collision_ms = 0.0
     max_dynamic_particle_collision_ms = 0.0
     max_dynamic_particle_count = 0
     max_dynamic_particle_contacts = 0
     max_dynamic_particle_overflow = 0
+    total_dynamic_collider_cache_hits = 0
+    total_dynamic_collider_cache_misses = 0
     total_abi41_lra_tack_count = 0
     total_abi41_bending_wing_count = 0
     max_abi41_bending_texture_ready = 0
@@ -316,6 +323,22 @@ def main() -> None:
         diag = ssbl.solver.session_diagnostics(active_obj)
         finite = finite and bool(diag.finite)
         max_analytic_collision_ms = max(max_analytic_collision_ms, float(diag.analytic_collision_ms))
+        max_native_cuda_step_call_ms = max(max_native_cuda_step_call_ms, float(getattr(diag, "cuda_step_call_ms", 0.0)))
+        max_dynamic_upload_ms = max(max_dynamic_upload_ms, float(getattr(diag, "dynamic_upload_ms", 0.0)))
+        max_dynamic_collider_pack_ms = max(
+            max_dynamic_collider_pack_ms,
+            float(getattr(diag, "dynamic_collider_pack_ms", 0.0)),
+        )
+        max_dynamic_triangle_upload_ms = max(
+            max_dynamic_triangle_upload_ms,
+            float(getattr(diag, "dynamic_triangle_upload_ms", 0.0)),
+        )
+        max_dynamic_particle_upload_ms = max(
+            max_dynamic_particle_upload_ms,
+            float(getattr(diag, "dynamic_particle_upload_ms", 0.0)),
+        )
+        total_dynamic_collider_cache_hits += int(getattr(diag, "dynamic_collider_cache_hits", 0))
+        total_dynamic_collider_cache_misses += int(getattr(diag, "dynamic_collider_cache_misses", 0))
         max_dynamic_collision_ms = max(max_dynamic_collision_ms, float(diag.dynamic_collision_ms))
         max_dynamic_particle_collision_ms = max(
             max_dynamic_particle_collision_ms,
@@ -381,6 +404,12 @@ def main() -> None:
             "analytic_collision_ms": float(diag.analytic_collision_ms),
             "static_collision_ms": float(diag.static_collision_ms),
             "dynamic_upload_ms": float(diag.dynamic_upload_ms),
+            "dynamic_collider_pack_ms": float(getattr(diag, "dynamic_collider_pack_ms", 0.0)),
+            "dynamic_triangle_upload_ms": float(getattr(diag, "dynamic_triangle_upload_ms", 0.0)),
+            "dynamic_particle_upload_ms": float(getattr(diag, "dynamic_particle_upload_ms", 0.0)),
+            "dynamic_collider_cache_hits": int(getattr(diag, "dynamic_collider_cache_hits", 0)),
+            "dynamic_collider_cache_misses": int(getattr(diag, "dynamic_collider_cache_misses", 0)),
+            "native_cuda_step_call_ms": float(getattr(diag, "cuda_step_call_ms", 0.0)),
             "dynamic_collision_ms": float(diag.dynamic_collision_ms),
             "dynamic_particle_collision_ms": float(diag.dynamic_particle_collision_ms),
             "resolved_contacts": int(diag.resolved_contacts),
@@ -427,6 +456,13 @@ def main() -> None:
         "max_sphere_penetrating_vertices": int(max_sphere_penetrating_vertices),
         "max_edge_ratio": float(max_edge_ratio),
         "max_analytic_collision_ms": float(max_analytic_collision_ms),
+        "max_native_cuda_step_call_ms": float(max_native_cuda_step_call_ms),
+        "max_dynamic_upload_ms": float(max_dynamic_upload_ms),
+        "max_dynamic_collider_pack_ms": float(max_dynamic_collider_pack_ms),
+        "max_dynamic_triangle_upload_ms": float(max_dynamic_triangle_upload_ms),
+        "max_dynamic_particle_upload_ms": float(max_dynamic_particle_upload_ms),
+        "total_dynamic_collider_cache_hits": int(total_dynamic_collider_cache_hits),
+        "total_dynamic_collider_cache_misses": int(total_dynamic_collider_cache_misses),
         "max_dynamic_collision_ms": float(max_dynamic_collision_ms),
         "max_dynamic_particle_collision_ms": float(max_dynamic_particle_collision_ms),
         "max_dynamic_particle_count": int(max_dynamic_particle_count),
@@ -445,6 +481,13 @@ def main() -> None:
         "final_dynamic_particle_count": int(final_diag.dynamic_particle_count),
         "final_dynamic_particle_contacts": int(final_diag.dynamic_particle_contacts),
         "final_dynamic_particle_overflow": int(final_diag.dynamic_particle_overflow),
+        "final_dynamic_upload_ms": float(getattr(final_diag, "dynamic_upload_ms", 0.0)),
+        "final_dynamic_collider_pack_ms": float(getattr(final_diag, "dynamic_collider_pack_ms", 0.0)),
+        "final_dynamic_triangle_upload_ms": float(getattr(final_diag, "dynamic_triangle_upload_ms", 0.0)),
+        "final_dynamic_particle_upload_ms": float(getattr(final_diag, "dynamic_particle_upload_ms", 0.0)),
+        "final_dynamic_collider_cache_hits": int(getattr(final_diag, "dynamic_collider_cache_hits", 0)),
+        "final_dynamic_collider_cache_misses": int(getattr(final_diag, "dynamic_collider_cache_misses", 0)),
+        "final_native_cuda_step_call_ms": float(getattr(final_diag, "cuda_step_call_ms", 0.0)),
         "final_abi41_lra_tack_count": int(getattr(final_diag, "abi41_lra_tack_count", 0)),
         "final_abi41_bending_wing_count": int(getattr(final_diag, "abi41_bending_wing_count", 0)),
         "final_abi41_bending_texture_ready": int(getattr(final_diag, "abi41_bending_texture_ready", 0)),

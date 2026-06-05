@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 import hashlib
+import math
 import os
 import re
 import struct
@@ -77,6 +78,11 @@ class FramePerf:
     runtime_upload_ms: float = 0.0
     static_upload_ms: float = 0.0
     dynamic_upload_ms: float = 0.0
+    dynamic_collider_pack_ms: float = 0.0
+    dynamic_collider_cache_hits: int = 0
+    dynamic_collider_cache_misses: int = 0
+    dynamic_triangle_count: int = 0
+    dynamic_particle_count: int = 0
     cuda_step_call_ms: float = 0.0
     download_ms: float = 0.0
     writeback_ms: float = 0.0
@@ -87,6 +93,29 @@ class FramePerf:
     writeback_performed: bool = False
     diagnostics_ms: float = 0.0
     viewport_tag_ms: float = 0.0
+
+
+@dataclass
+class CrossClothColliderCache:
+    triangles: np.ndarray = field(default_factory=lambda: np.empty((0, 3, 3), dtype=np.float32))
+    triangle_indices: np.ndarray = field(default_factory=lambda: np.empty((0, 3), dtype=np.int32))
+    particle_positions: np.ndarray = field(default_factory=lambda: np.empty((0, 3), dtype=np.float32))
+    particle_radii: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
+    particle_inv_mass: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
+    particle_slot_ids: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int32))
+    particle_phases: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int32))
+    triangle_signature: tuple = ()
+    particle_signature: tuple = ()
+    swept_min: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
+    swept_max: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
+    max_motion: float = 0.0
+    max_edge_length: float = 0.0
+    motion_delta: np.ndarray = field(default_factory=lambda: np.empty((0, 3), dtype=np.float32))
+    vertex_mask: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=bool))
+    vertex_mask_tmp: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=bool))
+    triangle_mask: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=bool))
+    triangle_mask_tmp: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=bool))
+    motion_sq: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
 
 
 @dataclass
@@ -119,6 +148,7 @@ class ClothSlot:
     force_fields_active: bool
     auto_sphere_object_name: str = ""
     force_next_writeback: bool = False
+    dynamic_collider_cache: CrossClothColliderCache = field(default_factory=CrossClothColliderCache)
 
 
 @dataclass
@@ -309,6 +339,11 @@ def record_viewport_tag_ms(object_name: str, elapsed_ms: float) -> None:
         abi41_bending_texture_ready=diag.abi41_bending_texture_ready,
         abi41_tack_jitter_guarded=diag.abi41_tack_jitter_guarded,
         abi41_bending_guarded=diag.abi41_bending_guarded,
+        dynamic_collider_pack_ms=diag.dynamic_collider_pack_ms,
+        dynamic_triangle_upload_ms=diag.dynamic_triangle_upload_ms,
+        dynamic_particle_upload_ms=diag.dynamic_particle_upload_ms,
+        dynamic_collider_cache_hits=diag.dynamic_collider_cache_hits,
+        dynamic_collider_cache_misses=diag.dynamic_collider_cache_misses,
         frame_ms=diag.frame_ms,
         frame_set_ms=diag.frame_set_ms,
         input_refresh_ms=diag.input_refresh_ms,
@@ -1599,13 +1634,19 @@ def _slot_should_download(download_positions, slot_name: str) -> bool:
 
 def _step_session_slots(session: SceneSession, download_positions, perf: FramePerf | None = None) -> None:
     cross_cloth_enabled = len(session.slots) > 1 and str(session.cross_cloth_mode or "off").lower() != "off"
+    if cross_cloth_enabled:
+        _prepare_cross_cloth_collider_caches(session, perf)
     for slot_name in session.solve_order:
         slot = session.slots[slot_name]
         should_download = _slot_should_download(download_positions, slot_name)
         if cross_cloth_enabled:
             started = time.perf_counter()
-            dynamic_triangles = _collect_cross_cloth_triangles(session, slot)
-            dynamic_particles = _collect_cross_cloth_particles(session, slot)
+            pack_started = time.perf_counter()
+            dynamic_triangles, dynamic_particles = _collect_cross_cloth_colliders(session, slot)
+            if perf is not None:
+                perf.dynamic_collider_pack_ms += _elapsed_ms(pack_started)
+                perf.dynamic_triangle_count += int(len(dynamic_triangles))
+                perf.dynamic_particle_count += int(len(dynamic_particles.get("positions", ())))
             slot.native.update_frame_inputs(
                 pin_indices=None,
                 pin_positions=None,
@@ -1626,7 +1667,8 @@ def _step_session_slots(session: SceneSession, download_positions, perf: FramePe
                 perf.dynamic_upload_ms += elapsed
                 perf.frame_input_upload_ms += elapsed
         started = time.perf_counter()
-        sample_diagnostics = bool(should_download or cross_cloth_enabled)
+        is_last_slot = slot_name == session.solve_order[-1]
+        sample_diagnostics = bool(should_download or (cross_cloth_enabled and is_last_slot))
         slot.native.step(
             slot.substeps,
             slot.iterations,
@@ -1637,97 +1679,398 @@ def _step_session_slots(session: SceneSession, download_positions, perf: FramePe
             perf.cuda_step_call_ms += _elapsed_ms(started)
         if should_download or cross_cloth_enabled:
             started = time.perf_counter()
-            slot.previous_positions_world = np.array(slot.current_positions_world, dtype=np.float32, copy=True)
-            slot.current_positions_world = np.array(slot.native.download_positions(), dtype=np.float32, copy=True)
+            downloaded_positions = np.asarray(slot.native.download_positions(), dtype=np.float32)
+            if slot.previous_positions_world.shape == slot.current_positions_world.shape:
+                np.copyto(slot.previous_positions_world, slot.current_positions_world, casting="unsafe")
+            else:
+                slot.previous_positions_world = np.array(slot.current_positions_world, dtype=np.float32, copy=True)
+            if slot.current_positions_world.shape == downloaded_positions.shape:
+                np.copyto(slot.current_positions_world, downloaded_positions, casting="unsafe")
+            else:
+                slot.current_positions_world = np.array(downloaded_positions, dtype=np.float32, copy=True)
             if perf is not None:
                 perf.download_ms += _elapsed_ms(started)
 
 
-def _collect_cross_cloth_triangles(session: SceneSession, target: ClothSlot) -> np.ndarray:
-    mode = str(session.cross_cloth_mode or "off").lower()
-    if mode == "off":
-        return np.empty((0, 3, 3), dtype=np.float32)
-    target_aabb = _swept_positions_aabb(target)
-    all_tris: list[np.ndarray] = []
-    for source in session.slots.values():
-        if not _cross_cloth_source_enabled(mode, target, source):
-            continue
-        positions = source.current_positions_world
-        if positions is None or len(source.cloth.triangles) == 0:
-            continue
-        source_aabb = _swept_positions_aabb(source)
-        if target_aabb is not None and source_aabb is not None:
-            contact_radius = max(float(target.external_contact_distance), float(source.external_contact_distance))
-            motion_padding = max(
-                contact_radius * 4.0,
-                _slot_max_motion(target) * 2.0,
-                _slot_max_motion(source) * 2.0,
-                0.08,
-            )
-            if _aabb_distance(target_aabb, source_aabb) > contact_radius + motion_padding:
-                continue
-        all_tris.append(np.asarray(positions[source.cloth.triangles], dtype=np.float32))
-    if not all_tris:
-        return np.empty((0, 3, 3), dtype=np.float32)
-    return np.ascontiguousarray(np.concatenate(all_tris, axis=0), dtype=np.float32)
-
-
-def _collect_cross_cloth_particles(session: SceneSession, target: ClothSlot) -> dict[str, np.ndarray]:
-    empty = {
+def _empty_dynamic_particles() -> dict[str, np.ndarray]:
+    return {
         "positions": np.empty((0, 3), dtype=np.float32),
         "radii": np.empty(0, dtype=np.float32),
         "inv_mass": np.empty(0, dtype=np.float32),
         "slot_ids": np.empty(0, dtype=np.int32),
         "phases": np.empty(0, dtype=np.int32),
     }
+
+
+def _single_or_concat_float32(arrays: list[np.ndarray], empty_shape: tuple[int, ...]) -> np.ndarray:
+    if not arrays:
+        return np.empty(empty_shape, dtype=np.float32)
+    if len(arrays) == 1:
+        return np.ascontiguousarray(arrays[0], dtype=np.float32)
+    return np.ascontiguousarray(np.concatenate(arrays, axis=0), dtype=np.float32)
+
+
+def _single_or_concat_int32(arrays: list[np.ndarray]) -> np.ndarray:
+    if not arrays:
+        return np.empty(0, dtype=np.int32)
+    if len(arrays) == 1:
+        return np.ascontiguousarray(arrays[0], dtype=np.int32).reshape((-1,))
+    return np.ascontiguousarray(np.concatenate(arrays, axis=0), dtype=np.int32).reshape((-1,))
+
+
+def _ensure_bool_buffer(buffer: np.ndarray, count: int) -> np.ndarray:
+    if buffer.shape != (count,):
+        return np.empty(count, dtype=bool)
+    return buffer
+
+
+def _cross_source_vertex_mask(
+    cache: CrossClothColliderCache,
+    positions: np.ndarray,
+    lower: np.ndarray,
+    upper: np.ndarray,
+) -> np.ndarray:
+    count = int(len(positions))
+    cache.vertex_mask = _ensure_bool_buffer(cache.vertex_mask, count)
+    cache.vertex_mask_tmp = _ensure_bool_buffer(cache.vertex_mask_tmp, count)
+    mask = cache.vertex_mask
+    tmp = cache.vertex_mask_tmp
+    np.greater_equal(positions[:, 0], lower[0], out=mask)
+    np.less_equal(positions[:, 0], upper[0], out=tmp)
+    np.logical_and(mask, tmp, out=mask)
+    np.greater_equal(positions[:, 1], lower[1], out=tmp)
+    np.logical_and(mask, tmp, out=mask)
+    np.less_equal(positions[:, 1], upper[1], out=tmp)
+    np.logical_and(mask, tmp, out=mask)
+    np.greater_equal(positions[:, 2], lower[2], out=tmp)
+    np.logical_and(mask, tmp, out=mask)
+    np.less_equal(positions[:, 2], upper[2], out=tmp)
+    np.logical_and(mask, tmp, out=mask)
+    return mask
+
+
+def _cross_source_triangle_mask(
+    cache: CrossClothColliderCache,
+    triangles: np.ndarray,
+    vertex_mask: np.ndarray,
+) -> np.ndarray:
+    count = int(len(triangles))
+    cache.triangle_mask = _ensure_bool_buffer(cache.triangle_mask, count)
+    cache.triangle_mask_tmp = _ensure_bool_buffer(cache.triangle_mask_tmp, count)
+    tri_mask = cache.triangle_mask
+    tmp = cache.triangle_mask_tmp
+    np.take(vertex_mask, triangles[:, 0], out=tri_mask)
+    np.take(vertex_mask, triangles[:, 1], out=tmp)
+    np.logical_or(tri_mask, tmp, out=tri_mask)
+    np.take(vertex_mask, triangles[:, 2], out=tmp)
+    np.logical_or(tri_mask, tmp, out=tri_mask)
+    return tri_mask
+
+
+def _positions_aabb_fast(positions: np.ndarray | None) -> tuple[np.ndarray, np.ndarray] | None:
+    if positions is None:
+        return None
+    array = np.asarray(positions, dtype=np.float32)
+    if array.ndim != 2 or array.shape[1] != 3 or len(array) == 0:
+        return None
+    minimum = np.min(array, axis=0)
+    maximum = np.max(array, axis=0)
+    if bool(np.isfinite(minimum).all()) and bool(np.isfinite(maximum).all()):
+        return minimum, maximum
+    return _positions_aabb(array)
+
+
+def _slot_max_motion_cached(cache: CrossClothColliderCache, current: np.ndarray, previous: np.ndarray) -> float:
+    if current.shape != previous.shape or current.ndim != 2 or current.shape[1] != 3 or len(current) == 0:
+        return 0.0
+    count = int(len(current))
+    if cache.motion_delta.shape != current.shape:
+        cache.motion_delta = np.empty_like(current, dtype=np.float32)
+    if cache.motion_sq.shape != (count,):
+        cache.motion_sq = np.empty(count, dtype=np.float32)
+    np.subtract(current, previous, out=cache.motion_delta, casting="unsafe")
+    delta = cache.motion_delta
+    sq = cache.motion_sq
+    np.multiply(delta[:, 0], delta[:, 0], out=sq)
+    np.add(sq, delta[:, 1] * delta[:, 1], out=sq)
+    np.add(sq, delta[:, 2] * delta[:, 2], out=sq)
+    max_sq = float(np.max(sq)) if count > 0 else 0.0
+    if not math.isfinite(max_sq) or max_sq <= 0.0:
+        return 0.0 if max_sq == 0.0 else _slot_max_motion_arrays(current, previous)
+    return float(math.sqrt(max_sq))
+
+
+def _slot_max_motion_arrays(current: np.ndarray, previous: np.ndarray) -> float:
+    if current.shape != previous.shape or current.ndim != 2 or current.shape[1] != 3 or len(current) == 0:
+        return 0.0
+    delta = current - previous
+    distances = np.linalg.norm(delta, axis=1)
+    finite = distances[np.isfinite(distances)]
+    if len(finite) == 0:
+        return 0.0
+    return float(np.max(finite))
+
+
+def _prepare_cross_cloth_collider_caches(session: SceneSession, perf: FramePerf | None = None) -> None:
+    started = time.perf_counter()
+    slot_ids = {name: index + 1 for index, name in enumerate(session.solve_order)}
+    for source in session.slots.values():
+        positions = np.asarray(source.current_positions_world, dtype=np.float32)
+        if positions.ndim != 2 or positions.shape[1] != 3:
+            positions = np.empty((0, 3), dtype=np.float32)
+        positions = np.ascontiguousarray(positions, dtype=np.float32)
+        cache = source.dynamic_collider_cache
+        previous = np.asarray(source.previous_positions_world, dtype=np.float32)
+        current_aabb = _positions_aabb_fast(positions)
+        previous_aabb = _positions_aabb_fast(previous)
+        if current_aabb is None:
+            swept = previous_aabb
+        elif previous_aabb is None:
+            swept = current_aabb
+        else:
+            swept = (np.minimum(current_aabb[0], previous_aabb[0]), np.maximum(current_aabb[1], previous_aabb[1]))
+        if swept is None:
+            cache.swept_min = np.empty(0, dtype=np.float32)
+            cache.swept_max = np.empty(0, dtype=np.float32)
+        else:
+            cache.swept_min = np.asarray(swept[0], dtype=np.float32)
+            cache.swept_max = np.asarray(swept[1], dtype=np.float32)
+        cache.max_motion = _slot_max_motion_cached(cache, positions, previous)
+
+        triangles = np.asarray(source.cloth.triangles, dtype=np.int32)
+        triangles_valid = (
+            triangles.ndim == 2
+            and triangles.shape[1] == 3
+            and len(positions) > 0
+            and (len(triangles) == 0 or (int(np.min(triangles)) >= 0 and int(np.max(triangles)) < len(positions)))
+        )
+        triangle_signature = (
+            int(len(triangles)) if triangles_valid else 0,
+            int(len(positions)),
+            id(source.cloth.triangles),
+            id(source.cloth.edge_rest_lengths),
+        )
+        if cache.triangle_signature != triangle_signature:
+            cache.triangles = np.empty((0, 3, 3), dtype=np.float32)
+            cache.triangle_indices = (
+                np.ascontiguousarray(triangles, dtype=np.int32)
+                if triangles_valid
+                else np.empty((0, 3), dtype=np.int32)
+            )
+            cache.triangle_signature = triangle_signature
+            rest_lengths = np.asarray(source.cloth.edge_rest_lengths, dtype=np.float32).reshape((-1,))
+            finite_rest = rest_lengths[np.isfinite(rest_lengths)]
+            rest_max = float(np.max(finite_rest)) if len(finite_rest) else 0.0
+            cache.max_edge_length = max(
+                rest_max * 3.0,
+                float(source.external_contact_distance) * 8.0,
+                0.08,
+            )
+            if perf is not None:
+                perf.dynamic_collider_cache_misses += 1
+        else:
+            if perf is not None:
+                perf.dynamic_collider_cache_hits += 1
+
+        count = int(len(positions))
+        slot_id = int(slot_ids.get(source.object_name, 0))
+        particle_signature = (
+            count,
+            float(source.external_contact_distance),
+            int(source.collision_layer),
+            slot_id,
+            id(source.cloth.inv_mass),
+        )
+        if cache.particle_signature != particle_signature or cache.particle_positions.shape != (count, 3):
+            cache.particle_radii = np.full(count, float(source.external_contact_distance), dtype=np.float32)
+            source_inv_mass = np.asarray(source.cloth.inv_mass, dtype=np.float32).reshape((-1,))
+            if len(source_inv_mass) == count:
+                cache.particle_inv_mass = np.ascontiguousarray(source_inv_mass, dtype=np.float32)
+            else:
+                cache.particle_inv_mass = np.ones(count, dtype=np.float32)
+            cache.particle_slot_ids = np.full(count, slot_id, dtype=np.int32)
+            cache.particle_phases = np.full(count, int(source.collision_layer), dtype=np.int32)
+            cache.particle_signature = particle_signature
+            if perf is not None:
+                perf.dynamic_collider_cache_misses += 1
+        else:
+            if perf is not None:
+                perf.dynamic_collider_cache_hits += 1
+        cache.particle_positions = positions
+    if perf is not None:
+        perf.dynamic_collider_pack_ms += _elapsed_ms(started)
+
+
+def _cross_source_expanded_target_aabb(
+    target: ClothSlot,
+    source: ClothSlot,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    target_cache = target.dynamic_collider_cache
+    source_cache = source.dynamic_collider_cache
+    if (
+        target_cache.swept_min.size != 3
+        or target_cache.swept_max.size != 3
+        or source_cache.swept_min.size != 3
+        or source_cache.swept_max.size != 3
+    ):
+        return None
+    target_aabb = (target_cache.swept_min, target_cache.swept_max)
+    source_aabb = (source_cache.swept_min, source_cache.swept_max)
+    contact_radius = max(float(target.external_contact_distance), float(source.external_contact_distance))
+    motion_padding = max(
+        contact_radius * 4.0,
+        float(target_cache.max_motion) * 2.0,
+        float(source_cache.max_motion) * 2.0,
+        float(source_cache.max_edge_length),
+        0.08,
+    )
+    padding = contact_radius + motion_padding
+    if _aabb_distance(target_aabb, source_aabb) > padding:
+        return None
+    return target_aabb[0] - padding, target_aabb[1] + padding
+
+
+def _collect_cross_cloth_triangles(session: SceneSession, target: ClothSlot) -> np.ndarray:
     mode = str(session.cross_cloth_mode or "off").lower()
     if mode == "off":
-        return empty
-    target_aabb = _swept_positions_aabb(target)
-    positions_list: list[np.ndarray] = []
-    radii_list: list[np.ndarray] = []
-    inv_mass_list: list[np.ndarray] = []
-    slot_id_list: list[np.ndarray] = []
-    phase_list: list[np.ndarray] = []
-    slot_ids = {name: index + 1 for index, name in enumerate(session.solve_order)}
+        return np.empty((0, 3, 3), dtype=np.float32)
+    all_tris: list[np.ndarray] = []
     for source in session.slots.values():
         if not _cross_cloth_source_enabled(mode, target, source):
             continue
-        positions = source.current_positions_world
-        if positions is None or len(positions) == 0:
+        if len(source.cloth.triangles) == 0:
             continue
-        source_aabb = _swept_positions_aabb(source)
-        if target_aabb is not None and source_aabb is not None:
-            contact_radius = max(float(target.external_contact_distance), float(source.external_contact_distance))
-            motion_padding = max(
-                contact_radius * 4.0,
-                _slot_max_motion(target) * 2.0,
-                _slot_max_motion(source) * 2.0,
-                0.08,
-            )
-            if _aabb_distance(target_aabb, source_aabb) > contact_radius + motion_padding:
-                continue
-        source_positions = np.asarray(positions, dtype=np.float32)
-        count = int(len(source_positions))
-        if count <= 0:
+        expanded = _cross_source_expanded_target_aabb(target, source)
+        if expanded is None:
             continue
-        positions_list.append(source_positions)
-        radii_list.append(np.full(count, float(source.external_contact_distance), dtype=np.float32))
-        source_inv_mass = np.asarray(source.cloth.inv_mass, dtype=np.float32).reshape((-1,))
-        if len(source_inv_mass) == count:
-            inv_mass_list.append(source_inv_mass)
+        positions = source.dynamic_collider_cache.particle_positions
+        triangles = np.asarray(source.cloth.triangles, dtype=np.int32)
+        if (
+            len(positions) == 0
+            or triangles.ndim != 2
+            or triangles.shape[1] != 3
+            or len(triangles) == 0
+            or int(np.min(triangles)) < 0
+            or int(np.max(triangles)) >= len(positions)
+        ):
+            continue
+        vertex_mask = np.all(positions >= expanded[0], axis=1) & np.all(positions <= expanded[1], axis=1)
+        if not bool(np.any(vertex_mask)):
+            continue
+        tri_mask = np.any(vertex_mask[triangles], axis=1)
+        if not bool(np.any(tri_mask)):
+            continue
+        if bool(np.all(tri_mask)):
+            selected_triangles = triangles
         else:
-            inv_mass_list.append(np.ones(count, dtype=np.float32))
-        slot_id = int(slot_ids.get(source.object_name, 0))
-        slot_id_list.append(np.full(count, slot_id, dtype=np.int32))
-        phase_list.append(np.full(count, int(source.collision_layer), dtype=np.int32))
+            selected_triangles = triangles[tri_mask]
+        all_tris.append(np.ascontiguousarray(positions[selected_triangles], dtype=np.float32))
+    if not all_tris:
+        return np.empty((0, 3, 3), dtype=np.float32)
+    return np.ascontiguousarray(np.concatenate(all_tris, axis=0), dtype=np.float32)
+
+
+def _collect_cross_cloth_colliders(
+    session: SceneSession,
+    target: ClothSlot,
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    mode = str(session.cross_cloth_mode or "off").lower()
+    if mode == "off":
+        return np.empty((0, 3, 3), dtype=np.float32), _empty_dynamic_particles()
+    triangles_list: list[np.ndarray] = []
+    positions_list: list[np.ndarray] = []
+    radii_list: list[np.ndarray] = []
+    inv_mass_list: list[np.ndarray] = []
+    slot_ids_list: list[np.ndarray] = []
+    phase_list: list[np.ndarray] = []
+    for source in session.slots.values():
+        if not _cross_cloth_source_enabled(mode, target, source):
+            continue
+        expanded = _cross_source_expanded_target_aabb(target, source)
+        if expanded is None:
+            continue
+        cache = source.dynamic_collider_cache
+        positions = cache.particle_positions
+        if len(positions) == 0:
+            continue
+        vertex_mask = _cross_source_vertex_mask(cache, positions, expanded[0], expanded[1])
+        if not bool(np.any(vertex_mask)):
+            continue
+        if bool(np.all(vertex_mask)):
+            positions_list.append(positions)
+            radii_list.append(cache.particle_radii)
+            inv_mass_list.append(cache.particle_inv_mass)
+            slot_ids_list.append(cache.particle_slot_ids)
+            phase_list.append(cache.particle_phases)
+        else:
+            positions_list.append(np.ascontiguousarray(positions[vertex_mask], dtype=np.float32))
+            radii_list.append(np.ascontiguousarray(cache.particle_radii[vertex_mask], dtype=np.float32))
+            inv_mass_list.append(np.ascontiguousarray(cache.particle_inv_mass[vertex_mask], dtype=np.float32))
+            slot_ids_list.append(np.ascontiguousarray(cache.particle_slot_ids[vertex_mask], dtype=np.int32))
+            phase_list.append(np.ascontiguousarray(cache.particle_phases[vertex_mask], dtype=np.int32))
+
+        triangles = cache.triangle_indices
+        if len(triangles) == 0:
+            continue
+        tri_mask = _cross_source_triangle_mask(cache, triangles, vertex_mask)
+        if not bool(np.any(tri_mask)):
+            continue
+        selected_triangles = triangles if bool(np.all(tri_mask)) else triangles[tri_mask]
+        triangles_list.append(np.ascontiguousarray(positions[selected_triangles], dtype=np.float32))
+
+    dynamic_triangles = _single_or_concat_float32(triangles_list, (0, 3, 3))
     if not positions_list:
-        return empty
+        return dynamic_triangles, _empty_dynamic_particles()
+    return dynamic_triangles, {
+        "positions": _single_or_concat_float32(positions_list, (0, 3)),
+        "radii": _single_or_concat_float32(radii_list, (0,)).reshape((-1,)),
+        "inv_mass": _single_or_concat_float32(inv_mass_list, (0,)).reshape((-1,)),
+        "slot_ids": _single_or_concat_int32(slot_ids_list),
+        "phases": _single_or_concat_int32(phase_list),
+    }
+
+
+def _collect_cross_cloth_particles(session: SceneSession, target: ClothSlot) -> dict[str, np.ndarray]:
+    mode = str(session.cross_cloth_mode or "off").lower()
+    if mode == "off":
+        return _empty_dynamic_particles()
+    positions_list: list[np.ndarray] = []
+    radii_list: list[np.ndarray] = []
+    inv_mass_list: list[np.ndarray] = []
+    slot_ids_list: list[np.ndarray] = []
+    phase_list: list[np.ndarray] = []
+    for source in session.slots.values():
+        if not _cross_cloth_source_enabled(mode, target, source):
+            continue
+        expanded = _cross_source_expanded_target_aabb(target, source)
+        if expanded is None:
+            continue
+        cache = source.dynamic_collider_cache
+        positions = cache.particle_positions
+        if len(positions) == 0:
+            continue
+        mask = np.all(positions >= expanded[0], axis=1) & np.all(positions <= expanded[1], axis=1)
+        if not bool(np.any(mask)):
+            continue
+        if bool(np.all(mask)):
+            positions_list.append(positions)
+            radii_list.append(cache.particle_radii)
+            inv_mass_list.append(cache.particle_inv_mass)
+            slot_ids_list.append(cache.particle_slot_ids)
+            phase_list.append(cache.particle_phases)
+        else:
+            positions_list.append(np.ascontiguousarray(positions[mask], dtype=np.float32))
+            radii_list.append(np.ascontiguousarray(cache.particle_radii[mask], dtype=np.float32))
+            inv_mass_list.append(np.ascontiguousarray(cache.particle_inv_mass[mask], dtype=np.float32))
+            slot_ids_list.append(np.ascontiguousarray(cache.particle_slot_ids[mask], dtype=np.int32))
+            phase_list.append(np.ascontiguousarray(cache.particle_phases[mask], dtype=np.int32))
+    if not positions_list:
+        return _empty_dynamic_particles()
     return {
         "positions": np.ascontiguousarray(np.concatenate(positions_list, axis=0), dtype=np.float32),
         "radii": np.ascontiguousarray(np.concatenate(radii_list, axis=0), dtype=np.float32),
         "inv_mass": np.ascontiguousarray(np.concatenate(inv_mass_list, axis=0), dtype=np.float32),
-        "slot_ids": np.ascontiguousarray(np.concatenate(slot_id_list, axis=0), dtype=np.int32),
+        "slot_ids": np.ascontiguousarray(np.concatenate(slot_ids_list, axis=0), dtype=np.int32),
         "phases": np.ascontiguousarray(np.concatenate(phase_list, axis=0), dtype=np.int32),
     }
 
@@ -2268,6 +2611,11 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
     abi41_bending_texture_ready = 0
     abi41_tack_jitter_guarded = 0
     abi41_bending_guarded = 0
+    dynamic_collider_pack_ms = 0.0
+    dynamic_triangle_upload_ms = 0.0
+    dynamic_particle_upload_ms = 0.0
+    dynamic_collider_cache_hits = 0
+    dynamic_collider_cache_misses = 0
     finite = True
     writeback_performed = False
     diag_started = time.perf_counter()
@@ -2384,6 +2732,11 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
         abi41_bending_texture_ready = max(abi41_bending_texture_ready, int(diag.abi41_bending_texture_ready))
         abi41_tack_jitter_guarded += int(diag.abi41_tack_jitter_guarded)
         abi41_bending_guarded += int(diag.abi41_bending_guarded)
+        dynamic_collider_pack_ms += float(diag.dynamic_collider_pack_ms)
+        dynamic_triangle_upload_ms += float(diag.dynamic_triangle_upload_ms)
+        dynamic_particle_upload_ms += float(diag.dynamic_particle_upload_ms)
+        dynamic_collider_cache_hits += int(diag.dynamic_collider_cache_hits)
+        dynamic_collider_cache_misses += int(diag.dynamic_collider_cache_misses)
         finite = finite and bool(diag.finite)
         writeback_performed = writeback_performed or bool(diag.writeback_performed)
         if diag.min_gap is not None:
@@ -2436,11 +2789,15 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
         external_friction_corrections=external_friction_corrections,
         force_field_count=force_field_count,
         unsupported_force_field_count=unsupported_force_field_count,
-        dynamic_particle_count=dynamic_particle_count,
+        dynamic_particle_count=(
+            perf.dynamic_particle_count if perf is not None and perf.dynamic_particle_count > 0 else dynamic_particle_count
+        ),
         dynamic_particle_candidate_count=dynamic_particle_candidate_count,
         dynamic_particle_contacts=dynamic_particle_contacts,
         dynamic_particle_overflow=dynamic_particle_overflow,
-        dynamic_triangle_count=dynamic_triangle_count,
+        dynamic_triangle_count=(
+            perf.dynamic_triangle_count if perf is not None and perf.dynamic_triangle_count > 0 else dynamic_triangle_count
+        ),
         static_triangle_count=static_triangle_count,
         fast_exact_vt_candidates=fast_exact_vt_candidates,
         fast_exact_vt_projected=fast_exact_vt_projected,
@@ -2503,6 +2860,17 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
         abi41_bending_texture_ready=abi41_bending_texture_ready,
         abi41_tack_jitter_guarded=abi41_tack_jitter_guarded,
         abi41_bending_guarded=abi41_bending_guarded,
+        dynamic_collider_pack_ms=(
+            perf.dynamic_collider_pack_ms if perf is not None else dynamic_collider_pack_ms
+        ),
+        dynamic_triangle_upload_ms=dynamic_triangle_upload_ms,
+        dynamic_particle_upload_ms=dynamic_particle_upload_ms,
+        dynamic_collider_cache_hits=(
+            perf.dynamic_collider_cache_hits if perf is not None else dynamic_collider_cache_hits
+        ),
+        dynamic_collider_cache_misses=(
+            perf.dynamic_collider_cache_misses if perf is not None else dynamic_collider_cache_misses
+        ),
         finite=finite,
         frame_ms=perf.frame_ms if perf is not None else 0.0,
         frame_set_ms=perf.frame_set_ms if perf is not None else 0.0,

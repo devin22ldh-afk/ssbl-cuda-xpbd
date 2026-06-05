@@ -184,6 +184,11 @@ typedef struct SsblXpbdDiagnostics {
     long long abi41_bending_texture_ready;
     long long abi41_tack_jitter_guarded;
     long long abi41_bending_guarded;
+    float dynamic_collider_pack_ms;
+    float dynamic_triangle_upload_ms;
+    float dynamic_particle_upload_ms;
+    long long dynamic_collider_cache_hits;
+    long long dynamic_collider_cache_misses;
 } SsblXpbdDiagnostics;
 
 typedef struct SsblXpbdMesh {

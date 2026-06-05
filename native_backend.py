@@ -279,6 +279,11 @@ class _NativeDiagnostics(ctypes.Structure):
         ("abi41_bending_texture_ready", ctypes.c_longlong),
         ("abi41_tack_jitter_guarded", ctypes.c_longlong),
         ("abi41_bending_guarded", ctypes.c_longlong),
+        ("dynamic_collider_pack_ms", ctypes.c_float),
+        ("dynamic_triangle_upload_ms", ctypes.c_float),
+        ("dynamic_particle_upload_ms", ctypes.c_float),
+        ("dynamic_collider_cache_hits", ctypes.c_longlong),
+        ("dynamic_collider_cache_misses", ctypes.c_longlong),
     ]
 
 
@@ -403,6 +408,11 @@ class NativeStepDiagnostics:
     abi41_bending_texture_ready: int = 0
     abi41_tack_jitter_guarded: int = 0
     abi41_bending_guarded: int = 0
+    dynamic_collider_pack_ms: float = 0.0
+    dynamic_triangle_upload_ms: float = 0.0
+    dynamic_particle_upload_ms: float = 0.0
+    dynamic_collider_cache_hits: int = 0
+    dynamic_collider_cache_misses: int = 0
     frame_ms: float = 0.0
     frame_set_ms: float = 0.0
     input_refresh_ms: float = 0.0
@@ -1040,6 +1050,11 @@ class NativeXpbdSolver:
             abi41_bending_texture_ready=int(raw.abi41_bending_texture_ready),
             abi41_tack_jitter_guarded=int(raw.abi41_tack_jitter_guarded),
             abi41_bending_guarded=int(raw.abi41_bending_guarded),
+            dynamic_collider_pack_ms=float(raw.dynamic_collider_pack_ms),
+            dynamic_triangle_upload_ms=float(raw.dynamic_triangle_upload_ms),
+            dynamic_particle_upload_ms=float(raw.dynamic_particle_upload_ms),
+            dynamic_collider_cache_hits=int(raw.dynamic_collider_cache_hits),
+            dynamic_collider_cache_misses=int(raw.dynamic_collider_cache_misses),
         )
         self._last_diagnostics = diag
         return diag

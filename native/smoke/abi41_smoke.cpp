@@ -1169,23 +1169,30 @@ int run_overpressure_smoke() {
 } // namespace
 
 int main() {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
+    std::printf("SSBL_ABI41_SMOKE_START\n");
     static_assert(sizeof(ssbl_abi41::float3) == 12);
     static_assert(sizeof(ssbl_abi41::CudaSpringPBD) == 12);
     static_assert(sizeof(ssbl_abi41::CudaTriangle) == 12);
     static_assert(sizeof(ssbl_abi41::symMatCuda) == 24);
 
+    std::printf("SSBL_ABI41_SMOKE_BEFORE_HARD_STRETCH\n");
     int stretch_result = run_hard_stretch_optimization_smoke();
     if (stretch_result != 0) {
         return stretch_result;
     }
+    std::printf("SSBL_ABI41_SMOKE_BEFORE_OVERPRESSURE\n");
     int pressure_result = run_overpressure_smoke();
     if (pressure_result != 0) {
         return pressure_result;
     }
+    std::printf("SSBL_ABI41_SMOKE_BEFORE_TACK_BENDING\n");
     int tack_bending_result = run_tack_bending_smoke();
     if (tack_bending_result != 0) {
         return tack_bending_result;
     }
+    std::printf("SSBL_ABI41_SMOKE_BEFORE_STATIC_SDF\n");
     int static_sdf_result = run_static_sdf_smoke();
     if (static_sdf_result != 0) {
         return static_sdf_result;
@@ -1298,13 +1305,16 @@ int main() {
         diag.step_ms,
         diag.resolved_contacts
     );
+    std::printf("SSBL_ABI41_SMOKE_BEFORE_SELF_COLLISION\n");
     int self_result = run_self_collision_smoke();
     if (self_result != 0) {
         return self_result;
     }
+    std::printf("SSBL_ABI41_SMOKE_BEFORE_SELF_VT\n");
     int vt_result = run_self_vertex_triangle_smoke();
     if (vt_result != 0) {
         return vt_result;
     }
+    std::printf("SSBL_ABI41_SMOKE_BEFORE_SELF_EE\n");
     return run_self_edge_edge_smoke();
 }
