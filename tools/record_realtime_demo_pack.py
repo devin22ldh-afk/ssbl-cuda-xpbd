@@ -252,18 +252,10 @@ def _create_overlay(scene: bpy.types.Scene, camera: bpy.types.Object, title: str
 def _update_overlay(
     overlay: Overlay,
     *,
-    frame: int,
-    total_frames: int,
-    average_fps: float,
-    last_step_ms: float,
-    native_ms: float,
+    metrics_line: str,
     note: str,
 ) -> None:
-    overlay.metrics.data.body = (
-        f"frame {frame:03d}/{total_frames:03d} | "
-        f"sim FPS {average_fps:5.1f} | "
-        f"step {last_step_ms:5.2f} ms"
-    )
+    overlay.metrics.data.body = metrics_line
     overlay.notes.data.body = note
     bpy.context.view_layer.update()
 
@@ -296,40 +288,84 @@ def _ensure_output_dir(name: str) -> tuple[Path, Path, Path]:
     return case_dir, frames_dir, video_path
 
 
-def _run_checked(command: list[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-
-
-def _drawtext_escape(text: str) -> str:
-    return (
-        str(text)
-        .replace("\\", "\\\\")
-        .replace("'", "\\'")
-        .replace(":", "\\:")
-        .replace(",", "\\,")
+def _run_checked(command: list[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        command,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=str(cwd) if cwd is not None else None,
     )
 
 
-def _encode_video(frames_dir: Path, video_path: Path, overlay_lines: list[str]) -> str:
+def _display_step_ms(last_step_ms: float, native_ms: float) -> float:
+    native_ms = float(native_ms)
+    if math.isfinite(native_ms) and native_ms > 0.0:
+        return native_ms
+    last_step_ms = float(last_step_ms)
+    if math.isfinite(last_step_ms) and last_step_ms > 0.0:
+        return last_step_ms
+    return 0.0
+
+
+def _current_sim_fps(last_step_ms: float, native_ms: float) -> float:
+    step_ms = _display_step_ms(last_step_ms, native_ms)
+    if step_ms <= 0.0:
+        return 0.0
+    return 1000.0 / step_ms
+
+
+def _format_metrics_line(frame: int, total_frames: int, last_step_ms: float, native_ms: float) -> str:
+    step_ms = _display_step_ms(last_step_ms, native_ms)
+    sim_fps = _current_sim_fps(last_step_ms, native_ms)
+    return f"frame {frame:03d}/{total_frames:03d} | sim FPS {sim_fps:5.1f} | step {step_ms:5.2f} ms"
+
+
+def _compose_overlay_text(title: str, metrics_line: str, note_line: str) -> str:
+    return "\n".join(line for line in (title, metrics_line, note_line) if line)
+
+
+def _format_srt_timestamp(seconds: float) -> str:
+    total_ms = max(0, int(round(float(seconds) * 1000.0)))
+    hours = total_ms // 3_600_000
+    minutes = (total_ms // 60_000) % 60
+    secs = (total_ms // 1000) % 60
+    millis = total_ms % 1000
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+def _write_overlay_srt(frames_dir: Path, overlay_text_frames: list[str]) -> Path:
+    if not overlay_text_frames:
+        raise RuntimeError("overlay_text_frames must not be empty")
+    overlay_path = frames_dir / "overlay.srt"
+    entries: list[str] = []
+    for index, text in enumerate(overlay_text_frames, start=1):
+        start_s = (index - 1) / VIDEO_FPS
+        end_s = index / VIDEO_FPS
+        entries.extend(
+            [
+                str(index),
+                f"{_format_srt_timestamp(start_s)} --> {_format_srt_timestamp(end_s)}",
+                str(text).replace("\r\n", "\n").replace("\r", "\n"),
+                "",
+            ]
+        )
+    overlay_path.write_text("\n".join(entries), encoding="utf-8")
+    return overlay_path
+
+
+def _encode_video(frames_dir: Path, video_path: Path, overlay_text_frames: list[str]) -> str:
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
         raise RuntimeError("ffmpeg was not found in PATH")
-    filters = ["scale=trunc(iw/2)*2:trunc(ih/2)*2"]
-    fontfile = "/Windows/Fonts/arialbd.ttf"
-    y = 24
-    sizes = [30, 25, 23]
-    colors = ["white", "0xC7F1FFFF", "0xFFD582FF"]
-    for index, line in enumerate(overlay_lines):
-        filters.append(
-            "drawtext="
-            f"fontfile={fontfile}:"
-            f"text='{_drawtext_escape(line)}':"
-            f"x=28:y={y}:"
-            f"fontsize={sizes[min(index, len(sizes) - 1)]}:"
-            f"fontcolor={colors[min(index, len(colors) - 1)]}:"
-            "box=1:boxcolor=black@0.64:boxborderw=10"
-        )
-        y += 38 if index == 0 else 33
+    overlay_path = _write_overlay_srt(frames_dir, overlay_text_frames)
+    filter_chain = (
+        "scale=trunc(iw/2)*2:trunc(ih/2)*2,"
+        "subtitles=overlay.srt:"
+        "force_style='FontName=Arial,FontSize=23,Bold=1,Alignment=7,MarginL=28,MarginV=24,"
+        "BorderStyle=3,Outline=0,Shadow=0,BackColour=&H66000000,PrimaryColour=&H00FFFFFF,LineSpacing=6'"
+    )
     _run_checked(
         [
             ffmpeg,
@@ -337,7 +373,7 @@ def _encode_video(frames_dir: Path, video_path: Path, overlay_lines: list[str]) 
             "-framerate",
             str(VIDEO_FPS),
             "-i",
-            str(frames_dir / "frame_%04d.png"),
+            "frame_%04d.png",
             "-c:v",
             "libx264",
             "-pix_fmt",
@@ -345,9 +381,10 @@ def _encode_video(frames_dir: Path, video_path: Path, overlay_lines: list[str]) 
             "-movflags",
             "+faststart",
             "-vf",
-            ",".join(filters),
+            filter_chain,
             str(video_path),
-        ]
+        ],
+        cwd=frames_dir,
     )
     if not video_path.exists() or video_path.stat().st_size <= 0:
         raise RuntimeError(f"ffmpeg did not produce a non-empty video: {video_path}")
@@ -467,12 +504,6 @@ def _summarize_demo(
         ffprobe=probe,
         representative_frames=picks,
     )
-
-
-def _metrics_overlay(step_ms_samples: list[float], simulation_elapsed: float) -> str:
-    steps = len(step_ms_samples)
-    average_fps = steps / max(float(simulation_elapsed), 1.0e-9)
-    return f"sim FPS {average_fps:.1f} | p95 step {_p95(step_ms_samples):.1f} ms | frame %{{n}}"
 
 
 def _keyword_line(*keywords: str) -> str:
@@ -648,6 +679,7 @@ def _record_wring_towel() -> DemoResult:
     session = ssbl.solver.start_preview(bpy.context, towel)
     step_ms_samples: list[float] = []
     frame_paths: list[str] = []
+    overlay_text_frames: list[str] = []
     finite = True
     min_z = float("inf")
     max_radius = 0.0
@@ -668,16 +700,13 @@ def _record_wring_towel() -> DemoResult:
         for vert in towel.data.vertices:
             min_z = min(min_z, float((towel.matrix_world @ vert.co).z))
             max_radius = max(max_radius, math.hypot(float(vert.co.y), float(vert.co.z - 1.25)))
-        avg_fps = len(step_ms_samples) / max(simulation_elapsed, 1.0e-9)
+        metrics_line = _format_metrics_line(frame, WRING_FRAME_COUNT, last_ms, native_ms)
         _update_overlay(
             overlay,
-            frame=frame,
-            total_frames=WRING_FRAME_COUNT,
-            average_fps=avg_fps,
-            last_step_ms=last_ms,
-            native_ms=native_ms,
+            metrics_line=metrics_line,
             note=_keyword_line(*keywords),
         )
+        overlay_text_frames.append(_compose_overlay_text(title, metrics_line, _keyword_line(*keywords)))
         frame_paths.append(_render_frame(scene, frames_dir, frame))
 
     tethers = len(session.cloth.lra_edges)
@@ -688,11 +717,7 @@ def _record_wring_towel() -> DemoResult:
     _encode_video(
         frames_dir,
         video_path,
-        [
-            title,
-            _metrics_overlay(step_ms_samples, simulation_elapsed),
-            _keyword_line(*keywords),
-        ],
+        overlay_text_frames,
     )
     return _summarize_demo(
         name=name,
@@ -905,6 +930,7 @@ def _record_multicloth_contact() -> DemoResult:
 
     step_ms_samples: list[float] = []
     frame_paths: list[str] = []
+    overlay_text_frames: list[str] = []
     finite = True
     simulation_elapsed = 0.0
     max_edge_ratio = 0.0
@@ -940,16 +966,13 @@ def _record_multicloth_contact() -> DemoResult:
             first_y = np.asarray(first.current_positions_world, dtype=np.float64)[:, 1]
             second_y = np.asarray(second.current_positions_world, dtype=np.float64)[:, 1]
             min_panel_gap = min(min_panel_gap, float(np.min(second_y) - np.max(first_y)))
-        avg_fps = len(step_ms_samples) / max(simulation_elapsed, 1.0e-9)
+        metrics_line = _format_metrics_line(frame, frame_count, last_ms, native_ms)
         _update_overlay(
             overlay,
-            frame=frame,
-            total_frames=frame_count,
-            average_fps=avg_fps,
-            last_step_ms=last_ms,
-            native_ms=native_ms,
+            metrics_line=metrics_line,
             note=_keyword_line(*keywords),
         )
+        overlay_text_frames.append(_compose_overlay_text(title, metrics_line, _keyword_line(*keywords)))
         frame_paths.append(_render_frame(scene, frames_dir, frame))
 
     ssbl.solver.request_stop(cloths[1])
@@ -957,11 +980,7 @@ def _record_multicloth_contact() -> DemoResult:
     _encode_video(
         frames_dir,
         video_path,
-        [
-            title,
-            _metrics_overlay(step_ms_samples, simulation_elapsed),
-            _keyword_line(*keywords),
-        ],
+        overlay_text_frames,
     )
     return _summarize_demo(
         name=name,
@@ -1189,6 +1208,7 @@ def _record_object_collision_suite() -> DemoResult:
 
     step_ms_samples: list[float] = []
     frame_paths: list[str] = []
+    overlay_text_frames: list[str] = []
     finite = True
     simulation_elapsed = 0.0
     max_penetration = 0.0
@@ -1220,16 +1240,13 @@ def _record_object_collision_suite() -> DemoResult:
         finite = finite and _finite_mesh(cloth) and bool(diag.finite)
         max_penetration = max(max_penetration, float(diag.penetration_depth))
         max_static_collision_ms = max(max_static_collision_ms, float(diag.static_collision_ms))
-        avg_fps = len(step_ms_samples) / max(simulation_elapsed, 1.0e-9)
+        metrics_line = _format_metrics_line(frame, frame_count, last_ms, native_ms)
         _update_overlay(
             overlay,
-            frame=frame,
-            total_frames=frame_count,
-            average_fps=avg_fps,
-            last_step_ms=last_ms,
-            native_ms=native_ms,
+            metrics_line=metrics_line,
             note=_keyword_line(*keywords),
         )
+        overlay_text_frames.append(_compose_overlay_text(title, metrics_line, _keyword_line(*keywords)))
         frame_paths.append(_render_frame(scene, frames_dir, frame))
 
     ssbl.solver.request_stop(cloth)
@@ -1237,11 +1254,7 @@ def _record_object_collision_suite() -> DemoResult:
     _encode_video(
         frames_dir,
         video_path,
-        [
-            title,
-            _metrics_overlay(step_ms_samples, simulation_elapsed),
-            _keyword_line(*keywords),
-        ],
+        overlay_text_frames,
     )
     return _summarize_demo(
         name=name,
@@ -1366,6 +1379,7 @@ def _record_force_field_tuning() -> DemoResult:
 
     step_ms_samples: list[float] = []
     frame_paths: list[str] = []
+    overlay_text_frames: list[str] = []
     finite = True
     simulation_elapsed = 0.0
     max_avg_x = _average_x(cloth)
@@ -1393,17 +1407,13 @@ def _record_force_field_tuning() -> DemoResult:
         finite = finite and _finite_mesh(cloth) and bool(diag.finite)
         max_avg_x = max(max_avg_x, _average_x(cloth))
         force_field_counts.append(int(diag.force_field_count))
-        avg_fps = len(step_ms_samples) / max(simulation_elapsed, 1.0e-9)
-        phase = "wind 18" if frame < 22 else ("wind 52" if frame < 34 else "wind 52 + stiffer cloth")
+        metrics_line = _format_metrics_line(frame, frame_count, last_ms, native_ms)
         _update_overlay(
             overlay,
-            frame=frame,
-            total_frames=frame_count,
-            average_fps=avg_fps,
-            last_step_ms=last_ms,
-            native_ms=native_ms,
+            metrics_line=metrics_line,
             note=_keyword_line(*keywords),
         )
+        overlay_text_frames.append(_compose_overlay_text(title, metrics_line, _keyword_line(*keywords)))
         frame_paths.append(_render_frame(scene, frames_dir, frame))
 
     ssbl.solver.request_stop(cloth)
@@ -1411,11 +1421,7 @@ def _record_force_field_tuning() -> DemoResult:
     _encode_video(
         frames_dir,
         video_path,
-        [
-            title,
-            _metrics_overlay(step_ms_samples, simulation_elapsed),
-            _keyword_line(*keywords),
-        ],
+        overlay_text_frames,
     )
     return _summarize_demo(
         name=name,
@@ -1569,6 +1575,7 @@ def _record_tshirt_drape() -> DemoResult:
 
     step_ms_samples: list[float] = []
     frame_paths: list[str] = []
+    overlay_text_frames: list[str] = []
     finite = True
     simulation_elapsed = 0.0
     max_static_collision_ms = 0.0
@@ -1595,16 +1602,13 @@ def _record_tshirt_drape() -> DemoResult:
             min_cloth_z = min(min_cloth_z, float(np.min(positions[:, 2])))
             max_x_span = max(max_x_span, float(np.max(positions[:, 0]) - np.min(positions[:, 0])))
         max_static_collision_ms = max(max_static_collision_ms, float(diag.static_collision_ms))
-        avg_fps = len(step_ms_samples) / max(simulation_elapsed, 1.0e-9)
+        metrics_line = _format_metrics_line(frame, frame_count, last_ms, native_ms)
         _update_overlay(
             overlay,
-            frame=frame,
-            total_frames=frame_count,
-            average_fps=avg_fps,
-            last_step_ms=last_ms,
-            native_ms=native_ms,
+            metrics_line=metrics_line,
             note=_keyword_line(*keywords),
         )
+        overlay_text_frames.append(_compose_overlay_text(title, metrics_line, _keyword_line(*keywords)))
         frame_paths.append(_render_frame(scene, frames_dir, frame))
 
     ssbl.solver.request_stop(cloth)
@@ -1612,11 +1616,7 @@ def _record_tshirt_drape() -> DemoResult:
     _encode_video(
         frames_dir,
         video_path,
-        [
-            title,
-            _metrics_overlay(step_ms_samples, simulation_elapsed),
-            _keyword_line(*keywords),
-        ],
+        overlay_text_frames,
     )
     return _summarize_demo(
         name=name,

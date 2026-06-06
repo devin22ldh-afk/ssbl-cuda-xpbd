@@ -9,10 +9,10 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_ARCHITECTURES 89 CACHE STRING "CUDA architectures")
 
 option(SSBL_BUILD_LEGACY "Build the legacy ABI36 CUDA backend" ON)
-option(SSBL_BUILD_ABI41 "Build the reconstructed ABI39 CUDA backend" ON)
+option(SSBL_BUILD_ABI41 "Build the reconstructed ABI40 CUDA backend" ON)
 set(SSBL_CUDA_OUTPUT_NAME "ssbl_xpbd_cuda_abi36" CACHE STRING "Native SSBL CUDA DLL output name")
 set(SSBL_CUDA_OUTPUT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/bin" CACHE PATH "Native SSBL CUDA DLL output directory")
-set(SSBL_ABI41_OUTPUT_NAME "ssbl_xpbd_cuda_abi39" CACHE STRING "Reconstructed SSBL CUDA DLL output name")
+set(SSBL_ABI41_OUTPUT_NAME "ssbl_xpbd_cuda_abi40" CACHE STRING "Reconstructed SSBL CUDA DLL output name")
 set(SSBL_ABI41_OUTPUT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/bin" CACHE PATH "Reconstructed SSBL CUDA DLL output directory")
 
 if (SSBL_BUILD_LEGACY)

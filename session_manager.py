@@ -270,26 +270,12 @@ def record_viewport_tag_ms(object_name: str, elapsed_ms: float) -> None:
         self_recovery_ms=diag.self_recovery_ms,
         sync_ms=diag.sync_ms,
         diagnostics_fetch_ms=diag.diagnostics_fetch_ms,
-        self_vs_pair_build_ms=diag.self_vs_pair_build_ms,
-        self_vs_pair_project_ms=diag.self_vs_pair_project_ms,
         candidate_count=diag.candidate_count,
         resolved_contacts=diag.resolved_contacts,
         min_gap=diag.min_gap,
         ccd_clamp_count=diag.ccd_clamp_count,
         recovery_passes=diag.recovery_passes,
         local_retry_count=diag.local_retry_count,
-        self_active_regions=diag.self_active_regions,
-        self_sleeping_regions=diag.self_sleeping_regions,
-        self_skipped_sources=diag.self_skipped_sources,
-        self_active_vertices=diag.self_active_vertices,
-        self_active_samples=diag.self_active_samples,
-        self_suspect_regions=diag.self_suspect_regions,
-        self_compaction_used=diag.self_compaction_used,
-        self_full_recovery_fallbacks=diag.self_full_recovery_fallbacks,
-        self_vs_pair_count=diag.self_vs_pair_count,
-        self_vs_pair_capacity=diag.self_vs_pair_capacity,
-        self_vs_pair_overflow=diag.self_vs_pair_overflow,
-        self_vs_pair_compaction_used=diag.self_vs_pair_compaction_used,
         jitter_stabilized_vertices=diag.jitter_stabilized_vertices,
         jitter_rejected_vertices=diag.jitter_rejected_vertices,
         jitter_max_correction=diag.jitter_max_correction,
@@ -1230,13 +1216,6 @@ def _solver_options_signature(options, settings=None) -> tuple:
         round(float(options.pressure_strength), 6),
         int(options.self_probe_interval),
         int(options.self_surface_pair_interval),
-        bool(options.self_sleep_enabled),
-        int(options.self_sleep_still_frames),
-        int(options.self_sleep_full_scan_interval),
-        bool(options.self_compaction_enabled),
-        round(float(options.self_sleep_motion_scale), 6),
-        round(float(options.self_compaction_active_fraction_threshold), 6),
-        bool(options.self_pair_compaction_enabled),
         bool(options.jitter_stabilizer_enabled),
         round(float(getattr(options, "contact_friction", 0.35)), 6),
         round(float(getattr(options, "contact_tangent_damping", 0.2)), 6),
@@ -2886,8 +2865,6 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
     self_recovery_ms = 0.0
     sync_ms = 0.0
     diagnostics_fetch_ms = 0.0
-    self_vs_pair_build_ms = 0.0
-    self_vs_pair_project_ms = 0.0
     frame_input_upload_ms = 0.0
     candidate_count = 0
     resolved_contacts = 0
@@ -2895,18 +2872,6 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
     ccd_clamp_count = 0
     recovery_passes = 0
     local_retry_count = 0
-    self_active_regions = 0
-    self_sleeping_regions = 0
-    self_skipped_sources = 0
-    self_active_vertices = 0
-    self_active_samples = 0
-    self_suspect_regions = 0
-    self_compaction_used = 0
-    self_full_recovery_fallbacks = 0
-    self_vs_pair_count = 0
-    self_vs_pair_capacity = 0
-    self_vs_pair_overflow = 0
-    self_vs_pair_compaction_used = 0
     jitter_stabilized_vertices = 0
     jitter_rejected_vertices = 0
     jitter_max_correction = 0.0
@@ -3019,26 +2984,12 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
         self_recovery_ms += float(diag.self_recovery_ms)
         sync_ms += float(diag.sync_ms)
         diagnostics_fetch_ms += float(diag.diagnostics_fetch_ms)
-        self_vs_pair_build_ms += float(diag.self_vs_pair_build_ms)
-        self_vs_pair_project_ms += float(diag.self_vs_pair_project_ms)
         frame_input_upload_ms += float(diag.frame_input_upload_ms)
         candidate_count += int(diag.candidate_count)
         resolved_contacts += int(diag.resolved_contacts)
         ccd_clamp_count += int(diag.ccd_clamp_count)
         recovery_passes += int(diag.recovery_passes)
         local_retry_count += int(diag.local_retry_count)
-        self_active_regions += int(diag.self_active_regions)
-        self_sleeping_regions += int(diag.self_sleeping_regions)
-        self_skipped_sources += int(diag.self_skipped_sources)
-        self_active_vertices += int(diag.self_active_vertices)
-        self_active_samples += int(diag.self_active_samples)
-        self_suspect_regions += int(diag.self_suspect_regions)
-        self_compaction_used += int(diag.self_compaction_used)
-        self_full_recovery_fallbacks += int(diag.self_full_recovery_fallbacks)
-        self_vs_pair_count += int(diag.self_vs_pair_count)
-        self_vs_pair_capacity += int(diag.self_vs_pair_capacity)
-        self_vs_pair_overflow += int(diag.self_vs_pair_overflow)
-        self_vs_pair_compaction_used += int(diag.self_vs_pair_compaction_used)
         jitter_stabilized_vertices += int(diag.jitter_stabilized_vertices)
         jitter_rejected_vertices += int(diag.jitter_rejected_vertices)
         jitter_max_correction = max(jitter_max_correction, float(diag.jitter_max_correction))
@@ -3153,8 +3104,6 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
         self_recovery_ms=self_recovery_ms,
         sync_ms=sync_ms,
         diagnostics_fetch_ms=diagnostics_fetch_ms,
-        self_vs_pair_build_ms=self_vs_pair_build_ms,
-        self_vs_pair_project_ms=self_vs_pair_project_ms,
         frame_input_upload_ms=perf.frame_input_upload_ms if perf is not None else frame_input_upload_ms,
         candidate_count=candidate_count,
         resolved_contacts=resolved_contacts,
@@ -3162,18 +3111,6 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
         ccd_clamp_count=ccd_clamp_count,
         recovery_passes=recovery_passes,
         local_retry_count=local_retry_count,
-        self_active_regions=self_active_regions,
-        self_sleeping_regions=self_sleeping_regions,
-        self_skipped_sources=self_skipped_sources,
-        self_active_vertices=self_active_vertices,
-        self_active_samples=self_active_samples,
-        self_suspect_regions=self_suspect_regions,
-        self_compaction_used=self_compaction_used,
-        self_full_recovery_fallbacks=self_full_recovery_fallbacks,
-        self_vs_pair_count=self_vs_pair_count,
-        self_vs_pair_capacity=self_vs_pair_capacity,
-        self_vs_pair_overflow=self_vs_pair_overflow,
-        self_vs_pair_compaction_used=self_vs_pair_compaction_used,
         jitter_stabilized_vertices=jitter_stabilized_vertices,
         jitter_rejected_vertices=jitter_rejected_vertices,
         jitter_max_correction=jitter_max_correction,

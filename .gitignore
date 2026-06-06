@@ -8,9 +8,12 @@ progress.md
 
 # Native build outputs and import libraries
 native/build/
+native/build_*/
 native/lib/
+native/lib_*/
+native/bin_*/
 native/bin/*.dll
-!native/bin/ssbl_xpbd_cuda_abi16.dll
+!native/bin/ssbl_xpbd_cuda_abi40.dll
 native/bin/*.exe
 native/bin/*.exp
 native/bin/*.lib

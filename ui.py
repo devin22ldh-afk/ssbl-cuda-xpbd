@@ -200,13 +200,6 @@ class SSBL_PT_advanced(bpy.types.Panel):
             col_adv_self.prop(settings, "self_collision_interval", text="求交判定间隔")
             col_adv_self.prop(settings, "self_probe_interval", text="宽相 Probe 间隔")
             col_adv_self.prop(settings, "self_surface_pair_interval", text="表面配对刷新间隔")
-            
-            box_adv_self.separator()
-            col_sleep = box_adv_self.column(align=True)
-            col_sleep.prop(settings, "self_sleep_enabled", text="启用休眠机制 (Sleep)")
-            if settings.self_sleep_enabled:
-                col_sleep.prop(settings, "self_sleep_still_frames", text="静止判定帧数")
-                col_sleep.prop(settings, "self_sleep_full_scan_interval", text="全量扫描间隔")
 
 
 class SSBL_PT_cache(bpy.types.Panel):

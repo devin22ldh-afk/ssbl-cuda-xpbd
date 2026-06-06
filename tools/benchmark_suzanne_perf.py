@@ -137,22 +137,6 @@ def _configure(settings, *, self_collision: bool, volume: bool, optimized: bool)
         if self_collision
         else 1
     )
-    settings.self_sleep_enabled = bool(
-        _int_env("SSBL_SUZANNE_SELF_SLEEP_ENABLED", 1 if self_collision else 0)
-    )
-    settings.self_sleep_still_frames = _int_env("SSBL_SUZANNE_SELF_SLEEP_STILL_FRAMES", 10)
-    settings.self_sleep_full_scan_interval = _int_env("SSBL_SUZANNE_SELF_SLEEP_FULL_SCAN_INTERVAL", 30)
-    settings.self_compaction_enabled = bool(
-        _int_env("SSBL_SUZANNE_SELF_COMPACTION_ENABLED", 1 if self_collision else 0)
-    )
-    settings.self_pair_compaction_enabled = bool(
-        _int_env("SSBL_SUZANNE_SELF_PAIR_COMPACTION_ENABLED", 1 if self_collision else 0)
-    )
-    settings.self_sleep_motion_scale = _float_env("SSBL_SUZANNE_SELF_SLEEP_MOTION_SCALE", 1.0)
-    settings.self_compaction_active_fraction_threshold = _float_env(
-        "SSBL_SUZANNE_COMPACTION_ACTIVE_FRACTION",
-        0.75,
-    )
     settings.use_volume_pressure = bool(volume)
     settings.volume_solve_interval = 2 if optimized and volume else 1
     settings.volume_compliance = 1.0e-6
@@ -172,9 +156,6 @@ def _run_case(obj: bpy.types.Object, label: str, *, self_collision: bool, volume
     settings = bpy.context.scene.ssbl_preview
     _configure(settings, self_collision=self_collision, volume=volume, optimized=optimized)
     configured_writeback_interval = max(int(getattr(settings, "preview_writeback_interval", 1)), 1)
-    configured_sleep_enabled = bool(getattr(settings, "self_sleep_enabled", False))
-    configured_compaction_enabled = bool(getattr(settings, "self_compaction_enabled", False))
-    configured_pair_compaction_enabled = bool(getattr(settings, "self_pair_compaction_enabled", False))
     before = _source_snapshot(obj)
     session = ssbl.solver.start_preview(bpy.context, obj)
     steps = int(settings.frame_count)
@@ -239,9 +220,6 @@ def _run_case(obj: bpy.types.Object, label: str, *, self_collision: bool, volume
         "verts": len(session.cloth.positions_world),
         "tris": len(session.cloth.triangles),
         "writeback_interval": configured_writeback_interval,
-        "sleep_enabled": configured_sleep_enabled,
-        "compaction_enabled": configured_compaction_enabled,
-        "pair_compaction_enabled": configured_pair_compaction_enabled,
         "measured_steps": measured_steps,
         "fps": round(max(measured_steps, 1) / elapsed, 2),
         "avg_frame_ms": round(measured_frame_ms_total / max(measured_steps, 1), 2),
@@ -270,8 +248,6 @@ def _run_case(obj: bpy.types.Object, label: str, *, self_collision: bool, volume
         "self_solve_ms": round(float(diag.self_solve_ms), 2),
         "self_probe_ms": round(float(diag.self_probe_ms), 2),
         "self_recovery_ms": round(float(diag.self_recovery_ms), 2),
-        "self_vs_pair_build_ms": round(float(diag.self_vs_pair_build_ms), 2),
-        "self_vs_pair_project_ms": round(float(diag.self_vs_pair_project_ms), 2),
         "sync_ms": round(float(diag.sync_ms), 2),
         "native_diag_fetch_ms": round(float(diag.diagnostics_fetch_ms), 2),
         "frame_ms": round(float(diag.frame_ms), 2),
@@ -299,18 +275,6 @@ def _run_case(obj: bpy.types.Object, label: str, *, self_collision: bool, volume
         "ccd_clamp_count": int(diag.ccd_clamp_count),
         "recovery_passes": int(diag.recovery_passes),
         "local_retry_count": int(diag.local_retry_count),
-        "self_active_regions": int(diag.self_active_regions),
-        "self_sleeping_regions": int(diag.self_sleeping_regions),
-        "self_skipped_sources": int(diag.self_skipped_sources),
-        "self_active_vertices": int(diag.self_active_vertices),
-        "self_active_samples": int(diag.self_active_samples),
-        "self_suspect_regions": int(diag.self_suspect_regions),
-        "self_compaction_used": int(diag.self_compaction_used),
-        "self_full_recovery_fallbacks": int(diag.self_full_recovery_fallbacks),
-        "self_vs_pair_count": int(diag.self_vs_pair_count),
-        "self_vs_pair_capacity": int(diag.self_vs_pair_capacity),
-        "self_vs_pair_overflow": int(diag.self_vs_pair_overflow),
-        "self_vs_pair_compaction_used": int(diag.self_vs_pair_compaction_used),
         "jitter_stabilized_vertices": int(diag.jitter_stabilized_vertices),
         "jitter_rejected_vertices": int(diag.jitter_rejected_vertices),
         "jitter_max_correction": round(float(diag.jitter_max_correction), 6),
@@ -347,32 +311,6 @@ def _append_compare_cases(results: list[dict[str, object]], obj: bpy.types.Objec
                     volume=True,
                     optimized=True,
                     env={"SSBL_SUZANNE_WRITEBACK_INTERVAL": str(interval)},
-                )
-            )
-
-    if _bool_env("SSBL_SUZANNE_COMPARE_PAIR", False):
-        for enabled in (0, 1):
-            results.append(
-                _run_case_with_env(
-                    obj,
-                    f"optimized_self_and_volume_pair_{'on' if enabled else 'off'}",
-                    self_collision=True,
-                    volume=True,
-                    optimized=True,
-                    env={"SSBL_SUZANNE_SELF_PAIR_COMPACTION_ENABLED": str(enabled)},
-                )
-            )
-
-    if _bool_env("SSBL_SUZANNE_COMPARE_SLEEP", False):
-        for enabled in (0, 1):
-            results.append(
-                _run_case_with_env(
-                    obj,
-                    f"optimized_self_and_volume_sleep_{'on' if enabled else 'off'}",
-                    self_collision=True,
-                    volume=True,
-                    optimized=True,
-                    env={"SSBL_SUZANNE_SELF_SLEEP_ENABLED": str(enabled)},
                 )
             )
 

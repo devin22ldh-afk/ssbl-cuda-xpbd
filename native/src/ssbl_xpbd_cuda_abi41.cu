@@ -289,7 +289,7 @@ struct Abi41Solver {
 };
 
 bool set_error(const char* message) {
-    g_last_error = message ? message : "unknown ABI39 recon CUDA error";
+    g_last_error = message ? message : "unknown ABI40 recon CUDA error";
     return false;
 }
 
@@ -4718,7 +4718,7 @@ bool upload_dynamic_particles(
 extern "C" SSBL_API void* ssbl_create_solver(const SsblXpbdConfig* config, const SsblXpbdMesh* mesh) {
     g_last_error.clear();
     if (!finite_config(config) || !mesh || !mesh->positions || !mesh->inv_mass) {
-        set_error("invalid ABI39 ABI41 solver create request");
+        set_error("invalid ABI40 ABI41 solver create request");
         return nullptr;
     }
     auto* solver = new Abi41Solver();
@@ -4772,12 +4772,12 @@ extern "C" SSBL_API void* ssbl_create_solver(const SsblXpbdConfig* config, const
         springs.push_back(ReconSpring{static_cast<unsigned int>(std::max(i, 0)), static_cast<unsigned int>(std::max(j, 0)), rest});
     }
     if (solver->cfg.bend_count > 0 && (!mesh->bends || !mesh->bend_rest_lengths)) {
-        set_error("ABI39 recon bend constraints require bend pairs and rest lengths");
+        set_error("ABI40 recon bend constraints require bend pairs and rest lengths");
         free_solver(solver);
         return nullptr;
     }
     if (solver->cfg.lra_count > 0 && (!mesh->lra_edges || !mesh->lra_rest_lengths)) {
-        set_error("ABI39 recon LRA constraints require edge pairs and rest lengths");
+        set_error("ABI40 recon LRA constraints require edge pairs and rest lengths");
         free_solver(solver);
         return nullptr;
     }
@@ -5012,7 +5012,7 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
         if (solver->pin_count > 0) {
             abi41_pin_project_kernel<<<p_blocks, kThreads>>>(*solver);
         }
-        if (!set_cuda_error(cudaGetLastError(), "launch ABI39 recon integrate/pin")) {
+        if (!set_cuda_error(cudaGetLastError(), "launch ABI40 recon integrate/pin")) {
             return 0;
         }
         for (int it = 0; it < iterations; ++it) {
@@ -5138,18 +5138,18 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
                     solver->diag.self_solve_ms += elapsed_ms_since(self_solve_started);
                 }
             }
-            if (!set_cuda_error(cudaGetLastError(), "launch ABI39 recon constraints")) {
+            if (!set_cuda_error(cudaGetLastError(), "launch ABI40 recon constraints")) {
                 return 0;
             }
         }
         abi41_update_velocity_kernel<<<v_blocks, kThreads>>>(*solver, sub_dt);
-        if (!set_cuda_error(cudaGetLastError(), "launch ABI39 recon velocity")) {
+        if (!set_cuda_error(cudaGetLastError(), "launch ABI40 recon velocity")) {
             return 0;
         }
     }
     if (force_sync != 0 || fetch_diagnostics != 0) {
         const auto sync_started = std::chrono::high_resolution_clock::now();
-        if (!set_cuda_error(cudaDeviceSynchronize(), "ABI39 ABI41 solver step")) {
+        if (!set_cuda_error(cudaDeviceSynchronize(), "ABI40 ABI41 solver step")) {
             return 0;
         }
         solver->diag.sync_ms = elapsed_ms_since(sync_started);
@@ -5178,7 +5178,7 @@ extern "C" SSBL_API int ssbl_download_positions(void* handle, float* out_positio
     }
     return set_cuda_error(
         cudaMemcpy(out_positions, solver->pos, sizeof(Vec3) * solver->cfg.vertex_count, cudaMemcpyDeviceToHost),
-        "download ABI39 recon positions"
+        "download ABI40 recon positions"
     ) ? 1 : 0;
 }
 

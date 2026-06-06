@@ -56,13 +56,6 @@ class _NativeConfig(ctypes.Structure):
         ("volume_solve_interval", ctypes.c_int),
         ("self_probe_interval", ctypes.c_int),
         ("self_surface_pair_interval", ctypes.c_int),
-        ("self_sleep_enabled", ctypes.c_int),
-        ("self_sleep_still_frames", ctypes.c_int),
-        ("self_sleep_full_scan_interval", ctypes.c_int),
-        ("self_compaction_enabled", ctypes.c_int),
-        ("self_sleep_motion_scale", ctypes.c_float),
-        ("self_compaction_active_fraction_threshold", ctypes.c_float),
-        ("self_pair_compaction_enabled", ctypes.c_int),
         ("jitter_stabilizer_enabled", ctypes.c_int),
         ("contact_friction", ctypes.c_float),
         ("contact_tangent_damping", ctypes.c_float),
@@ -181,26 +174,12 @@ class _NativeDiagnostics(ctypes.Structure):
         ("self_recovery_ms", ctypes.c_float),
         ("sync_ms", ctypes.c_float),
         ("diagnostics_fetch_ms", ctypes.c_float),
-        ("self_vs_pair_build_ms", ctypes.c_float),
-        ("self_vs_pair_project_ms", ctypes.c_float),
         ("candidate_count", ctypes.c_longlong),
         ("resolved_contacts", ctypes.c_longlong),
         ("min_gap", ctypes.c_float),
         ("ccd_clamp_count", ctypes.c_longlong),
         ("recovery_passes", ctypes.c_longlong),
         ("local_retry_count", ctypes.c_longlong),
-        ("self_active_regions", ctypes.c_longlong),
-        ("self_sleeping_regions", ctypes.c_longlong),
-        ("self_skipped_sources", ctypes.c_longlong),
-        ("self_active_vertices", ctypes.c_longlong),
-        ("self_active_samples", ctypes.c_longlong),
-        ("self_suspect_regions", ctypes.c_longlong),
-        ("self_compaction_used", ctypes.c_longlong),
-        ("self_full_recovery_fallbacks", ctypes.c_longlong),
-        ("self_vs_pair_count", ctypes.c_longlong),
-        ("self_vs_pair_capacity", ctypes.c_longlong),
-        ("self_vs_pair_overflow", ctypes.c_longlong),
-        ("self_vs_pair_compaction_used", ctypes.c_longlong),
         ("jitter_stabilized_vertices", ctypes.c_longlong),
         ("jitter_rejected_vertices", ctypes.c_longlong),
         ("jitter_max_correction", ctypes.c_float),
@@ -321,26 +300,12 @@ class NativeStepDiagnostics:
     self_recovery_ms: float = 0.0
     sync_ms: float = 0.0
     diagnostics_fetch_ms: float = 0.0
-    self_vs_pair_build_ms: float = 0.0
-    self_vs_pair_project_ms: float = 0.0
     candidate_count: int = 0
     resolved_contacts: int = 0
     min_gap: float | None = None
     ccd_clamp_count: int = 0
     recovery_passes: int = 0
     local_retry_count: int = 0
-    self_active_regions: int = 0
-    self_sleeping_regions: int = 0
-    self_skipped_sources: int = 0
-    self_active_vertices: int = 0
-    self_active_samples: int = 0
-    self_suspect_regions: int = 0
-    self_compaction_used: int = 0
-    self_full_recovery_fallbacks: int = 0
-    self_vs_pair_count: int = 0
-    self_vs_pair_capacity: int = 0
-    self_vs_pair_overflow: int = 0
-    self_vs_pair_compaction_used: int = 0
     jitter_stabilized_vertices: int = 0
     jitter_rejected_vertices: int = 0
     jitter_max_correction: float = 0.0
@@ -462,7 +427,7 @@ class NativeStepDiagnostics:
 
 _LIB = None
 _LOAD_ERROR = ""
-_ABI41_DLL_NAME = "ssbl_xpbd_cuda_abi39.dll"
+_ABI41_DLL_NAME = "ssbl_xpbd_cuda_abi40.dll"
 _CAP_STRETCH_OPTIMIZATION = 1 << 0
 
 
@@ -494,7 +459,7 @@ def _load_library():
     path = dll_path()
     if not os.path.exists(path):
         raise NativeBackendUnavailable(
-            "Missing ABI39 CUDA solver DLL. Install CUDA Toolkit, CMake, and VS Build Tools, then run native/build_recon.ps1."
+            "Missing ABI40 CUDA solver DLL. Install CUDA Toolkit, CMake, and VS Build Tools, then run native/build_recon.ps1."
         )
 
     try:
@@ -629,13 +594,6 @@ def _config_from_options(
     cfg.volume_solve_interval = int(options.volume_solve_interval)
     cfg.self_probe_interval = int(options.self_probe_interval)
     cfg.self_surface_pair_interval = int(options.self_surface_pair_interval)
-    cfg.self_sleep_enabled = int(options.self_sleep_enabled)
-    cfg.self_sleep_still_frames = int(options.self_sleep_still_frames)
-    cfg.self_sleep_full_scan_interval = int(options.self_sleep_full_scan_interval)
-    cfg.self_compaction_enabled = int(options.self_compaction_enabled)
-    cfg.self_sleep_motion_scale = float(options.self_sleep_motion_scale)
-    cfg.self_compaction_active_fraction_threshold = float(options.self_compaction_active_fraction_threshold)
-    cfg.self_pair_compaction_enabled = int(options.self_pair_compaction_enabled)
     cfg.jitter_stabilizer_enabled = int(options.jitter_stabilizer_enabled)
     cfg.contact_friction = float(getattr(options, "contact_friction", 0.35))
     cfg.contact_tangent_damping = float(getattr(options, "contact_tangent_damping", 0.2))
@@ -705,12 +663,12 @@ def _as_force_field_ptr(arr):
 class NativeXpbdSolver:
     def __init__(self, cloth: ClothBuildData, options: SolverOptions, static_triangles: np.ndarray):
         self._lib = _load_library()
-        self._is_abi41_abi39 = "abi39" in os.path.basename(dll_path()).lower()
+        self._is_abi41_abi40 = "abi40" in os.path.basename(dll_path()).lower()
         if bool(getattr(options, "stretch_optimization_enabled", False)):
             if (_capabilities(self._lib) & _CAP_STRETCH_OPTIMIZATION) == 0:
                 raise NativeSolverError(
                     "Loaded CUDA solver DLL does not support hard stretch optimization. "
-                    "Rebuild native/build_recon.ps1 to generate the ABI39 DLL."
+                    "Rebuild native/build_recon.ps1 to generate the ABI40 DLL."
                 )
         self._vertex_count = int(len(cloth.positions_world))
         self._positions_out = np.empty((self._vertex_count, 3), dtype=np.float32)
@@ -860,7 +818,7 @@ class NativeXpbdSolver:
             (dynamic_particles or {}).get("radii", np.empty(0, dtype=np.float32)),
             dtype=np.float32,
         ).reshape((-1,))
-        needs_particle_extras = dynamic_particle_count > 0 and not bool(getattr(self, "_is_abi41_abi39", False))
+        needs_particle_extras = dynamic_particle_count > 0 and not bool(getattr(self, "_is_abi41_abi40", False))
         if needs_particle_extras:
             particle_inv_mass = np.ascontiguousarray(
                 (dynamic_particles or {}).get("inv_mass", np.ones(dynamic_particle_count, dtype=np.float32)),
@@ -981,26 +939,12 @@ class NativeXpbdSolver:
             self_recovery_ms=float(raw.self_recovery_ms),
             sync_ms=float(raw.sync_ms),
             diagnostics_fetch_ms=float(raw.diagnostics_fetch_ms),
-            self_vs_pair_build_ms=float(raw.self_vs_pair_build_ms),
-            self_vs_pair_project_ms=float(raw.self_vs_pair_project_ms),
             candidate_count=int(raw.candidate_count),
             resolved_contacts=int(raw.resolved_contacts),
             min_gap=min_gap,
             ccd_clamp_count=int(raw.ccd_clamp_count),
             recovery_passes=int(raw.recovery_passes),
             local_retry_count=int(raw.local_retry_count),
-            self_active_regions=int(raw.self_active_regions),
-            self_sleeping_regions=int(raw.self_sleeping_regions),
-            self_skipped_sources=int(raw.self_skipped_sources),
-            self_active_vertices=int(raw.self_active_vertices),
-            self_active_samples=int(raw.self_active_samples),
-            self_suspect_regions=int(raw.self_suspect_regions),
-            self_compaction_used=int(raw.self_compaction_used),
-            self_full_recovery_fallbacks=int(raw.self_full_recovery_fallbacks),
-            self_vs_pair_count=int(raw.self_vs_pair_count),
-            self_vs_pair_capacity=int(raw.self_vs_pair_capacity),
-            self_vs_pair_overflow=int(raw.self_vs_pair_overflow),
-            self_vs_pair_compaction_used=int(raw.self_vs_pair_compaction_used),
             jitter_stabilized_vertices=int(raw.jitter_stabilized_vertices),
             jitter_rejected_vertices=int(raw.jitter_rejected_vertices),
             jitter_max_correction=float(raw.jitter_max_correction),

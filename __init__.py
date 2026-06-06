@@ -37,13 +37,6 @@ def _apply_fast_self_collision_defaults(settings) -> None:
     settings.fast_self_collision_passes = 4
     settings.self_probe_interval = 4
     settings.self_surface_pair_interval = 4
-    settings.self_sleep_enabled = True
-    settings.self_sleep_still_frames = 6
-    settings.self_sleep_full_scan_interval = 60
-    settings.self_compaction_enabled = True
-    settings.self_pair_compaction_enabled = True
-    settings.self_sleep_motion_scale = 1.5
-    settings.self_compaction_active_fraction_threshold = 0.90
 
 
 def _apply_strict_self_collision_defaults(settings) -> None:
@@ -51,13 +44,6 @@ def _apply_strict_self_collision_defaults(settings) -> None:
     settings.max_self_collision_neighbors = 64
     settings.self_probe_interval = 1
     settings.self_surface_pair_interval = 1
-    settings.self_sleep_enabled = True
-    settings.self_sleep_still_frames = 10
-    settings.self_sleep_full_scan_interval = 30
-    settings.self_compaction_enabled = True
-    settings.self_pair_compaction_enabled = True
-    settings.self_sleep_motion_scale = 1.0
-    settings.self_compaction_active_fraction_threshold = 0.75
 
 
 def _apply_self_collision_mode(settings, _context):
@@ -84,9 +70,6 @@ def _apply_self_collision_toggle(settings, _context):
     enabled = bool(getattr(settings, "self_collision", False))
     if enabled:
         _apply_self_collision_mode(settings, _context)
-    else:
-        settings.self_sleep_enabled = False
-        settings.self_pair_compaction_enabled = False
 
 
 def _apply_hardness(settings, _context):
@@ -362,7 +345,7 @@ class SSBL_PreviewSettings(PropertyGroup):
     )
     damping: FloatProperty(
         name="速度阻尼",
-        default=1.0,
+        default=0.9999,
         min=0.0,
         max=1.0,
         description="每个子步施加的速度阻尼",
@@ -649,53 +632,6 @@ class SSBL_PreviewSettings(PropertyGroup):
         min=1,
         soft_max=8,
         description="Run sample-sample self-collision every N self-collision passes; 1 preserves the original behavior",
-    )
-    self_sleep_enabled: BoolProperty(
-        name="局部休眠",
-        default=True,
-        description="快速预览中让连续静止的局部区域跳过主动自碰撞查询",
-    )
-    self_sleep_still_frames: IntProperty(
-        name="静止帧数",
-        default=10,
-        min=1,
-        max=60,
-        description="局部区域连续多少个 solver frame 低运动量后进入自碰撞休眠",
-    )
-    self_sleep_full_scan_interval: IntProperty(
-        name="强制复查间隔",
-        default=30,
-        min=1,
-        max=240,
-        description="每隔多少个 solver frame 强制唤醒并完整复查一次局部自碰撞",
-    )
-    self_compaction_enabled: BoolProperty(
-        name="Active compaction",
-        default=True,
-        options={"HIDDEN"},
-        description="Internal fast-preview source-list compaction for sleeping self-collision regions",
-    )
-    self_sleep_motion_scale: FloatProperty(
-        name="Self sleep motion scale",
-        default=1.0,
-        min=0.05,
-        max=4.0,
-        options={"HIDDEN"},
-        description="Internal multiplier for cloth-thickness-based local self-sleep motion threshold",
-    )
-    self_compaction_active_fraction_threshold: FloatProperty(
-        name="Self compaction active fraction",
-        default=0.75,
-        min=0.01,
-        max=1.0,
-        options={"HIDDEN"},
-        description="Internal active source fraction below which compacted self-collision lists are used",
-    )
-    self_pair_compaction_enabled: BoolProperty(
-        name="Vertex-surface pair compaction",
-        default=True,
-        options={"HIDDEN"},
-        description="Internal preview vertex-surface pair compaction for self-collision solve/probe/recovery",
     )
     jitter_stabilizer_enabled: BoolProperty(
         name="Jitter stabilizer",

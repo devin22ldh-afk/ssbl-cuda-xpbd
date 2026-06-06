@@ -38,25 +38,9 @@ constexpr float kSelfApproachEps = 1.0e-5f;
 constexpr float kSelfContactDistanceEdgeP10Scale = 0.60f;
 constexpr int kFastSelfCollisionPasses = 4;
 constexpr int kFastSelfTriangleCleanupRuns = 0;
-constexpr int kSelfSleepTargetVerticesPerRegion = 512;
-constexpr int kSelfSleepMaxRegions = 1024;
 constexpr int kSelfSourceFull = 0;
-constexpr int kSelfSourceActive = 1;
-constexpr int kSelfSourceSuspect = 2;
 constexpr int kSelfCollisionModeFast = 1;
 constexpr int kSelfCollisionModeStrict = 2;
-constexpr int kSelfCompactionCountSlots = 6;
-constexpr int kSelfCompactionActiveVertices = 0;
-constexpr int kSelfCompactionSuspectVertices = 1;
-constexpr int kSelfCompactionActiveSamples = 2;
-constexpr int kSelfCompactionSuspectSamples = 3;
-constexpr int kSelfCompactionActiveRegions = 4;
-constexpr int kSelfCompactionSuspectRegions = 5;
-constexpr int kSelfVsPairCountSlots = 2;
-constexpr int kSelfVsPairCount = 0;
-constexpr int kSelfVsPairOverflow = 1;
-constexpr int kSelfVsPairCapacityMin = 262144;
-constexpr int kSelfVsPairCapacityMax = 8388608;
 constexpr int kMaxSelfTriangleHashCells = 32;
 constexpr int kMaxSelfVertexTriangleQueryCells = 64;
 constexpr int kMaxSelfVertexTriangleCandidates = 128;
@@ -119,9 +103,6 @@ constexpr int kDiagCandidateCount = 0;
 constexpr int kDiagResolvedContacts = 1;
 constexpr int kDiagCcdClampCount = 2;
 constexpr int kDiagFiniteFlag = 3;
-constexpr int kDiagSelfSkippedSources = 4;
-constexpr int kDiagSelfActiveRegions = 5;
-constexpr int kDiagSelfSleepingRegions = 6;
 constexpr int kDiagExternalContactCacheHits = 7;
 constexpr int kDiagExternalContactCacheMisses = 8;
 constexpr int kDiagExternalContactCacheOverflow = 9;
@@ -247,45 +228,7 @@ struct Solver {
     int self_tri_entry_capacity = 0;
     int* self_recovery_touched = nullptr;
     Vec3* self_recovery_delta = nullptr;
-    int* self_sleep_vertex_regions = nullptr;
-    int* self_sleep_triangle_regions = nullptr;
-    Vec3* self_sleep_prev_pos = nullptr;
-    int* self_sleep_region_still_frames = nullptr;
-    int* self_sleep_region_sleeping = nullptr;
-    int* self_sleep_region_motion = nullptr;
-    int* self_sleep_region_touched = nullptr;
-    int* self_sleep_region_vertex_counts = nullptr;
-    int* self_sleep_has_sleeping = nullptr;
-    int self_sleep_region_count = 0;
-    int self_sleep_dim_x = 1;
-    int self_sleep_dim_y = 1;
-    int self_sleep_dim_z = 1;
-    int self_sleep_force_active = 0;
-    long long self_sleep_frame_count = 0;
-    int* self_active_vertices = nullptr;
-    int* self_suspect_vertices = nullptr;
-    int* self_active_vertex_flags = nullptr;
-    int* self_suspect_vertex_flags = nullptr;
-    int* self_active_samples = nullptr;
-    int* self_suspect_samples = nullptr;
-    int* self_compaction_counts = nullptr;
-    int self_active_vertex_count = 0;
-    int self_suspect_vertex_count = 0;
-    int self_active_sample_count = 0;
-    int self_suspect_sample_count = 0;
-    int self_suspect_region_count = 0;
-    int self_compaction_used = 0;
-    int self_compaction_samples_per_triangle = 0;
     int self_source_mode = kSelfSourceFull;
-    long long self_full_recovery_fallbacks = 0;
-    Int2* self_vs_pairs = nullptr;
-    int* self_vs_pair_counts = nullptr;
-    int self_vs_pair_capacity = 0;
-    int self_vs_pair_count = 0;
-    int self_vs_pair_overflow = 0;
-    int self_vs_pair_current_overflow = 0;
-    int self_vs_pair_compaction_used = 0;
-    int self_vs_pair_valid = 0;
     int self_sample_hash_table_size = 0;
     int self_sample_count = 0;
     int self_sample_hash_valid = 0;
@@ -345,10 +288,6 @@ enum TimingSlot {
     kTimingSelfSolve,
     kTimingSelfProbe,
     kTimingSelfRecovery,
-    kTimingSelfVsPairBuild,
-    kTimingSelfVsPairProjectSolve,
-    kTimingSelfVsPairProjectProbe,
-    kTimingSelfVsPairProjectRecovery,
     kTimingCount
 };
 
@@ -383,12 +322,6 @@ float* timing_field(SsblXpbdDiagnostics* diag, int slot) {
             return &diag->self_probe_ms;
         case kTimingSelfRecovery:
             return &diag->self_recovery_ms;
-        case kTimingSelfVsPairBuild:
-            return &diag->self_vs_pair_build_ms;
-        case kTimingSelfVsPairProjectSolve:
-        case kTimingSelfVsPairProjectProbe:
-        case kTimingSelfVsPairProjectRecovery:
-            return &diag->self_vs_pair_project_ms;
         default:
             return nullptr;
     }
@@ -399,10 +332,6 @@ float* timing_primary_field(SsblXpbdDiagnostics* diag, int slot) {
         return nullptr;
     }
     switch (slot) {
-        case kTimingSelfVsPairProjectSolve:
-            return &diag->self_solve_ms;
-        case kTimingSelfVsPairProjectRecovery:
-            return &diag->self_recovery_ms;
         case kTimingDynamicParticleCollision:
             return &diag->dynamic_collision_ms;
         default:
@@ -605,141 +534,6 @@ bool build_volume_vertex_triangles(Solver* solver, const SsblXpbdConfig* config,
         solver->volume_vertex_triangle_count,
         "missing volume incident triangles"
     );
-    return ok;
-}
-
-int self_sleep_region_index_for_position(
-    Vec3 p,
-    Vec3 min_pos,
-    Vec3 extent,
-    int dim_x,
-    int dim_y,
-    int dim_z
-) {
-    auto axis_index = [](float value, float min_value, float axis_extent, int dim) {
-        if (dim <= 1 || axis_extent <= kEps) {
-            return 0;
-        }
-        float normalized = (value - min_value) / axis_extent;
-        int cell = static_cast<int>(std::floor(normalized * static_cast<float>(dim)));
-        return std::clamp(cell, 0, dim - 1);
-    };
-    int x = axis_index(p.x, min_pos.x, extent.x, dim_x);
-    int y = axis_index(p.y, min_pos.y, extent.y, dim_y);
-    int z = axis_index(p.z, min_pos.z, extent.z, dim_z);
-    return x + y * dim_x + z * dim_x * dim_y;
-}
-
-bool build_self_sleep_regions(
-    Solver* solver,
-    const SsblXpbdConfig* config,
-    const SsblXpbdMesh* mesh,
-    const std::vector<Vec3>& host_pos
-) {
-    if (!solver || !config || !mesh || !solver->cfg.self_sleep_enabled || config->vertex_count <= 0) {
-        return true;
-    }
-
-    Vec3 min_pos = host_pos[0];
-    Vec3 max_pos = host_pos[0];
-    for (const Vec3& p : host_pos) {
-        min_pos.x = std::min(min_pos.x, p.x);
-        min_pos.y = std::min(min_pos.y, p.y);
-        min_pos.z = std::min(min_pos.z, p.z);
-        max_pos.x = std::max(max_pos.x, p.x);
-        max_pos.y = std::max(max_pos.y, p.y);
-        max_pos.z = std::max(max_pos.z, p.z);
-    }
-    Vec3 extent{
-        std::max(max_pos.x - min_pos.x, 1.0e-6f),
-        std::max(max_pos.y - min_pos.y, 1.0e-6f),
-        std::max(max_pos.z - min_pos.z, 1.0e-6f)
-    };
-    int target_regions = std::clamp(
-        (config->vertex_count + kSelfSleepTargetVerticesPerRegion - 1) / kSelfSleepTargetVerticesPerRegion,
-        1,
-        kSelfSleepMaxRegions
-    );
-    int dim_x = 1;
-    int dim_y = 1;
-    int dim_z = 1;
-    while (dim_x * dim_y * dim_z < target_regions) {
-        float score_x = extent.x / static_cast<float>(dim_x);
-        float score_y = extent.y / static_cast<float>(dim_y);
-        float score_z = extent.z / static_cast<float>(dim_z);
-        if (score_x >= score_y && score_x >= score_z) {
-            ++dim_x;
-        } else if (score_y >= score_z) {
-            ++dim_y;
-        } else {
-            ++dim_z;
-        }
-    }
-    int region_count = std::min(dim_x * dim_y * dim_z, kSelfSleepMaxRegions);
-    solver->self_sleep_dim_x = dim_x;
-    solver->self_sleep_dim_y = dim_y;
-    solver->self_sleep_dim_z = dim_z;
-    std::vector<int> vertex_regions(config->vertex_count, 0);
-    std::vector<int> region_vertex_counts(region_count, 0);
-    for (int i = 0; i < config->vertex_count; ++i) {
-        vertex_regions[i] = std::clamp(
-            self_sleep_region_index_for_position(host_pos[i], min_pos, extent, dim_x, dim_y, dim_z),
-            0,
-            region_count - 1
-        );
-        ++region_vertex_counts[vertex_regions[i]];
-    }
-
-    std::vector<int> triangle_regions(std::max(config->triangle_count, 0), 0);
-    if (config->triangle_count > 0) {
-        if (!mesh->triangles) {
-            return set_error("missing self sleep triangle data");
-        }
-        const Int3* triangles = reinterpret_cast<const Int3*>(mesh->triangles);
-        for (int t = 0; t < config->triangle_count; ++t) {
-            Int3 tri = triangles[t];
-            if (tri.x >= 0 && tri.x < config->vertex_count
-                && tri.y >= 0 && tri.y < config->vertex_count
-                && tri.z >= 0 && tri.z < config->vertex_count) {
-                Vec3 centroid{
-                    (host_pos[tri.x].x + host_pos[tri.y].x + host_pos[tri.z].x) / 3.0f,
-                    (host_pos[tri.x].y + host_pos[tri.y].y + host_pos[tri.z].y) / 3.0f,
-                    (host_pos[tri.x].z + host_pos[tri.y].z + host_pos[tri.z].z) / 3.0f
-                };
-                triangle_regions[t] = std::clamp(
-                    self_sleep_region_index_for_position(centroid, min_pos, extent, dim_x, dim_y, dim_z),
-                    0,
-                    region_count - 1
-                );
-            }
-        }
-    }
-
-    solver->self_sleep_region_count = region_count;
-    bool ok = true;
-    ok = ok && alloc_and_copy(&solver->self_sleep_vertex_regions, vertex_regions.data(), config->vertex_count, "missing self sleep vertex regions");
-    ok = ok && alloc_and_copy(&solver->self_sleep_triangle_regions, triangle_regions.data(), config->triangle_count, "missing self sleep triangle regions");
-    ok = ok && alloc_and_copy(&solver->self_sleep_prev_pos, host_pos.data(), config->vertex_count, "missing self sleep previous positions");
-    ok = ok && alloc_and_copy(&solver->self_sleep_region_vertex_counts, region_vertex_counts.data(), region_count, "missing self sleep region counts");
-    if (ok) {
-        cudaError_t err = cudaMalloc(reinterpret_cast<void**>(&solver->self_sleep_region_still_frames), sizeof(int) * region_count);
-        ok = ok && set_cuda_error(err, "self sleep still-frame allocation");
-        err = cudaMalloc(reinterpret_cast<void**>(&solver->self_sleep_region_sleeping), sizeof(int) * region_count);
-        ok = ok && set_cuda_error(err, "self sleep state allocation");
-        err = cudaMalloc(reinterpret_cast<void**>(&solver->self_sleep_region_motion), sizeof(int) * region_count);
-        ok = ok && set_cuda_error(err, "self sleep motion allocation");
-        err = cudaMalloc(reinterpret_cast<void**>(&solver->self_sleep_region_touched), sizeof(int) * region_count);
-        ok = ok && set_cuda_error(err, "self sleep touch allocation");
-        err = cudaMalloc(reinterpret_cast<void**>(&solver->self_sleep_has_sleeping), sizeof(int));
-        ok = ok && set_cuda_error(err, "self sleep summary allocation");
-    }
-    if (ok) {
-        ok = ok && set_cuda_error(cudaMemset(solver->self_sleep_region_still_frames, 0, sizeof(int) * region_count), "self sleep still-frame reset");
-        ok = ok && set_cuda_error(cudaMemset(solver->self_sleep_region_sleeping, 0, sizeof(int) * region_count), "self sleep state reset");
-        ok = ok && set_cuda_error(cudaMemset(solver->self_sleep_region_motion, 0, sizeof(int) * region_count), "self sleep motion reset");
-        ok = ok && set_cuda_error(cudaMemset(solver->self_sleep_region_touched, 0, sizeof(int) * region_count), "self sleep touch reset");
-        ok = ok && set_cuda_error(cudaMemset(solver->self_sleep_has_sleeping, 0, sizeof(int)), "self sleep summary reset");
-    }
     return ok;
 }
 
@@ -1464,277 +1258,34 @@ __device__ void diag_note_nonfinite(Solver solver) {
     }
 }
 
-__device__ void diag_note_self_source_skipped(Solver solver) {
-    if (solver.diag_counts) {
-        atomicAdd(&solver.diag_counts[kDiagSelfSkippedSources], 1ull);
-    }
-}
-
-__device__ bool self_sleep_available(Solver solver) {
-    return solver.cfg.self_sleep_enabled
-        && !solver.self_sleep_force_active
-        && solver.self_sleep_region_count > 0
-        && solver.self_sleep_region_sleeping
-        && solver.self_sleep_has_sleeping
-        && solver.self_sleep_has_sleeping[0] != 0;
-}
-
-__device__ int self_sleep_region_for_vertex(Solver solver, int index) {
-    if (!solver.self_sleep_vertex_regions || index < 0 || index >= solver.cfg.vertex_count) {
-        return -1;
-    }
-    int region = solver.self_sleep_vertex_regions[index];
-    return (region >= 0 && region < solver.self_sleep_region_count) ? region : -1;
-}
-
-__device__ int self_sleep_region_for_triangle(Solver solver, int triangle_index) {
-    if (!solver.self_sleep_triangle_regions || triangle_index < 0 || triangle_index >= solver.cfg.triangle_count) {
-        return -1;
-    }
-    int region = solver.self_sleep_triangle_regions[triangle_index];
-    return (region >= 0 && region < solver.self_sleep_region_count) ? region : -1;
-}
-
-__device__ bool self_sleep_source_vertex_skipped(Solver solver, int index) {
-    if (!self_sleep_available(solver)) {
-        return false;
-    }
-    int region = self_sleep_region_for_vertex(solver, index);
-    return region >= 0 && solver.self_sleep_region_sleeping[region] != 0;
-}
-
-__device__ bool self_sleep_source_triangle_skipped(Solver solver, int triangle_index) {
-    if (!self_sleep_available(solver)) {
-        return false;
-    }
-    int region = self_sleep_region_for_triangle(solver, triangle_index);
-    return region >= 0 && solver.self_sleep_region_sleeping[region] != 0;
-}
-
-__device__ bool self_region_is_active(Solver solver, int region) {
-    if (region < 0 || region >= solver.self_sleep_region_count) {
-        return false;
-    }
-    return solver.self_sleep_force_active
-        || !solver.self_sleep_region_sleeping
-        || solver.self_sleep_region_sleeping[region] == 0;
-}
-
-__device__ bool self_region_is_suspect(Solver solver, int region) {
-    if (region < 0 || region >= solver.self_sleep_region_count) {
-        return false;
-    }
-    if (self_region_is_active(solver, region)) {
-        return true;
-    }
-    int dim_x = solver.self_sleep_dim_x > 1 ? solver.self_sleep_dim_x : 1;
-    int dim_y = solver.self_sleep_dim_y > 1 ? solver.self_sleep_dim_y : 1;
-    int dim_z = solver.self_sleep_dim_z > 1 ? solver.self_sleep_dim_z : 1;
-    int z = region / (dim_x * dim_y);
-    int rem = region - z * dim_x * dim_y;
-    int y = rem / dim_x;
-    int x = rem - y * dim_x;
-    for (int dz = -1; dz <= 1; ++dz) {
-        int nz = z + dz;
-        if (nz < 0 || nz >= dim_z) {
-            continue;
-        }
-        for (int dy = -1; dy <= 1; ++dy) {
-            int ny = y + dy;
-            if (ny < 0 || ny >= dim_y) {
-                continue;
-            }
-            for (int dx = -1; dx <= 1; ++dx) {
-                int nx = x + dx;
-                if (nx < 0 || nx >= dim_x) {
-                    continue;
-                }
-                int neighbor = nx + ny * dim_x + nz * dim_x * dim_y;
-                if (self_region_is_active(solver, neighbor)) {
-                    return true;
-                }
-            }
-        }
-    }
-    return false;
-}
-
-__device__ float self_compaction_fraction_threshold(Solver solver) {
-    float threshold = solver.cfg.self_compaction_active_fraction_threshold;
-    if (!(threshold > 0.0f)) {
-        threshold = 0.75f;
-    }
-    return fminf(fmaxf(threshold, 0.01f), 1.0f);
-}
-
-__device__ int self_compaction_count(Solver solver, int slot) {
-    if (slot == kSelfCompactionActiveVertices) {
-        return solver.self_active_vertex_count;
-    }
-    if (slot == kSelfCompactionSuspectVertices) {
-        return solver.self_suspect_vertex_count;
-    }
-    if (slot == kSelfCompactionActiveSamples) {
-        return solver.self_active_sample_count;
-    }
-    if (slot == kSelfCompactionSuspectSamples) {
-        return solver.self_suspect_sample_count;
-    }
-    if (slot == kSelfCompactionSuspectRegions) {
-        return solver.self_suspect_region_count;
-    }
-    return 0;
-}
-
-__device__ bool self_compaction_uses_vertex_list(Solver solver) {
-    if (!solver.cfg.self_compaction_enabled || !solver.self_compaction_used) {
-        return false;
-    }
-    int slot = -1;
-    if (solver.self_source_mode == kSelfSourceActive && solver.self_active_vertices) {
-        slot = kSelfCompactionActiveVertices;
-    } else if (solver.self_source_mode == kSelfSourceSuspect && solver.self_suspect_vertices) {
-        slot = kSelfCompactionSuspectVertices;
-    } else {
-        return false;
-    }
-    int full_count = solver.cfg.vertex_count;
-    if (full_count <= 0) {
-        return false;
-    }
-    int compacted_count = self_compaction_count(solver, slot);
-    return compacted_count >= 0
-        && compacted_count < full_count
-        && static_cast<float>(compacted_count) < static_cast<float>(full_count) * self_compaction_fraction_threshold(solver);
-}
-
-__device__ bool self_compaction_uses_sample_list(Solver solver) {
-    if (!solver.cfg.self_compaction_enabled || !solver.self_compaction_used) {
-        return false;
-    }
-    if (solver.self_compaction_samples_per_triangle != solver.self_samples_per_triangle) {
-        return false;
-    }
-    int slot = -1;
-    if (solver.self_source_mode == kSelfSourceActive && solver.self_active_samples) {
-        slot = kSelfCompactionActiveSamples;
-    } else if (solver.self_source_mode == kSelfSourceSuspect && solver.self_suspect_samples) {
-        slot = kSelfCompactionSuspectSamples;
-    } else {
-        return false;
-    }
-    int full_count = solver.self_sample_count;
-    if (full_count <= 0) {
-        return false;
-    }
-    int compacted_count = self_compaction_count(solver, slot);
-    return compacted_count >= 0
-        && compacted_count < full_count
-        && static_cast<float>(compacted_count) < static_cast<float>(full_count) * self_compaction_fraction_threshold(solver);
-}
-
 __device__ int self_vertex_source_count(Solver solver) {
-    if (self_compaction_uses_vertex_list(solver)) {
-        if (solver.self_source_mode == kSelfSourceActive) {
-            return self_compaction_count(solver, kSelfCompactionActiveVertices);
-        }
-        if (solver.self_source_mode == kSelfSourceSuspect) {
-            return self_compaction_count(solver, kSelfCompactionSuspectVertices);
-        }
-    }
     return solver.cfg.vertex_count;
 }
 
 __device__ int self_sample_source_count(Solver solver) {
-    if (self_compaction_uses_sample_list(solver)) {
-        if (solver.self_source_mode == kSelfSourceActive) {
-            return self_compaction_count(solver, kSelfCompactionActiveSamples);
-        }
-        if (solver.self_source_mode == kSelfSourceSuspect) {
-            return self_compaction_count(solver, kSelfCompactionSuspectSamples);
-        }
-    }
     return solver.self_sample_count;
 }
 
 __device__ int self_vertex_source_index(Solver solver, int ordinal) {
-    if (self_compaction_uses_vertex_list(solver) && solver.self_source_mode == kSelfSourceActive && solver.self_active_vertices) {
-        return solver.self_active_vertices[ordinal];
-    }
-    if (self_compaction_uses_vertex_list(solver) && solver.self_source_mode == kSelfSourceSuspect && solver.self_suspect_vertices) {
-        return solver.self_suspect_vertices[ordinal];
-    }
     return ordinal;
 }
 
-__device__ bool self_source_vertex_flag(Solver solver, int vertex) {
-    if (vertex < 0 || vertex >= solver.cfg.vertex_count) {
-        return false;
-    }
-    if (!solver.cfg.self_compaction_enabled || !solver.self_compaction_used) {
-        return true;
-    }
-    if (solver.self_source_mode == kSelfSourceActive && solver.self_active_vertex_flags) {
-        return solver.self_active_vertex_flags[vertex] != 0;
-    }
-    if (solver.self_source_mode == kSelfSourceSuspect && solver.self_suspect_vertex_flags) {
-        return solver.self_suspect_vertex_flags[vertex] != 0;
-    }
-    return true;
-}
-
-__device__ bool self_source_edge_flag(Solver solver, Int2 edge) {
-    return self_source_vertex_flag(solver, edge.x) || self_source_vertex_flag(solver, edge.y);
-}
-
 __device__ int self_sample_source_index(Solver solver, int ordinal) {
-    if (self_compaction_uses_sample_list(solver) && solver.self_source_mode == kSelfSourceActive && solver.self_active_samples) {
-        return solver.self_active_samples[ordinal];
-    }
-    if (self_compaction_uses_sample_list(solver) && solver.self_source_mode == kSelfSourceSuspect && solver.self_suspect_samples) {
-        return solver.self_suspect_samples[ordinal];
-    }
     return ordinal;
 }
 
 __device__ int self_triangle_hash_source_count(Solver solver) {
-    if (self_compaction_uses_sample_list(solver)) {
-        return self_sample_source_count(solver);
-    }
     return solver.cfg.triangle_count;
 }
 
 __device__ int self_triangle_hash_source_index(Solver solver, int ordinal) {
-    if (self_compaction_uses_sample_list(solver)) {
-        int sample = self_sample_source_index(solver, ordinal);
-        if (sample < 0 || sample >= solver.self_sample_count) {
-            return -1;
-        }
-        int samples_per_triangle = solver.self_samples_per_triangle > 0 ? solver.self_samples_per_triangle : 1;
-        int tri_index = sample / samples_per_triangle;
-        if (sample - tri_index * samples_per_triangle != 0) {
-            return -1;
-        }
-        return tri_index;
-    }
     return ordinal;
-}
-
-__device__ void note_self_region_touch(Solver solver, int index) {
-    if (!solver.self_sleep_region_touched) {
-        return;
-    }
-    int region = self_sleep_region_for_vertex(solver, index);
-    if (region >= 0) {
-        atomicExch(&solver.self_sleep_region_touched[region], 1);
-    }
 }
 
 __device__ void note_self_collision_correction(Solver solver, int index, Vec3 delta) {
     if (index < 0 || index >= solver.cfg.vertex_count) {
         return;
     }
-    note_self_region_touch(solver, index);
     if (solver.self_recovery_touched) {
         atomicExch(&solver.self_recovery_touched[index], 1);
     }
@@ -1762,7 +1313,6 @@ __device__ void apply_self_collision_correction_untracked(Solver solver, int ind
     if (!solver.self_recovery_mode) {
         atomic_add(&solver.prev[index], delta);
     }
-    note_self_region_touch(solver, index);
 }
 
 __device__ void apply_self_collision_correction_without_frontier(Solver solver, int index, Vec3 delta) {
@@ -1773,7 +1323,6 @@ __device__ void apply_self_collision_correction_without_frontier(Solver solver, 
     if (!solver.self_recovery_mode) {
         atomic_add(&solver.prev[index], delta);
     }
-    note_self_region_touch(solver, index);
     if (solver.self_recovery_delta) {
         atomic_add(&solver.self_recovery_delta[index], delta);
     }
@@ -1798,33 +1347,6 @@ __device__ bool same_or_one_ring_neighbor(Solver solver, int a, int b) {
 
 __device__ bool self_fast_mode(Solver solver) {
     return solver.cfg.self_collision_mode == kSelfCollisionModeFast;
-}
-
-__device__ bool self_contact_frontier_vertex(Solver solver, int vertex) {
-    if (!self_fast_mode(solver) || !solver.self_recovery_touched || vertex < 0 || vertex >= solver.cfg.vertex_count) {
-        return false;
-    }
-    if (solver.self_recovery_touched[vertex] != 0) {
-        return true;
-    }
-    if (!solver.vertex_neighbor_offsets || !solver.vertex_neighbors) {
-        return false;
-    }
-    int start = solver.vertex_neighbor_offsets[vertex];
-    int end = solver.vertex_neighbor_offsets[vertex + 1];
-    for (int idx = start; idx < end; ++idx) {
-        int neighbor = solver.vertex_neighbors[idx];
-        if (neighbor >= 0 && neighbor < solver.cfg.vertex_count && solver.self_recovery_touched[neighbor] != 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
-__device__ bool self_contact_frontier_triangle(Solver solver, Int3 tri) {
-    return self_contact_frontier_vertex(solver, tri.x)
-        || self_contact_frontier_vertex(solver, tri.y)
-        || self_contact_frontier_vertex(solver, tri.z);
 }
 
 __device__ void self_surface_sample_weights(int kind, float* wa, float* wb, float* wc) {
@@ -1941,49 +1463,6 @@ __device__ int self_sample_kind(Solver solver, int sample, int tri_index) {
     return sample - tri_index * samples_per_triangle;
 }
 
-__global__ void build_self_compaction_regions_kernel(Solver solver) {
-    int region = blockIdx.x * blockDim.x + threadIdx.x;
-    if (region >= solver.self_sleep_region_count || !solver.self_compaction_counts) {
-        return;
-    }
-    if (self_region_is_active(solver, region)) {
-        atomicAdd(&solver.self_compaction_counts[kSelfCompactionActiveRegions], 1);
-    }
-    if (self_region_is_suspect(solver, region)) {
-        atomicAdd(&solver.self_compaction_counts[kSelfCompactionSuspectRegions], 1);
-    }
-}
-
-__global__ void build_self_compaction_vertices_kernel(Solver solver) {
-    int vertex = blockIdx.x * blockDim.x + threadIdx.x;
-    if (vertex >= solver.cfg.vertex_count || !solver.self_compaction_counts) {
-        return;
-    }
-    int region = self_sleep_region_for_vertex(solver, vertex);
-    bool use_frontier = self_fast_mode(solver) && solver.self_recovery_touched;
-    bool frontier = use_frontier && self_contact_frontier_vertex(solver, vertex);
-    bool active = use_frontier ? frontier : (region < 0 || self_region_is_active(solver, region));
-    bool suspect = use_frontier ? frontier : (region < 0 || self_region_is_suspect(solver, region));
-    if (active && solver.self_active_vertices) {
-        int slot = atomicAdd(&solver.self_compaction_counts[kSelfCompactionActiveVertices], 1);
-        if (slot < solver.cfg.vertex_count) {
-            solver.self_active_vertices[slot] = vertex;
-        }
-        if (solver.self_active_vertex_flags) {
-            solver.self_active_vertex_flags[vertex] = 1;
-        }
-    }
-    if (suspect && solver.self_suspect_vertices) {
-        int slot = atomicAdd(&solver.self_compaction_counts[kSelfCompactionSuspectVertices], 1);
-        if (slot < solver.cfg.vertex_count) {
-            solver.self_suspect_vertices[slot] = vertex;
-        }
-        if (solver.self_suspect_vertex_flags) {
-            solver.self_suspect_vertex_flags[vertex] = 1;
-        }
-    }
-}
-
 __device__ void atomic_max_float(float* address, float value) {
     if (!address || !isfinite(value) || value < 0.0f) {
         return;
@@ -1995,32 +1474,6 @@ __device__ void atomic_max_float(float* address, float value) {
         old_bits = atomicCAS(address_as_int, assumed, __float_as_int(value));
         if (old_bits == assumed) {
             break;
-        }
-    }
-}
-
-__global__ void build_self_compaction_samples_kernel(Solver solver) {
-    int sample = blockIdx.x * blockDim.x + threadIdx.x;
-    if (sample >= solver.self_sample_count || !solver.self_compaction_counts) {
-        return;
-    }
-    int tri_index = self_sample_triangle_index(solver, sample);
-    int region = self_sleep_region_for_triangle(solver, tri_index);
-    Int3 tri = solver.triangles[tri_index];
-    bool use_frontier = self_fast_mode(solver) && solver.self_recovery_touched;
-    bool frontier = use_frontier && self_contact_frontier_triangle(solver, tri);
-    bool active = use_frontier ? frontier : (region < 0 || self_region_is_active(solver, region));
-    bool suspect = use_frontier ? frontier : (region < 0 || self_region_is_suspect(solver, region));
-    if (active && solver.self_active_samples) {
-        int slot = atomicAdd(&solver.self_compaction_counts[kSelfCompactionActiveSamples], 1);
-        if (slot < solver.self_sample_count) {
-            solver.self_active_samples[slot] = sample;
-        }
-    }
-    if (suspect && solver.self_suspect_samples) {
-        int slot = atomicAdd(&solver.self_compaction_counts[kSelfCompactionSuspectSamples], 1);
-        if (slot < solver.self_sample_count) {
-            solver.self_suspect_samples[slot] = sample;
         }
     }
 }
@@ -3635,13 +3088,6 @@ __global__ void self_edge_edge_collision_kernel(Solver solver) {
         || edge_a.y < 0 || edge_a.y >= solver.cfg.vertex_count) {
         return;
     }
-    const bool compacted_fast_source = self_fast_mode(solver)
-        && solver.self_compaction_used
-        && (solver.self_source_mode == kSelfSourceActive || solver.self_source_mode == kSelfSourceSuspect);
-    const bool edge_a_in_source = self_source_edge_flag(solver, edge_a);
-    if (compacted_fast_source && !edge_a_in_source) {
-        return;
-    }
     float wx0 = solver.inv_mass[edge_a.x];
     float wx1 = solver.inv_mass[edge_a.y];
     if (wx0 <= 0.0f && wx1 <= 0.0f) {
@@ -3677,9 +3123,7 @@ __global__ void self_edge_edge_collision_kernel(Solver solver) {
                     ++scanned;
                     if (other != e) {
                         Int2 edge_b = solver.edges[other];
-                        const bool edge_b_in_source = self_source_edge_flag(solver, edge_b);
-                        const bool should_process_pair = other > e || (compacted_fast_source && edge_a_in_source && !edge_b_in_source);
-                        if (!should_process_pair) {
+                        if (other <= e) {
                             other = solver.self_edge_next[other];
                             continue;
                         }
@@ -3788,10 +3232,6 @@ __global__ void self_particle_collision_kernel(Solver solver) {
     }
     int i = self_vertex_source_index(solver, ordinal);
     if (i < 0 || i >= solver.cfg.vertex_count || solver.inv_mass[i] <= 0.0f) {
-        return;
-    }
-    if (!self_compaction_uses_vertex_list(solver) && self_sleep_source_vertex_skipped(solver, i)) {
-        diag_note_self_source_skipped(solver);
         return;
     }
     Vec3 p = solver.pos[i];
@@ -3980,12 +3420,6 @@ __global__ void self_edge_surface_collision_kernel(Solver solver) {
         || edge.y < 0 || edge.y >= solver.cfg.vertex_count) {
         return;
     }
-    if (self_fast_mode(solver)
-        && solver.self_compaction_used
-        && (solver.self_source_mode == kSelfSourceActive || solver.self_source_mode == kSelfSourceSuspect)
-        && !self_source_edge_flag(solver, edge)) {
-        return;
-    }
     float wx0 = solver.inv_mass[edge.x];
     float wx1 = solver.inv_mass[edge.y];
     if (wx0 <= 0.0f && wx1 <= 0.0f) {
@@ -4137,271 +3571,6 @@ int dynamic_collision_pass_count(const Solver* solver) {
     return 1;
 }
 
-__device__ int self_vs_pair_device_count(Solver solver) {
-    if (!solver.self_vs_pair_counts) {
-        return 0;
-    }
-    int count = solver.self_vs_pair_counts[kSelfVsPairCount];
-    if (count < 0) {
-        return 0;
-    }
-    return count < solver.self_vs_pair_capacity ? count : solver.self_vs_pair_capacity;
-}
-
-__device__ void append_self_vs_pair(Solver solver, int vertex, int sample) {
-    if (!solver.self_vs_pairs || !solver.self_vs_pair_counts || solver.self_vs_pair_capacity <= 0) {
-        return;
-    }
-    int slot = atomicAdd(&solver.self_vs_pair_counts[kSelfVsPairCount], 1);
-    if (slot < solver.self_vs_pair_capacity) {
-        solver.self_vs_pairs[slot] = {vertex, sample};
-    } else {
-        atomicExch(&solver.self_vs_pair_counts[kSelfVsPairOverflow], 1);
-    }
-}
-
-__global__ void build_self_vertex_surface_pairs_kernel(Solver solver, int store_all_coarse) {
-    int ordinal = blockIdx.x * blockDim.x + threadIdx.x;
-    if (ordinal >= self_vertex_source_count(solver)) {
-        return;
-    }
-    int i = self_vertex_source_index(solver, ordinal);
-    if (i < 0 || i >= solver.cfg.vertex_count || solver.inv_mass[i] <= 0.0f) {
-        return;
-    }
-    Vec3 p = solver.pos[i];
-    if (!finite_vec(p)) {
-        return;
-    }
-    float thickness = self_contact_distance(solver);
-    float cell_size = self_cell_size(solver);
-    int max_neighbors = solver.cfg.max_self_collision_neighbors > 1 ? solver.cfg.max_self_collision_neighbors : 1;
-    if (solver.self_recovery_mode) {
-        max_neighbors = min(max_neighbors * 2, 256);
-    }
-    int candidates = 0;
-    int scanned = 0;
-    int scan_limit = max_neighbors * (self_fast_mode(solver) ? 8 : 32);
-    int base_x = cell_coord(p.x, cell_size);
-    int base_y = cell_coord(p.y, cell_size);
-    int base_z = cell_coord(p.z, cell_size);
-
-    for (int dz = -1; dz <= 1; ++dz) {
-        for (int dy = -1; dy <= 1; ++dy) {
-            for (int dx = -1; dx <= 1; ++dx) {
-                int hash = hash_cell(base_x + dx, base_y + dy, base_z + dz, solver.self_sample_hash_table_size);
-                int sample = solver.self_sample_heads[hash];
-                while (sample >= 0 && candidates < max_neighbors && scanned < scan_limit) {
-                    ++scanned;
-                    int tri_index = self_sample_triangle_index(solver, sample);
-                    int kind = self_sample_kind(solver, sample, tri_index);
-                    Int3 tri = solver.triangles[tri_index];
-                    float wa;
-                    float wb;
-                    float wc;
-                    self_surface_sample_weights(kind, &wa, &wb, &wc);
-                    if (!rest_surface_neighbor(solver, i, tri, wa, wb, wc)) {
-                        Vec3 a = solver.pos[tri.x];
-                        Vec3 b = solver.pos[tri.y];
-                        Vec3 c = solver.pos[tri.z];
-                        Vec3 sample_pos = weighted_triangle_point(a, b, c, wa, wb, wc);
-                        Vec3 delta = sub(p, sample_pos);
-                        float d2 = dot(delta, delta);
-                        float d_linear = sqrtf(fmaxf(d2, 0.0f));
-                        if (!self_coarse_distance_ok(d_linear, thickness)) {
-                            sample = solver.self_sample_next[sample];
-                            continue;
-                        }
-                        bool append_pair = store_all_coarse != 0;
-                        if (!append_pair) {
-                            float gap = d_linear - thickness;
-                            Vec3 surface_normal = stable_triangle_normal(
-                                a,
-                                b,
-                                c,
-                                solver.rest[tri.x],
-                                solver.rest[tri.y],
-                                solver.rest[tri.z]
-                            );
-                            Vec3 prev_sample = weighted_triangle_point(
-                                solver.prev[tri.x],
-                                solver.prev[tri.y],
-                                solver.prev[tri.z],
-                                wa,
-                                wb,
-                                wc
-                            );
-                            Vec3 previous_delta = sub(solver.prev[i], prev_sample);
-                            float d = 0.0f;
-                            Vec3 normal = self_collision_normal(delta, surface_normal, previous_delta, thickness, &d);
-                            append_pair = self_should_project_contact(gap, delta, previous_delta, normal);
-                        }
-                        if (append_pair) {
-                            append_self_vs_pair(solver, i, sample);
-                            ++candidates;
-                        }
-                    }
-                    sample = solver.self_sample_next[sample];
-                }
-            }
-        }
-    }
-}
-
-__global__ void self_vertex_surface_pair_project_kernel(Solver solver) {
-    int pair_index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (pair_index >= self_vs_pair_device_count(solver)) {
-        return;
-    }
-    Int2 pair = solver.self_vs_pairs[pair_index];
-    int i = pair.x;
-    int sample = pair.y;
-    if (i < 0 || i >= solver.cfg.vertex_count || sample < 0 || sample >= solver.self_sample_count) {
-        return;
-    }
-    if (solver.inv_mass[i] <= 0.0f) {
-        return;
-    }
-    int tri_index = self_sample_triangle_index(solver, sample);
-    int kind = self_sample_kind(solver, sample, tri_index);
-    Int3 tri = solver.triangles[tri_index];
-    float wa;
-    float wb;
-    float wc;
-    self_surface_sample_weights(kind, &wa, &wb, &wc);
-    if (rest_surface_neighbor(solver, i, tri, wa, wb, wc)) {
-        return;
-    }
-    Vec3 p = solver.pos[i];
-    Vec3 a = solver.pos[tri.x];
-    Vec3 b = solver.pos[tri.y];
-    Vec3 c = solver.pos[tri.z];
-    Vec3 sample_pos = weighted_triangle_point(a, b, c, wa, wb, wc);
-    Vec3 delta = sub(p, sample_pos);
-    float d2 = dot(delta, delta);
-    float d_linear = sqrtf(fmaxf(d2, 0.0f));
-    float thickness = self_contact_distance(solver);
-    if (!self_coarse_distance_ok(d_linear, thickness)) {
-        return;
-    }
-    float gap = d_linear - thickness;
-    diag_note_gap(solver, gap);
-    Vec3 surface_normal = stable_triangle_normal(
-        a,
-        b,
-        c,
-        solver.rest[tri.x],
-        solver.rest[tri.y],
-        solver.rest[tri.z]
-    );
-    Vec3 prev_sample = weighted_triangle_point(
-        solver.prev[tri.x],
-        solver.prev[tri.y],
-        solver.prev[tri.z],
-        wa,
-        wb,
-        wc
-    );
-    Vec3 previous_delta = sub(solver.prev[i], prev_sample);
-    float d = 0.0f;
-    Vec3 normal = self_collision_normal(delta, surface_normal, previous_delta, thickness, &d);
-    if (!self_should_project_contact(gap, delta, previous_delta, normal)) {
-        return;
-    }
-    diag_note_effective_candidate(solver);
-    if (gap < 0.0f && dot(previous_delta, surface_normal) * dot(delta, surface_normal) < 0.0f) {
-        diag_note_ccd(solver);
-    }
-    if (gap < 0.0f) {
-        float wi = solver.inv_mass[i];
-        float wx = solver.inv_mass[tri.x];
-        float wy = solver.inv_mass[tri.y];
-        float wz = solver.inv_mass[tri.z];
-        float sample_weight = weighted_inv_mass(solver, tri, wa, wb, wc);
-        float total = wi + sample_weight;
-        if (total > 0.0f) {
-            Vec3 correction = mul(normal, self_projection_relaxation(solver) * (thickness - d) / total);
-            if (solver.self_sample_hash_dirty) {
-                atomicExch(solver.self_sample_hash_dirty, 1);
-            }
-            Vec3 correction_i = mul(correction, wi);
-            Vec3 correction_x = mul(correction, -wx * wa);
-            Vec3 correction_y = mul(correction, -wy * wb);
-            Vec3 correction_z = mul(correction, -wz * wc);
-            apply_self_collision_correction(solver, i, correction_i);
-            apply_self_collision_correction(solver, tri.x, correction_x);
-            apply_self_collision_correction(solver, tri.y, correction_y);
-            apply_self_collision_correction(solver, tri.z, correction_z);
-            diag_note_resolved(solver);
-        }
-    }
-}
-
-__global__ void probe_self_vertex_surface_pairs_kernel(Solver solver) {
-    int pair_index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (pair_index >= self_vs_pair_device_count(solver)) {
-        return;
-    }
-    Int2 pair = solver.self_vs_pairs[pair_index];
-    int i = pair.x;
-    int sample = pair.y;
-    if (i < 0 || i >= solver.cfg.vertex_count || sample < 0 || sample >= solver.self_sample_count) {
-        return;
-    }
-    if (solver.inv_mass[i] <= 0.0f) {
-        return;
-    }
-    int tri_index = self_sample_triangle_index(solver, sample);
-    int kind = self_sample_kind(solver, sample, tri_index);
-    Int3 tri = solver.triangles[tri_index];
-    float wa;
-    float wb;
-    float wc;
-    self_surface_sample_weights(kind, &wa, &wb, &wc);
-    if (rest_surface_neighbor(solver, i, tri, wa, wb, wc)) {
-        return;
-    }
-    Vec3 p = solver.pos[i];
-    Vec3 a = solver.pos[tri.x];
-    Vec3 b = solver.pos[tri.y];
-    Vec3 c = solver.pos[tri.z];
-    Vec3 sample_pos = weighted_triangle_point(a, b, c, wa, wb, wc);
-    Vec3 delta = sub(p, sample_pos);
-    float d_linear = sqrtf(fmaxf(dot(delta, delta), 0.0f));
-    float thickness = self_contact_distance(solver);
-    if (!self_coarse_distance_ok(d_linear, thickness)) {
-        return;
-    }
-    float gap = d_linear - thickness;
-    diag_note_gap(solver, gap);
-    Vec3 surface_normal = stable_triangle_normal(
-        a,
-        b,
-        c,
-        solver.rest[tri.x],
-        solver.rest[tri.y],
-        solver.rest[tri.z]
-    );
-    Vec3 prev_sample = weighted_triangle_point(
-        solver.prev[tri.x],
-        solver.prev[tri.y],
-        solver.prev[tri.z],
-        wa,
-        wb,
-        wc
-    );
-    Vec3 previous_delta = sub(solver.prev[i], prev_sample);
-    float contact_distance = 0.0f;
-    Vec3 normal = self_collision_normal(delta, surface_normal, previous_delta, thickness, &contact_distance);
-    if (!self_should_project_contact(gap, delta, previous_delta, normal)) {
-        return;
-    }
-    diag_note_effective_candidate(solver);
-    if (gap < 0.0f && dot(previous_delta, surface_normal) * dot(delta, surface_normal) < 0.0f) {
-        diag_note_ccd(solver);
-    }
-}
-
 __global__ void self_vertex_triangle_collision_kernel(Solver solver, int project_contacts) {
     int ordinal = blockIdx.x * blockDim.x + threadIdx.x;
     if (ordinal >= self_vertex_source_count(solver)
@@ -4412,10 +3581,6 @@ __global__ void self_vertex_triangle_collision_kernel(Solver solver, int project
     }
     int i = self_vertex_source_index(solver, ordinal);
     if (i < 0 || i >= solver.cfg.vertex_count || solver.inv_mass[i] <= 0.0f) {
-        return;
-    }
-    if (!self_compaction_uses_vertex_list(solver) && self_sleep_source_vertex_skipped(solver, i)) {
-        diag_note_self_source_skipped(solver);
         return;
     }
     Vec3 p = solver.pos[i];
@@ -4564,10 +3729,6 @@ __global__ void self_vertex_surface_collision_kernel(Solver solver) {
     if (i < 0 || i >= solver.cfg.vertex_count || solver.inv_mass[i] <= 0.0f) {
         return;
     }
-    if (!self_compaction_uses_vertex_list(solver) && self_sleep_source_vertex_skipped(solver, i)) {
-        diag_note_self_source_skipped(solver);
-        return;
-    }
     Vec3 p = solver.pos[i];
     if (!finite_vec(p)) {
         return;
@@ -4712,10 +3873,6 @@ __global__ void self_surface_sample_collision_kernel(Solver solver) {
         return;
     }
     int tri_index_a = self_sample_triangle_index(solver, sample_a);
-    if (!self_compaction_uses_sample_list(solver) && self_sleep_source_triangle_skipped(solver, tri_index_a)) {
-        diag_note_self_source_skipped(solver);
-        return;
-    }
     int kind_a = self_sample_kind(solver, sample_a, tri_index_a);
     Int3 tri_a = solver.triangles[tri_index_a];
     float aa;
@@ -4874,10 +4031,6 @@ __global__ void probe_self_particle_collision_kernel(Solver solver) {
     if (i < 0 || i >= solver.cfg.vertex_count || solver.inv_mass[i] <= 0.0f) {
         return;
     }
-    if (!self_compaction_uses_vertex_list(solver) && self_sleep_source_vertex_skipped(solver, i)) {
-        diag_note_self_source_skipped(solver);
-        return;
-    }
     Vec3 p = solver.pos[i];
     if (!finite_vec(p)) {
         diag_note_nonfinite(solver);
@@ -4940,10 +4093,6 @@ __global__ void probe_self_vertex_surface_collision_kernel(Solver solver) {
     }
     int i = self_vertex_source_index(solver, ordinal);
     if (i < 0 || i >= solver.cfg.vertex_count || solver.inv_mass[i] <= 0.0f) {
-        return;
-    }
-    if (!self_compaction_uses_vertex_list(solver) && self_sleep_source_vertex_skipped(solver, i)) {
-        diag_note_self_source_skipped(solver);
         return;
     }
     Vec3 p = solver.pos[i];
@@ -5330,93 +4479,6 @@ __global__ void clamp_self_recovery_displacement_kernel(Solver solver, float max
     }
 }
 
-__global__ void clear_self_sleep_frame_flags_kernel(Solver solver) {
-    int region = blockIdx.x * blockDim.x + threadIdx.x;
-    if (region >= solver.self_sleep_region_count) {
-        return;
-    }
-    if (solver.self_sleep_region_motion) {
-        solver.self_sleep_region_motion[region] = 0;
-    }
-    if (solver.self_sleep_region_touched) {
-        solver.self_sleep_region_touched[region] = 0;
-    }
-}
-
-__global__ void wake_self_sleep_regions_kernel(Solver solver) {
-    int region = blockIdx.x * blockDim.x + threadIdx.x;
-    if (region >= solver.self_sleep_region_count) {
-        return;
-    }
-    if (solver.self_sleep_region_still_frames) {
-        solver.self_sleep_region_still_frames[region] = 0;
-    }
-    if (solver.self_sleep_region_sleeping) {
-        solver.self_sleep_region_sleeping[region] = 0;
-    }
-    if (region == 0 && solver.self_sleep_has_sleeping) {
-        solver.self_sleep_has_sleeping[0] = 0;
-    }
-}
-
-__global__ void clear_self_sleep_summary_kernel(Solver solver) {
-    if (solver.self_sleep_has_sleeping) {
-        solver.self_sleep_has_sleeping[0] = 0;
-    }
-}
-
-__global__ void update_self_sleep_motion_kernel(Solver solver, float motion_threshold) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= solver.cfg.vertex_count || !solver.self_sleep_prev_pos || !solver.self_sleep_region_motion) {
-        return;
-    }
-    int region = self_sleep_region_for_vertex(solver, i);
-    if (region < 0) {
-        return;
-    }
-    Vec3 current = solver.pos[i];
-    Vec3 previous = solver.self_sleep_prev_pos[i];
-    solver.self_sleep_prev_pos[i] = current;
-    if (!finite_vec(current) || norm(sub(current, previous)) > motion_threshold) {
-        atomicExch(&solver.self_sleep_region_motion[region], 1);
-    }
-}
-
-__global__ void finalize_self_sleep_regions_kernel(Solver solver) {
-    int region = blockIdx.x * blockDim.x + threadIdx.x;
-    if (region >= solver.self_sleep_region_count
-        || !solver.self_sleep_region_still_frames
-        || !solver.self_sleep_region_sleeping) {
-        return;
-    }
-    if (solver.self_sleep_region_vertex_counts && solver.self_sleep_region_vertex_counts[region] <= 0) {
-        return;
-    }
-    bool moved = solver.self_sleep_region_motion && solver.self_sleep_region_motion[region] != 0;
-    bool touched = solver.self_sleep_region_touched && solver.self_sleep_region_touched[region] != 0;
-    if (moved || touched) {
-        solver.self_sleep_region_still_frames[region] = 0;
-        solver.self_sleep_region_sleeping[region] = 0;
-    } else {
-        int still_frames = solver.self_sleep_region_still_frames[region] + 1;
-        solver.self_sleep_region_still_frames[region] = still_frames;
-        int required_frames = solver.cfg.self_sleep_still_frames > 1 ? solver.cfg.self_sleep_still_frames : 1;
-        if (still_frames >= required_frames) {
-            solver.self_sleep_region_sleeping[region] = 1;
-        }
-    }
-    if (solver.diag_counts) {
-        if (solver.self_sleep_region_sleeping[region] != 0) {
-            atomicAdd(&solver.diag_counts[kDiagSelfSleepingRegions], 1ull);
-            if (solver.self_sleep_has_sleeping) {
-                atomicExch(solver.self_sleep_has_sleeping, 1);
-            }
-        } else {
-            atomicAdd(&solver.diag_counts[kDiagSelfActiveRegions], 1ull);
-        }
-    }
-}
-
 int block_count(int count) {
     return (count + 255) / 256;
 }
@@ -5646,9 +4708,6 @@ bool fetch_diagnostics_buffers(
     host_diag->resolved_contacts = static_cast<long long>(counts[kDiagResolvedContacts]);
     host_diag->ccd_clamp_count = static_cast<long long>(counts[kDiagCcdClampCount]);
     host_diag->finite_flag = counts[kDiagFiniteFlag] != 0ull ? 1 : 0;
-    host_diag->self_skipped_sources = static_cast<long long>(counts[kDiagSelfSkippedSources]);
-    host_diag->self_active_regions = static_cast<long long>(counts[kDiagSelfActiveRegions]);
-    host_diag->self_sleeping_regions = static_cast<long long>(counts[kDiagSelfSleepingRegions]);
     host_diag->external_contact_cache_hits = static_cast<long long>(counts[kDiagExternalContactCacheHits]);
     host_diag->external_contact_cache_misses = static_cast<long long>(counts[kDiagExternalContactCacheMisses]);
     host_diag->external_contact_cache_overflow = static_cast<long long>(counts[kDiagExternalContactCacheOverflow]);
@@ -5759,285 +4818,24 @@ bool fetch_probe_diagnostics(Solver* solver) {
     );
 }
 
-void reset_self_compaction_state(Solver* solver) {
+void reset_self_collision_state(Solver* solver) {
     if (!solver) {
         return;
     }
-    solver->self_active_vertex_count = 0;
-    solver->self_suspect_vertex_count = 0;
-    solver->self_active_sample_count = 0;
-    solver->self_suspect_sample_count = 0;
-    solver->self_suspect_region_count = 0;
-    solver->self_compaction_used = 0;
-    solver->self_compaction_samples_per_triangle = 0;
     solver->self_source_mode = kSelfSourceFull;
-    solver->self_full_recovery_fallbacks = 0;
-    solver->self_vs_pair_count = 0;
-    solver->self_vs_pair_overflow = 0;
-    solver->self_vs_pair_current_overflow = 0;
-    solver->self_vs_pair_compaction_used = 0;
-    solver->self_vs_pair_valid = 0;
     solver->self_sample_hash_valid = 0;
-    if (solver->self_compaction_counts) {
-        cudaMemset(solver->self_compaction_counts, 0, sizeof(int) * kSelfCompactionCountSlots);
-    }
-    if (solver->self_vs_pair_counts) {
-        cudaMemset(solver->self_vs_pair_counts, 0, sizeof(int) * kSelfVsPairCountSlots);
-    }
-}
-
-bool self_compaction_ready(const Solver* solver) {
-    if (!solver) {
-        return false;
-    }
-    if (!solver->cfg.self_compaction_enabled
-        || !solver->cfg.self_collision
-        || solver->self_sleep_force_active
-        || !solver->self_compaction_counts
-        || !solver->self_active_vertices
-        || !solver->self_suspect_vertices
-        || !solver->self_active_vertex_flags
-        || !solver->self_suspect_vertex_flags) {
-        return false;
-    }
-    const bool sleep_ready = solver->cfg.self_sleep_enabled
-        && solver->self_sleep_region_count > 0
-        && solver->self_sleep_frame_count >= std::max(solver->cfg.self_sleep_still_frames, 1);
-    const bool fast_frontier_ready = solver->cfg.self_collision_mode == kSelfCollisionModeFast
-        && solver->self_recovery_touched != nullptr;
-    return sleep_ready || fast_frontier_ready;
-}
-
-bool prepare_self_compaction_lists(Solver* solver, int v_blocks) {
-    if (!solver || !self_compaction_ready(solver)) {
-        return true;
-    }
-    if (!set_cuda_error(
-            cudaMemset(solver->self_compaction_counts, 0, sizeof(int) * kSelfCompactionCountSlots),
-            "reset self compaction counts")) {
-        return false;
-    }
-    if (!set_cuda_error(
-            cudaMemset(solver->self_active_vertex_flags, 0, sizeof(int) * solver->cfg.vertex_count),
-            "reset self active vertex flags")) {
-        return false;
-    }
-    if (!set_cuda_error(
-            cudaMemset(solver->self_suspect_vertex_flags, 0, sizeof(int) * solver->cfg.vertex_count),
-            "reset self suspect vertex flags")) {
-        return false;
-    }
-    Solver compact_solver = *solver;
-    compact_solver.self_source_mode = kSelfSourceFull;
-    compact_solver.self_samples_per_triangle = solver->self_samples_per_triangle;
-    compact_solver.self_sample_count = solver->self_sample_count;
-    compact_solver.self_compaction_samples_per_triangle = compact_solver.self_samples_per_triangle;
-    if (compact_solver.self_sleep_region_count > 0) {
-        build_self_compaction_regions_kernel<<<block_count(compact_solver.self_sleep_region_count), 256>>>(compact_solver);
-    }
-    build_self_compaction_vertices_kernel<<<v_blocks, 256>>>(compact_solver);
-    if (!set_cuda_error(cudaGetLastError(), "launch self compaction")) {
-        return false;
-    }
-    int counts[kSelfCompactionCountSlots] = {};
-    if (!set_cuda_error(
-            cudaMemcpy(counts, solver->self_compaction_counts, sizeof(counts), cudaMemcpyDeviceToHost),
-            "download self compaction counts")) {
-        return false;
-    }
-    if (counts[kSelfCompactionActiveVertices] > 0
-        && compact_solver.self_sample_count > 0
-        && compact_solver.self_active_samples
-        && compact_solver.self_suspect_samples) {
-        build_self_compaction_samples_kernel<<<block_count(compact_solver.self_sample_count), 256>>>(compact_solver);
-        if (!set_cuda_error(cudaGetLastError(), "launch self sample compaction")) {
-            return false;
-        }
-        if (!set_cuda_error(
-                cudaMemcpy(counts, solver->self_compaction_counts, sizeof(counts), cudaMemcpyDeviceToHost),
-                "download self sample compaction counts")) {
-            return false;
-        }
-    }
-    solver->self_active_vertex_count = counts[kSelfCompactionActiveVertices];
-    solver->self_suspect_vertex_count = counts[kSelfCompactionSuspectVertices];
-    solver->self_active_sample_count = counts[kSelfCompactionActiveSamples];
-    solver->self_suspect_sample_count = counts[kSelfCompactionSuspectSamples];
-    solver->self_suspect_region_count = counts[kSelfCompactionSuspectRegions];
-    solver->self_compaction_samples_per_triangle = compact_solver.self_samples_per_triangle;
-    float threshold = solver->cfg.self_compaction_active_fraction_threshold;
-    if (!std::isfinite(threshold) || threshold <= 0.0f) {
-        threshold = 0.75f;
-    }
-    threshold = std::clamp(threshold, 0.01f, 1.0f);
-    bool active_list_used = solver->cfg.vertex_count > 0
-        && solver->self_active_vertex_count > 0
-        && solver->self_active_vertex_count < solver->cfg.vertex_count
-        && static_cast<float>(solver->self_active_vertex_count) < static_cast<float>(solver->cfg.vertex_count) * threshold;
-    solver->self_compaction_used = active_list_used ? 1 : 0;
-    return true;
-}
-
-bool fetch_self_compaction_diagnostics(Solver* solver) {
-    if (!solver) {
-        return set_error("invalid solver");
-    }
-    int counts[kSelfCompactionCountSlots] = {};
-    if (solver->self_compaction_counts) {
-        if (!set_cuda_error(
-                cudaMemcpy(counts, solver->self_compaction_counts, sizeof(counts), cudaMemcpyDeviceToHost),
-                "download self compaction counts")) {
-            return false;
-        }
-    }
-    solver->self_active_vertex_count = counts[kSelfCompactionActiveVertices];
-    solver->self_suspect_vertex_count = counts[kSelfCompactionSuspectVertices];
-    solver->self_active_sample_count = counts[kSelfCompactionActiveSamples];
-    solver->self_suspect_sample_count = counts[kSelfCompactionSuspectSamples];
-    solver->self_suspect_region_count = counts[kSelfCompactionSuspectRegions];
-    solver->diag.self_active_vertices = static_cast<long long>(solver->self_active_vertex_count);
-    solver->diag.self_active_samples = static_cast<long long>(solver->self_active_sample_count);
-    solver->diag.self_suspect_regions = static_cast<long long>(solver->self_suspect_region_count);
-    solver->diag.self_full_recovery_fallbacks = solver->self_full_recovery_fallbacks;
-    solver->diag.self_vs_pair_count = static_cast<long long>(solver->self_vs_pair_count);
-    solver->diag.self_vs_pair_capacity = static_cast<long long>(solver->self_vs_pair_capacity);
-    solver->diag.self_vs_pair_overflow = static_cast<long long>(solver->self_vs_pair_overflow);
-    solver->diag.self_vs_pair_compaction_used = static_cast<long long>(solver->self_vs_pair_compaction_used);
-    float threshold = solver->cfg.self_compaction_active_fraction_threshold;
-    if (!std::isfinite(threshold) || threshold <= 0.0f) {
-        threshold = 0.75f;
-    }
-    threshold = std::clamp(threshold, 0.01f, 1.0f);
-    bool active_list_used = solver->self_compaction_used
-        && solver->cfg.vertex_count > 0
-        && solver->self_active_vertex_count > 0
-        && solver->self_active_vertex_count < solver->cfg.vertex_count
-        && static_cast<float>(solver->self_active_vertex_count) < static_cast<float>(solver->cfg.vertex_count) * threshold;
-    bool suspect_list_used = solver->self_compaction_used
-        && solver->cfg.vertex_count > 0
-        && solver->self_suspect_vertex_count > 0
-        && solver->self_suspect_vertex_count < solver->cfg.vertex_count
-        && static_cast<float>(solver->self_suspect_vertex_count) < static_cast<float>(solver->cfg.vertex_count) * threshold;
-    solver->diag.self_compaction_used = (active_list_used || suspect_list_used) ? 1ll : 0ll;
-    return true;
-}
-
-float host_self_compaction_threshold(const Solver* solver) {
-    if (!solver) {
-        return 0.75f;
-    }
-    float threshold = solver->cfg.self_compaction_active_fraction_threshold;
-    if (!std::isfinite(threshold) || threshold <= 0.0f) {
-        threshold = 0.75f;
-    }
-    return std::clamp(threshold, 0.01f, 1.0f);
-}
-
-bool host_self_uses_vertex_list(const Solver* solver, int source_mode) {
-    if (!solver || !solver->cfg.self_compaction_enabled || !solver->self_compaction_used || solver->cfg.vertex_count <= 0) {
-        return false;
-    }
-    int count = 0;
-    if (source_mode == kSelfSourceActive && solver->self_active_vertices) {
-        count = solver->self_active_vertex_count;
-    } else if (source_mode == kSelfSourceSuspect && solver->self_suspect_vertices) {
-        count = solver->self_suspect_vertex_count;
-    } else {
-        return false;
-    }
-    return count > 0
-        && count < solver->cfg.vertex_count
-        && static_cast<float>(count) < static_cast<float>(solver->cfg.vertex_count) * host_self_compaction_threshold(solver);
-}
-
-bool host_self_uses_sample_list(const Solver* solver, int source_mode, int samples_per_triangle, int sample_count) {
-    if (!solver
-        || !solver->cfg.self_compaction_enabled
-        || !solver->self_compaction_used
-        || sample_count <= 0
-        || solver->self_compaction_samples_per_triangle != samples_per_triangle) {
-        return false;
-    }
-    int count = 0;
-    if (source_mode == kSelfSourceActive && solver->self_active_samples) {
-        count = solver->self_active_sample_count;
-    } else if (source_mode == kSelfSourceSuspect && solver->self_suspect_samples) {
-        count = solver->self_suspect_sample_count;
-    } else {
-        return false;
-    }
-    return count > 0
-        && count < sample_count
-        && static_cast<float>(count) < static_cast<float>(sample_count) * host_self_compaction_threshold(solver);
 }
 
 int host_self_vertex_source_count(const Solver* solver, int source_mode) {
-    if (host_self_uses_vertex_list(solver, source_mode)) {
-        return source_mode == kSelfSourceActive ? solver->self_active_vertex_count : solver->self_suspect_vertex_count;
-    }
+    (void)source_mode;
     return solver ? solver->cfg.vertex_count : 0;
 }
 
 int host_self_sample_source_count(const Solver* solver, int source_mode, int samples_per_triangle, int sample_count) {
-    if (host_self_uses_sample_list(solver, source_mode, samples_per_triangle, sample_count)) {
-        return source_mode == kSelfSourceActive ? solver->self_active_sample_count : solver->self_suspect_sample_count;
-    }
+    (void)solver;
+    (void)source_mode;
+    (void)samples_per_triangle;
     return sample_count;
-}
-
-bool host_self_pair_compaction_ready(const Solver* solver, int source_mode) {
-    if (!solver
-        || !solver->cfg.self_pair_compaction_enabled
-        || !solver->cfg.self_collision
-        || !solver->self_vs_pairs
-        || !solver->self_vs_pair_counts
-        || solver->self_vs_pair_capacity <= 0
-        || !solver->self_sample_heads
-        || !solver->self_sample_next
-        || solver->self_sample_count <= 0) {
-        return false;
-    }
-    if (!host_self_uses_vertex_list(solver, source_mode)) {
-        return false;
-    }
-    int source_count = host_self_vertex_source_count(solver, source_mode);
-    if (source_count <= 0 || solver->cfg.vertex_count <= 0) {
-        return false;
-    }
-    float threshold = std::min(host_self_compaction_threshold(solver), 0.40f);
-    return static_cast<float>(source_count) < static_cast<float>(solver->cfg.vertex_count) * threshold;
-}
-
-bool fetch_self_vs_pair_counts(Solver* solver, const char* label) {
-    if (!solver || !solver->self_vs_pair_counts) {
-        return set_error("self vertex-surface pair counters are not allocated");
-    }
-    int counts[kSelfVsPairCountSlots] = {};
-    if (!set_cuda_error(
-            cudaMemcpy(counts, solver->self_vs_pair_counts, sizeof(counts), cudaMemcpyDeviceToHost),
-            label)) {
-        return false;
-    }
-    int raw_count = std::max(counts[kSelfVsPairCount], 0);
-    bool current_overflow = counts[kSelfVsPairOverflow] != 0 || raw_count > solver->self_vs_pair_capacity;
-    solver->self_vs_pair_count = std::min(raw_count, solver->self_vs_pair_capacity);
-    solver->self_vs_pair_current_overflow = current_overflow ? 1 : 0;
-    solver->self_vs_pair_overflow = solver->self_vs_pair_overflow || current_overflow;
-    solver->self_vs_pair_valid = (raw_count > 0 && !current_overflow) ? 1 : 0;
-    return true;
-}
-
-bool reset_self_vs_pair_counts(Solver* solver) {
-    if (!solver || !solver->self_vs_pair_counts) {
-        return set_error("self vertex-surface pair counters are not allocated");
-    }
-    solver->self_vs_pair_count = 0;
-    solver->self_vs_pair_current_overflow = 0;
-    solver->self_vs_pair_valid = 0;
-    return set_cuda_error(
-        cudaMemset(solver->self_vs_pair_counts, 0, sizeof(int) * kSelfVsPairCountSlots),
-        "reset self vertex-surface pair counters"
-    );
 }
 
 bool build_self_triangle_hash(
@@ -6066,87 +4864,6 @@ bool build_self_triangle_hash(
     if (!end_timed_segment(timings, &segment, label)) {
         return false;
     }
-    return set_cuda_error(cudaGetLastError(), label);
-}
-
-bool build_self_vs_pairs(
-    Solver* solver,
-    const Solver& pair_solver,
-    int vertex_source_blocks,
-    int store_all_coarse,
-    std::vector<TimedSegment>* timings,
-    const char* label
-) {
-    if (!solver) {
-        return set_error("invalid self vertex-surface pair build");
-    }
-    if (!reset_self_vs_pair_counts(solver)) {
-        return false;
-    }
-    TimedSegment segment;
-    if (!begin_timed_segment(timings, kTimingSelfVsPairBuild, &segment, label)) {
-        return false;
-    }
-    build_self_vertex_surface_pairs_kernel<<<vertex_source_blocks, 256>>>(pair_solver, store_all_coarse);
-    if (!end_timed_segment(timings, &segment, label)) {
-        return false;
-    }
-    if (!set_cuda_error(cudaGetLastError(), label)) {
-        return false;
-    }
-    return fetch_self_vs_pair_counts(solver, "download self vertex-surface pair counts");
-}
-
-int current_self_vs_pair_count(const Solver* solver) {
-    if (!solver || solver->self_vs_pair_capacity <= 0) {
-        return 0;
-    }
-    return std::max(0, std::min(solver->self_vs_pair_count, solver->self_vs_pair_capacity));
-}
-
-bool project_self_vs_pairs(
-    Solver* solver,
-    Solver pair_solver,
-    int timing_slot,
-    std::vector<TimedSegment>* timings,
-    const char* label
-) {
-    int pair_count = current_self_vs_pair_count(solver);
-    if (pair_count <= 0) {
-        return true;
-    }
-    TimedSegment segment;
-    if (!begin_timed_segment(timings, timing_slot, &segment, label)) {
-        return false;
-    }
-    self_vertex_surface_pair_project_kernel<<<block_count(pair_count), 256>>>(pair_solver);
-    if (!end_timed_segment(timings, &segment, label)) {
-        return false;
-    }
-    solver->self_vs_pair_compaction_used = 1;
-    solver->self_vs_pair_valid = 0;
-    return set_cuda_error(cudaGetLastError(), label);
-}
-
-bool probe_self_vs_pairs(
-    Solver* solver,
-    Solver pair_solver,
-    std::vector<TimedSegment>* timings,
-    const char* label
-) {
-    int pair_count = current_self_vs_pair_count(solver);
-    if (pair_count <= 0) {
-        return false;
-    }
-    TimedSegment segment;
-    if (!begin_timed_segment(timings, kTimingSelfVsPairProjectProbe, &segment, label)) {
-        return false;
-    }
-    probe_self_vertex_surface_pairs_kernel<<<block_count(pair_count), 256>>>(pair_solver);
-    if (!end_timed_segment(timings, &segment, label)) {
-        return false;
-    }
-    solver->self_vs_pair_compaction_used = 1;
     return set_cuda_error(cudaGetLastError(), label);
 }
 
@@ -6362,47 +5079,12 @@ bool run_self_collision_pass(
         if (!end_timed_segment(timings, &hash_segment, "end self sample hash timing")) {
             return false;
         }
-        bool used_pair_path = false;
-        bool use_vs_pair_path = collision_solver.cfg.self_collision_mode != kSelfCollisionModeFast
-            && solver->self_compaction_used
-            && host_self_pair_compaction_ready(solver, collision_solver.self_source_mode);
-        if (use_vs_pair_path) {
-            Solver pair_solver = collision_solver;
-            pair_solver.diag_counts = collision_solver.diag_counts;
-            pair_solver.diag_min_gap = collision_solver.diag_min_gap;
-            int store_all_coarse = recovery_mode ? 1 : 0;
-            if (!build_self_vs_pairs(
-                    solver,
-                    pair_solver,
-                    vertex_source_blocks,
-                    store_all_coarse,
-                    timings,
-                    "build self vertex-surface pairs")) {
-                return false;
-            }
-            if (!solver->self_vs_pair_current_overflow && current_self_vs_pair_count(solver) > 0) {
-                int project_slot = recovery_mode ? kTimingSelfVsPairProjectRecovery : kTimingSelfVsPairProjectSolve;
-                if (!project_self_vs_pairs(
-                        solver,
-                        pair_solver,
-                        project_slot,
-                        timings,
-                        "project self vertex-surface pairs")) {
-                    return false;
-                }
-                used_pair_path = true;
-            } else if (!solver->self_vs_pair_current_overflow && current_self_vs_pair_count(solver) == 0 && !recovery_mode) {
-                used_pair_path = true;
-            }
+        if (!begin_timed_segment(timings, solve_slot, &solve_segment, "start self vertex-surface timing")) {
+            return false;
         }
-        if (!used_pair_path) {
-            if (!begin_timed_segment(timings, solve_slot, &solve_segment, "start self vertex-surface timing")) {
-                return false;
-            }
-            self_vertex_surface_collision_kernel<<<vertex_source_blocks, 256>>>(collision_solver);
-            if (!end_timed_segment(timings, &solve_segment, "end self vertex-surface timing")) {
-                return false;
-            }
+        self_vertex_surface_collision_kernel<<<vertex_source_blocks, 256>>>(collision_solver);
+        if (!end_timed_segment(timings, &solve_segment, "end self vertex-surface timing")) {
+            return false;
         }
         if (run_surface_sample_pairs) {
             if (!begin_timed_segment(timings, kTimingSelfHash, &hash_segment, "start self surface-pair hash timing")) {
@@ -6530,30 +5212,7 @@ bool probe_self_collision(
             build_self_surface_sample_hash_kernel<<<block_count(probe_solver.self_sample_count), 256>>>(probe_solver);
             solver->self_sample_hash_valid = 1;
         }
-        bool used_pair_probe = false;
-        bool use_vs_pair_probe = probe_solver.cfg.self_collision_mode != kSelfCollisionModeFast
-            && solver->self_compaction_used
-            && host_self_pair_compaction_ready(solver, probe_solver.self_source_mode);
-        if (use_vs_pair_probe) {
-            if (!build_self_vs_pairs(
-                    solver,
-                    probe_solver,
-                    vertex_source_blocks,
-                    1,
-                    timings,
-                    "build probe vertex-surface pairs")) {
-                return false;
-            }
-            if (!solver->self_vs_pair_current_overflow && current_self_vs_pair_count(solver) > 0) {
-                if (!probe_self_vs_pairs(solver, probe_solver, timings, "probe vertex-surface pairs")) {
-                    return false;
-                }
-                used_pair_probe = true;
-            }
-        }
-        if (!used_pair_probe) {
-            probe_self_vertex_surface_collision_kernel<<<vertex_source_blocks, 256>>>(probe_solver);
-        }
+        probe_self_vertex_surface_collision_kernel<<<vertex_source_blocks, 256>>>(probe_solver);
     }
     if (!end_timed_segment(timings, &probe_segment, "end self probe timing")) {
         return false;
@@ -6785,15 +5444,10 @@ bool run_substep(
         }
         if (run_self_collision && it == iterations - 1) {
             ++solver->self_collision_run_count;
-            const bool use_source_compaction = solver->self_compaction_used != 0;
-            const int solve_source_mode = use_source_compaction ? kSelfSourceActive : kSelfSourceFull;
-            const int probe_source_mode = (fast_self_collision && fast_cleanup_substep)
-                ? kSelfSourceFull
-                : (use_source_compaction ? kSelfSourceSuspect : kSelfSourceFull);
             int surface_pair_interval = std::max(solver->cfg.self_surface_pair_interval, 1);
             bool run_surface_pairs = (solver->self_collision_run_count % surface_pair_interval) == 0;
             const int self_collision_passes = fast_self_collision ? kFastSelfCollisionPasses : kSelfCollisionPasses;
-            solver->self_source_mode = solve_source_mode;
+            solver->self_source_mode = kSelfSourceFull;
             for (int self_pass = 0; self_pass < self_collision_passes; ++self_pass) {
                 const bool last_self_pass = self_pass == self_collision_passes - 1;
                 bool run_fast_triangle_slot = fast_self_collision
@@ -6822,7 +5476,7 @@ bool run_substep(
             }
 
             SsblXpbdDiagnostics probe_diag{};
-            solver->self_source_mode = probe_source_mode;
+            solver->self_source_mode = kSelfSourceFull;
             if (!probe_self_collision(solver, v_blocks, &probe_diag, timings)) {
                 solver->self_source_mode = kSelfSourceFull;
                 return false;
@@ -6835,7 +5489,7 @@ bool run_substep(
                 if (!clear_self_recovery_tracking(solver, "clear self recovery tracking")) {
                     return false;
                 }
-                solver->self_source_mode = probe_source_mode;
+                solver->self_source_mode = kSelfSourceFull;
                 if (!run_self_collision_pass(solver, v_blocks, true, true, false, timings)) {
                     solver->self_source_mode = kSelfSourceFull;
                     return false;
@@ -6854,38 +5508,12 @@ bool run_substep(
                 if (recovery_passes_total) {
                     ++(*recovery_passes_total);
                 }
-                solver->self_source_mode = probe_source_mode;
+                solver->self_source_mode = kSelfSourceFull;
                 if (fast_self_collision) {
                     break;
                 }
                 if (!probe_self_collision(solver, v_blocks, &probe_diag, timings)) {
                     solver->self_source_mode = kSelfSourceFull;
-                    return false;
-                }
-            }
-            if (!fast_self_collision && use_source_compaction && self_probe_triggers_retry(probe_diag, cloth_thickness)) {
-                if (!clear_self_recovery_tracking(solver, "clear full self recovery tracking")) {
-                    return false;
-                }
-                solver->self_source_mode = kSelfSourceFull;
-                if (!run_self_collision_pass(solver, v_blocks, true, true, false, timings)) {
-                    return false;
-                }
-                if (!clamp_self_recovery_displacement(
-                        solver,
-                        v_blocks,
-                        cloth_thickness,
-                        kSelfRecoveryMaxDisplacementScale,
-                        false,
-                        timings)) {
-                    return false;
-                }
-                ++extra_recovery_passes;
-                ++solver->self_full_recovery_fallbacks;
-                if (recovery_passes_total) {
-                    ++(*recovery_passes_total);
-                }
-                if (!probe_self_collision(solver, v_blocks, &probe_diag, timings)) {
                     return false;
                 }
             }
@@ -7031,24 +5659,6 @@ void free_solver(Solver* solver) {
     cudaFree(solver->self_tri_entry_count);
     cudaFree(solver->self_recovery_touched);
     cudaFree(solver->self_recovery_delta);
-    cudaFree(solver->self_sleep_vertex_regions);
-    cudaFree(solver->self_sleep_triangle_regions);
-    cudaFree(solver->self_sleep_prev_pos);
-    cudaFree(solver->self_sleep_region_still_frames);
-    cudaFree(solver->self_sleep_region_sleeping);
-    cudaFree(solver->self_sleep_region_motion);
-    cudaFree(solver->self_sleep_region_touched);
-    cudaFree(solver->self_sleep_region_vertex_counts);
-    cudaFree(solver->self_sleep_has_sleeping);
-    cudaFree(solver->self_active_vertices);
-    cudaFree(solver->self_suspect_vertices);
-    cudaFree(solver->self_active_vertex_flags);
-    cudaFree(solver->self_suspect_vertex_flags);
-    cudaFree(solver->self_active_samples);
-    cudaFree(solver->self_suspect_samples);
-    cudaFree(solver->self_compaction_counts);
-    cudaFree(solver->self_vs_pairs);
-    cudaFree(solver->self_vs_pair_counts);
     cudaFree(solver->jitter_frame_start_pos);
     cudaFree(solver->jitter_prev_delta);
     cudaFree(solver->jitter_score);
@@ -7128,18 +5738,6 @@ bool update_positions_internal(Solver* solver, const float* positions, int max_f
         return false;
     }
     if (!set_cuda_error(cudaMemset(solver->vel, 0, sizeof(Vec3) * solver->cfg.vertex_count), "velocity reset")) {
-        return false;
-    }
-    if (solver->self_sleep_prev_pos
-        && !set_cuda_error(cudaMemcpy(solver->self_sleep_prev_pos, positions, bytes, cudaMemcpyHostToDevice), "self sleep previous-position upload")) {
-        return false;
-    }
-    if (solver->self_sleep_region_sleeping
-        && !set_cuda_error(cudaMemset(solver->self_sleep_region_sleeping, 0, sizeof(int) * solver->self_sleep_region_count), "self sleep state reset")) {
-        return false;
-    }
-    if (solver->self_sleep_has_sleeping
-        && !set_cuda_error(cudaMemset(solver->self_sleep_has_sleeping, 0, sizeof(int)), "self sleep summary reset")) {
         return false;
     }
     if (solver->jitter_frame_start_pos
@@ -7344,26 +5942,6 @@ extern "C" SSBL_API void* ssbl_create_solver(const SsblXpbdConfig* config, const
     solver->cfg.self_collision_mode = solver->cfg.self_collision
         ? std::min(std::max(solver->cfg.self_collision_mode, 0), kSelfCollisionModeStrict)
         : 0;
-    solver->cfg.self_sleep_enabled = (solver->cfg.self_collision && solver->cfg.self_collision_mode > 0 && solver->cfg.self_sleep_enabled)
-        ? 1
-        : 0;
-    solver->cfg.self_sleep_still_frames = std::clamp(solver->cfg.self_sleep_still_frames, 1, 60);
-    solver->cfg.self_sleep_full_scan_interval = std::clamp(solver->cfg.self_sleep_full_scan_interval, 1, 240);
-    solver->cfg.self_compaction_enabled = (solver->cfg.self_sleep_enabled && solver->cfg.self_compaction_enabled) ? 1 : 0;
-    if (!std::isfinite(solver->cfg.self_sleep_motion_scale) || solver->cfg.self_sleep_motion_scale <= 0.0f) {
-        solver->cfg.self_sleep_motion_scale = 1.0f;
-    }
-    solver->cfg.self_sleep_motion_scale = std::clamp(solver->cfg.self_sleep_motion_scale, 0.05f, 4.0f);
-    if (!std::isfinite(solver->cfg.self_compaction_active_fraction_threshold)
-        || solver->cfg.self_compaction_active_fraction_threshold <= 0.0f) {
-        solver->cfg.self_compaction_active_fraction_threshold = 0.75f;
-    }
-    solver->cfg.self_compaction_active_fraction_threshold = std::clamp(
-        solver->cfg.self_compaction_active_fraction_threshold,
-        0.01f,
-        1.0f
-    );
-    solver->cfg.self_pair_compaction_enabled = (solver->cfg.self_collision && solver->cfg.self_pair_compaction_enabled) ? 1 : 0;
     solver->cfg.jitter_stabilizer_enabled = (
         solver->cfg.self_collision
         && solver->cfg.self_collision_mode > 0
@@ -7565,33 +6143,6 @@ extern "C" SSBL_API void* ssbl_create_solver(const SsblXpbdConfig* config, const
             cudaMemset(solver->self_recovery_delta, 0, sizeof(Vec3) * config->vertex_count),
             "self recovery delta reset"
         );
-        ok = ok && build_self_sleep_regions(solver, config, mesh, host_pos);
-        if (ok && solver->cfg.self_compaction_enabled) {
-            err = cudaMalloc(reinterpret_cast<void**>(&solver->self_active_vertices), sizeof(int) * config->vertex_count);
-            ok = ok && set_cuda_error(err, "self active vertex allocation");
-            err = cudaMalloc(reinterpret_cast<void**>(&solver->self_suspect_vertices), sizeof(int) * config->vertex_count);
-            ok = ok && set_cuda_error(err, "self suspect vertex allocation");
-            err = cudaMalloc(reinterpret_cast<void**>(&solver->self_active_vertex_flags), sizeof(int) * config->vertex_count);
-            ok = ok && set_cuda_error(err, "self active vertex flag allocation");
-            err = cudaMalloc(reinterpret_cast<void**>(&solver->self_suspect_vertex_flags), sizeof(int) * config->vertex_count);
-            ok = ok && set_cuda_error(err, "self suspect vertex flag allocation");
-            err = cudaMalloc(reinterpret_cast<void**>(&solver->self_compaction_counts), sizeof(int) * kSelfCompactionCountSlots);
-            ok = ok && set_cuda_error(err, "self compaction count allocation");
-            if (ok) {
-                ok = ok && set_cuda_error(
-                    cudaMemset(solver->self_compaction_counts, 0, sizeof(int) * kSelfCompactionCountSlots),
-                    "self compaction count reset"
-                );
-                ok = ok && set_cuda_error(
-                    cudaMemset(solver->self_active_vertex_flags, 0, sizeof(int) * config->vertex_count),
-                    "self active vertex flag reset"
-                );
-                ok = ok && set_cuda_error(
-                    cudaMemset(solver->self_suspect_vertex_flags, 0, sizeof(int) * config->vertex_count),
-                    "self suspect vertex flag reset"
-                );
-            }
-        }
         if (ok && config->triangle_count > 0) {
             solver->self_sample_count = config->triangle_count * solver->self_samples_per_triangle;
             solver->self_sample_hash_table_size = next_power_of_two(std::max(1024, solver->self_sample_count * 2));
@@ -7621,34 +6172,6 @@ extern "C" SSBL_API void* ssbl_create_solver(const SsblXpbdConfig* config, const
                     "self triangle hash reset"
                 );
                 ok = ok && set_cuda_error(cudaMemset(solver->self_tri_entry_count, 0, sizeof(int)), "self triangle hash count reset");
-            }
-            if (ok && solver->cfg.self_compaction_enabled) {
-                err = cudaMalloc(reinterpret_cast<void**>(&solver->self_active_samples), sizeof(int) * solver->self_sample_count);
-                ok = ok && set_cuda_error(err, "self active sample allocation");
-                err = cudaMalloc(reinterpret_cast<void**>(&solver->self_suspect_samples), sizeof(int) * solver->self_sample_count);
-                ok = ok && set_cuda_error(err, "self suspect sample allocation");
-            }
-            if (ok && solver->cfg.self_pair_compaction_enabled) {
-                long long requested_capacity = std::max(
-                    static_cast<long long>(config->vertex_count) * 32ll,
-                    static_cast<long long>(solver->self_sample_count) * 2ll
-                );
-                requested_capacity = std::clamp(
-                    requested_capacity,
-                    static_cast<long long>(kSelfVsPairCapacityMin),
-                    static_cast<long long>(kSelfVsPairCapacityMax)
-                );
-                solver->self_vs_pair_capacity = static_cast<int>(requested_capacity);
-                err = cudaMalloc(reinterpret_cast<void**>(&solver->self_vs_pairs), sizeof(Int2) * solver->self_vs_pair_capacity);
-                ok = ok && set_cuda_error(err, "self vertex-surface pair allocation");
-                err = cudaMalloc(reinterpret_cast<void**>(&solver->self_vs_pair_counts), sizeof(int) * kSelfVsPairCountSlots);
-                ok = ok && set_cuda_error(err, "self vertex-surface pair counter allocation");
-                if (ok) {
-                    ok = ok && set_cuda_error(
-                        cudaMemset(solver->self_vs_pair_counts, 0, sizeof(int) * kSelfVsPairCountSlots),
-                        "self vertex-surface pair counter reset"
-                    );
-                }
             }
         }
     }
@@ -7691,37 +6214,6 @@ extern "C" SSBL_API int ssbl_reset_solver(void* handle) {
             "reset self recovery delta")) {
         return 0;
     }
-    if (solver->self_sleep_prev_pos
-        && !set_cuda_error(
-            cudaMemcpy(solver->self_sleep_prev_pos, solver->rest, sizeof(Vec3) * n, cudaMemcpyDeviceToDevice),
-            "reset self sleep previous positions")) {
-        return 0;
-    }
-    if (solver->self_sleep_region_count > 0) {
-        int r = solver->self_sleep_region_count;
-        if (solver->self_sleep_region_still_frames
-            && !set_cuda_error(cudaMemset(solver->self_sleep_region_still_frames, 0, sizeof(int) * r), "reset self sleep still frames")) {
-            return 0;
-        }
-        if (solver->self_sleep_region_sleeping
-            && !set_cuda_error(cudaMemset(solver->self_sleep_region_sleeping, 0, sizeof(int) * r), "reset self sleep states")) {
-            return 0;
-        }
-        if (solver->self_sleep_region_motion
-            && !set_cuda_error(cudaMemset(solver->self_sleep_region_motion, 0, sizeof(int) * r), "reset self sleep motion flags")) {
-            return 0;
-        }
-        if (solver->self_sleep_region_touched
-            && !set_cuda_error(cudaMemset(solver->self_sleep_region_touched, 0, sizeof(int) * r), "reset self sleep touch flags")) {
-            return 0;
-        }
-        if (solver->self_sleep_has_sleeping
-            && !set_cuda_error(cudaMemset(solver->self_sleep_has_sleeping, 0, sizeof(int)), "reset self sleep summary")) {
-            return 0;
-        }
-        solver->self_sleep_frame_count = 0;
-        solver->self_sleep_force_active = 0;
-    }
     if (solver->jitter_frame_start_pos
         && !set_cuda_error(
             cudaMemcpy(solver->jitter_frame_start_pos, solver->rest, sizeof(Vec3) * n, cudaMemcpyDeviceToDevice),
@@ -7742,7 +6234,7 @@ extern "C" SSBL_API int ssbl_reset_solver(void* handle) {
     if (!clear_external_contact_cache(solver, "reset external contact cache")) {
         return 0;
     }
-    reset_self_compaction_state(solver);
+    reset_self_collision_state(solver);
     return 1;
 }
 
@@ -7832,7 +6324,7 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
     if (!reset_jitter_diagnostics(solver)) {
         return 0;
     }
-    reset_self_compaction_state(solver);
+    reset_self_collision_state(solver);
     if (solver->external_contacts && solver->external_contact_capacity > 0) {
         begin_external_contact_cache_step_kernel<<<block_count(solver->external_contact_capacity), 256>>>(*solver);
         if (!set_cuda_error(cudaGetLastError(), "begin external contact cache step")) {
@@ -7856,9 +6348,6 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
     const bool needs_sync = force_sync != 0 || fetch_diagnostics != 0;
     std::vector<TimedSegment> timings;
     std::vector<TimedSegment>* timing_ptr = needs_sync ? &timings : nullptr;
-    const bool use_self_sleep = solver->cfg.self_sleep_enabled
-        && solver->cfg.self_collision
-        && solver->self_sleep_region_count > 0;
     if (solver->cfg.jitter_stabilizer_enabled && solver->jitter_frame_start_pos) {
         if (!set_cuda_error(
                 cudaMemcpy(
@@ -7872,26 +6361,6 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
             return 0;
         }
     }
-    solver->self_sleep_force_active = 0;
-    if (use_self_sleep) {
-        clear_self_sleep_frame_flags_kernel<<<block_count(solver->self_sleep_region_count), 256>>>(*solver);
-        int full_scan_interval = std::max(solver->cfg.self_sleep_full_scan_interval, 1);
-        bool force_full_scan = solver->self_sleep_frame_count > 0
-            && (solver->self_sleep_frame_count % full_scan_interval) == 0;
-        if (force_full_scan) {
-            solver->self_sleep_force_active = 1;
-            wake_self_sleep_regions_kernel<<<block_count(solver->self_sleep_region_count), 256>>>(*solver);
-        }
-        if (!set_cuda_error(cudaGetLastError(), "launch self sleep frame prep")) {
-            destroy_timing_records(timing_ptr);
-            return 0;
-        }
-    }
-    if (!prepare_self_compaction_lists(solver, v_blocks)) {
-        destroy_timing_records(timing_ptr);
-        return 0;
-    }
-
     for (int s = 0; s < substeps; ++s) {
         int interval = std::max(solver->cfg.self_collision_interval, 1);
         bool run_self_collision = solver->cfg.self_collision
@@ -7919,18 +6388,6 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
                 fast_triangle_cleanup_substep,
                 run_jitter_filter,
                 timing_ptr)) {
-            destroy_timing_records(timing_ptr);
-            return 0;
-        }
-    }
-    if (use_self_sleep) {
-        solver->self_sleep_force_active = 0;
-        float motion_threshold = std::max(1.0e-4f, solver->cfg.cloth_thickness * solver->cfg.self_sleep_motion_scale);
-        update_self_sleep_motion_kernel<<<v_blocks, 256>>>(*solver, motion_threshold);
-        clear_self_sleep_summary_kernel<<<1, 1>>>(*solver);
-        finalize_self_sleep_regions_kernel<<<block_count(solver->self_sleep_region_count), 256>>>(*solver);
-        ++solver->self_sleep_frame_count;
-        if (!set_cuda_error(cudaGetLastError(), "launch self sleep frame update")) {
             destroy_timing_records(timing_ptr);
             return 0;
         }
@@ -7963,9 +6420,6 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
     if (fetch_diagnostics != 0) {
         const auto diagnostics_start = std::chrono::high_resolution_clock::now();
         if (!fetch_step_diagnostics(solver)) {
-            return 0;
-        }
-        if (!fetch_self_compaction_diagnostics(solver)) {
             return 0;
         }
         solver->diag.diagnostics_fetch_ms = elapsed_ms_since(diagnostics_start);
