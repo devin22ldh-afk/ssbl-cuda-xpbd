@@ -1736,6 +1736,7 @@ def _step_session_slots(session: SceneSession, download_positions, perf: FramePe
             slot.native.update_frame_inputs(
                 pin_indices=None,
                 pin_positions=None,
+                pin_weights=None,
                 update_pin=False,
                 options=None,
                 update_runtime=False,
@@ -2527,6 +2528,7 @@ def _refresh_bake_runtime_inputs(
     native.update_frame_inputs(
         pin_indices=cloth.pin_indices,
         pin_positions=pin_targets,
+        pin_weights=cloth.pin_weights,
         update_pin=True,
         options=settings_to_options(settings, runtime_mode_override="bake"),
         update_runtime=True,
@@ -2565,6 +2567,7 @@ def _apply_runtime_inputs(
         slot.native.update_frame_inputs(
             pin_indices=slot.cloth.pin_indices,
             pin_positions=pin_targets,
+            pin_weights=slot.cloth.pin_weights,
             update_pin=update_pin,
             options=options,
             update_runtime=update_runtime,

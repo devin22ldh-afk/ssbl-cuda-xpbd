@@ -60,6 +60,7 @@ constexpr float kAbi41SpringRelaxation = 0.18f;
 constexpr float kAbi41BendRelaxation = 0.10f;
 constexpr float kAbi41TackRelaxation = 0.35f;
 constexpr float kAbi41SelfAveragingClampScale = 0.35f;
+constexpr float kPinHardWeightThreshold = 0.75f;
 constexpr int kAbi41PcgMaxIterations = 1;
 constexpr int kAbi41PcgReductionDAD = 0;
 constexpr int kAbi41PcgReductionRZ = 1;
@@ -256,6 +257,7 @@ struct Abi41Solver {
     int unsupported_force_field_count = 0;
     int* pin_indices = nullptr;
     Vec3* pin_targets = nullptr;
+    float* pin_weights = nullptr;
     int pin_count = 0;
     int pin_capacity = 0;
     unsigned int* pcg_row_offsets = nullptr;
@@ -1847,7 +1849,20 @@ __global__ void abi41_pcg_advance_iteration_kernel(Abi41Solver solver) {
     }
 }
 
-__global__ void abi41_pin_project_kernel(Abi41Solver solver) {
+__device__ float abi41_pin_soft_relaxation(float weight, float pass_exponent) {
+    if (!isfinite(weight) || weight <= 0.0f) {
+        return 0.0f;
+    }
+    const float total_strength = clamp01(weight / kPinHardWeightThreshold);
+    if (total_strength >= 1.0f) {
+        return 1.0f;
+    }
+    const float remaining = fmaxf(1.0f - total_strength, 0.0f);
+    const float relaxation = 1.0f - powf(remaining, fmaxf(pass_exponent, 1.0e-4f));
+    return isfinite(relaxation) ? clamp01(relaxation) : total_strength;
+}
+
+__global__ void abi41_pin_project_kernel(Abi41Solver solver, float pass_exponent, float dt) {
     int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= solver.pin_count) {
         return;
@@ -1856,9 +1871,27 @@ __global__ void abi41_pin_project_kernel(Abi41Solver solver) {
     if (i < 0 || i >= solver.cfg.vertex_count) {
         return;
     }
-    solver.pos[i] = solver.pin_targets[p];
-    solver.prev[i] = solver.pin_targets[p];
-    solver.vel[i] = make_vec3(0.0f, 0.0f, 0.0f);
+    float weight = solver.pin_weights ? solver.pin_weights[p] : 1.0f;
+    if (!isfinite(weight) || weight <= 0.0f) {
+        return;
+    }
+    Vec3 target = solver.pin_targets[p];
+    if (weight >= kPinHardWeightThreshold || solver.inv_mass[i] <= 0.0f) {
+        solver.pos[i] = target;
+        solver.prev[i] = target;
+        solver.vel[i] = make_vec3(0.0f, 0.0f, 0.0f);
+        return;
+    }
+    float relaxation = abi41_pin_soft_relaxation(weight, pass_exponent);
+    if (relaxation <= 0.0f) {
+        return;
+    }
+    Vec3 correction = mul(sub(target, solver.pos[i]), relaxation);
+    Vec3 corrected = add(solver.pos[i], correction);
+    Vec3 damped_velocity = mul(solver.vel[i], fmaxf(1.0f - relaxation, 0.0f));
+    solver.pos[i] = corrected;
+    solver.prev[i] = sub(corrected, mul(damped_velocity, fmaxf(dt, kEps)));
+    solver.vel[i] = damped_velocity;
 }
 
 __global__ void abi41_analytic_collision_kernel(Abi41Solver solver) {
@@ -3802,7 +3835,7 @@ bool build_self_edge_hash(Abi41Solver* solver) {
     return set_cuda_error(cudaGetLastError(), "build self edge hash");
 }
 
-bool upload_pins(Abi41Solver* solver, const int* indices, const float* positions, int count) {
+bool upload_pins(Abi41Solver* solver, const int* indices, const float* positions, const float* weights, int count) {
     if (!solver) {
         return set_error("invalid solver handle");
     }
@@ -3816,11 +3849,19 @@ bool upload_pins(Abi41Solver* solver, const int* indices, const float* positions
     if (!indices || !positions) {
         return set_error("pin arrays are required when pin count is nonzero");
     }
+    std::vector<float> default_weights;
+    const float* upload_weights = weights;
+    if (!upload_weights) {
+        default_weights.assign(count, 1.0f);
+        upload_weights = default_weights.data();
+    }
     if (count > solver->pin_capacity) {
         cudaFree(solver->pin_indices);
         cudaFree(solver->pin_targets);
+        cudaFree(solver->pin_weights);
         solver->pin_indices = nullptr;
         solver->pin_targets = nullptr;
+        solver->pin_weights = nullptr;
         solver->pin_capacity = count;
         if (!alloc_and_copy(&solver->pin_indices, indices, count, "pin index allocation")) {
             solver->pin_capacity = 0;
@@ -3830,11 +3871,18 @@ bool upload_pins(Abi41Solver* solver, const int* indices, const float* positions
             solver->pin_capacity = 0;
             return false;
         }
+        if (!alloc_and_copy(&solver->pin_weights, upload_weights, count, "pin weight allocation")) {
+            solver->pin_capacity = 0;
+            return false;
+        }
     } else {
         if (!set_cuda_error(cudaMemcpy(solver->pin_indices, indices, sizeof(int) * count, cudaMemcpyHostToDevice), "pin index upload")) {
             return false;
         }
         if (!set_cuda_error(cudaMemcpy(solver->pin_targets, positions, sizeof(Vec3) * count, cudaMemcpyHostToDevice), "pin target upload")) {
+            return false;
+        }
+        if (!set_cuda_error(cudaMemcpy(solver->pin_weights, upload_weights, sizeof(float) * count, cudaMemcpyHostToDevice), "pin weight upload")) {
             return false;
         }
     }
@@ -4516,6 +4564,7 @@ void free_solver(Abi41Solver* solver) {
     cudaFree(solver->triangle_pair_count);
     cudaFree(solver->pin_indices);
     cudaFree(solver->pin_targets);
+    cudaFree(solver->pin_weights);
     cudaFree(solver->pcg_row_offsets);
     cudaFree(solver->pcg_col_indices);
     cudaFree(solver->pcg_edge_entry_ij);
@@ -4868,9 +4917,9 @@ extern "C" SSBL_API int ssbl_reset_solver(void* handle) {
     return reset_abi41_counts(solver) ? 1 : 0;
 }
 
-extern "C" SSBL_API int ssbl_update_pin_targets(void* handle, const int* indices, const float* positions, int count) {
+extern "C" SSBL_API int ssbl_update_pin_targets(void* handle, const int* indices, const float* positions, const float* weights, int count) {
     g_last_error.clear();
-    return upload_pins(reinterpret_cast<Abi41Solver*>(handle), indices, positions, count) ? 1 : 0;
+    return upload_pins(reinterpret_cast<Abi41Solver*>(handle), indices, positions, weights, count) ? 1 : 0;
 }
 
 extern "C" SSBL_API int ssbl_update_runtime_colliders(void* handle, const SsblXpbdRuntimeColliders* inputs) {
@@ -4918,7 +4967,7 @@ extern "C" SSBL_API int ssbl_update_frame_inputs(void* handle, const SsblXpbdFra
         return set_error("invalid frame input update") ? 1 : 0;
     }
     if (inputs->update_pin_targets
-        && !upload_pins(solver, inputs->pin_indices, inputs->pin_positions, inputs->pin_count)) {
+        && !upload_pins(solver, inputs->pin_indices, inputs->pin_positions, inputs->pin_weights, inputs->pin_count)) {
         return 0;
     }
     if (inputs->update_runtime_colliders) {
@@ -4997,6 +5046,7 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
     int wing_blocks = block_count(solver->bending_wing_count);
     int p_blocks = block_count(solver->pin_count);
     float sub_dt = solver->cfg.dt / static_cast<float>(substeps);
+    const float pin_pass_exponent = 1.0f / static_cast<float>(std::max(iterations + 1, 1));
     const bool run_analytic_colliders = (
         solver->runtime_colliders.use_ground != 0
         || solver->runtime_colliders.use_wall != 0
@@ -5010,7 +5060,7 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
     for (int s = 0; s < substeps; ++s) {
         abi41_integrate_kernel<<<v_blocks, kThreads>>>(*solver, sub_dt);
         if (solver->pin_count > 0) {
-            abi41_pin_project_kernel<<<p_blocks, kThreads>>>(*solver);
+            abi41_pin_project_kernel<<<p_blocks, kThreads>>>(*solver, pin_pass_exponent, sub_dt);
         }
         if (!set_cuda_error(cudaGetLastError(), "launch ABI40 recon integrate/pin")) {
             return 0;
@@ -5037,7 +5087,7 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
                 abi41_bend_project_kernel<<<b_blocks, kThreads>>>(*solver, sub_dt);
             }
             if (solver->pin_count > 0) {
-                abi41_pin_project_kernel<<<p_blocks, kThreads>>>(*solver);
+                abi41_pin_project_kernel<<<p_blocks, kThreads>>>(*solver, pin_pass_exponent, sub_dt);
             }
             if (run_analytic_colliders) {
                 abi41_analytic_collision_kernel<<<v_blocks, kThreads>>>(*solver);
@@ -5193,7 +5243,7 @@ extern "C" SSBL_API int ssbl_get_diagnostics(void* handle, SsblXpbdDiagnostics* 
 }
 
 extern "C" SSBL_API unsigned int ssbl_capabilities(void) {
-    return SSBL_CAP_STRETCH_OPTIMIZATION;
+    return SSBL_CAP_STRETCH_OPTIMIZATION | SSBL_CAP_PIN_WEIGHTS;
 }
 
 extern "C" SSBL_API const char* ssbl_last_error(void) {

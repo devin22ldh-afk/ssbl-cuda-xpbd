@@ -25,6 +25,7 @@ constexpr float kFastSelfRecoveryProjectionRelaxation = 0.90f;
 constexpr float kSelfRecoveryVelocityDamping = 0.65f;
 constexpr float kSelfCorrectionMaxDisplacementScale = 0.45f;
 constexpr float kSelfRecoveryMaxDisplacementScale = 0.50f;
+constexpr float kPinHardWeightThreshold = 0.75f;
 constexpr float kMaxSubstepMove = 0.35f;
 constexpr float kMaxVelocity = 35.0f;
 constexpr int kSelfCollisionPasses = 2;
@@ -244,6 +245,7 @@ struct Solver {
     float* jitter_max_correction = nullptr;
     int* pin_indices = nullptr;
     Vec3* pin_targets = nullptr;
+    float* pin_weights = nullptr;
     int pin_count = 0;
     int pin_capacity = 0;
     float* pinned_download = nullptr;
@@ -2128,7 +2130,20 @@ __global__ void lra_project_kernel(Solver solver, float dt) {
     }
 }
 
-__global__ void pin_project_kernel(Solver solver) {
+__device__ float pin_soft_relaxation(float weight, float pass_exponent) {
+    if (!isfinite(weight) || weight <= 0.0f) {
+        return 0.0f;
+    }
+    float total_strength = clamp01(weight / kPinHardWeightThreshold);
+    if (total_strength >= 1.0f) {
+        return 1.0f;
+    }
+    float remaining = fmaxf(1.0f - total_strength, 0.0f);
+    float relaxation = 1.0f - powf(remaining, fmaxf(pass_exponent, 1.0e-4f));
+    return isfinite(relaxation) ? clamp01(relaxation) : total_strength;
+}
+
+__global__ void pin_project_kernel(Solver solver, float pass_exponent, float dt) {
     int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= solver.pin_count) {
         return;
@@ -2137,8 +2152,26 @@ __global__ void pin_project_kernel(Solver solver) {
     if (i < 0 || i >= solver.cfg.vertex_count) {
         return;
     }
-    solver.pos[i] = solver.pin_targets[p];
-    solver.vel[i] = {0.0f, 0.0f, 0.0f};
+    float weight = solver.pin_weights ? solver.pin_weights[p] : 1.0f;
+    if (!isfinite(weight) || weight <= 0.0f) {
+        return;
+    }
+    Vec3 target = solver.pin_targets[p];
+    if (weight >= kPinHardWeightThreshold || solver.inv_mass[i] <= 0.0f) {
+        solver.pos[i] = target;
+        solver.vel[i] = {0.0f, 0.0f, 0.0f};
+        return;
+    }
+    float relaxation = pin_soft_relaxation(weight, pass_exponent);
+    if (relaxation <= 0.0f) {
+        return;
+    }
+    Vec3 correction = mul(sub(target, solver.pos[i]), relaxation);
+    Vec3 corrected = add(solver.pos[i], correction);
+    Vec3 damped_velocity = mul(solver.vel[i], fmaxf(1.0f - relaxation, 0.0f));
+    solver.pos[i] = corrected;
+    solver.prev[i] = sub(corrected, mul(damped_velocity, fmaxf(dt, kEps)));
+    solver.vel[i] = damped_velocity;
 }
 
 __global__ void volume_accumulate_kernel(Solver solver) {
@@ -5279,6 +5312,7 @@ bool run_substep(
         && solver->cfg.self_collision_mode >= kSelfCollisionModeStrict;
     const bool fast_self_collision = run_self_collision
         && solver->cfg.self_collision_mode == kSelfCollisionModeFast;
+    const float pin_pass_exponent = 1.0f / static_cast<float>(std::max(iterations + 1, 1));
     if (allow_retry && strict_self_collision) {
         if (!backup_solver_state(solver) || !backup_step_diagnostics_state(solver)) {
             return false;
@@ -5291,7 +5325,7 @@ bool run_substep(
     }
     integrate_kernel<<<v_blocks, 256>>>(*solver, sub_dt);
     if (solver->pin_count > 0) {
-        pin_project_kernel<<<p_blocks, 256>>>(*solver);
+        pin_project_kernel<<<p_blocks, 256>>>(*solver, pin_pass_exponent, sub_dt);
     }
     if (!end_timed_segment(timings, &segment, "end integrate timing")) {
         return false;
@@ -5382,7 +5416,7 @@ bool run_substep(
             return false;
         }
         if (solver->pin_count > 0) {
-            pin_project_kernel<<<p_blocks, 256>>>(*solver);
+            pin_project_kernel<<<p_blocks, 256>>>(*solver, pin_pass_exponent, sub_dt);
         }
         if (!end_timed_segment(timings, &segment, "end post-constraint timing")) {
             return false;
@@ -5666,6 +5700,7 @@ void free_solver(Solver* solver) {
     cudaFree(solver->jitter_max_correction);
     cudaFree(solver->pin_indices);
     cudaFree(solver->pin_targets);
+    cudaFree(solver->pin_weights);
     cudaFreeHost(solver->pinned_download);
     cudaFree(solver->diag_counts);
     cudaFree(solver->diag_min_gap);
@@ -5676,7 +5711,7 @@ void free_solver(Solver* solver) {
     delete solver;
 }
 
-bool update_pin_targets_internal(Solver* solver, const int* indices, const float* positions, int count) {
+bool update_pin_targets_internal(Solver* solver, const int* indices, const float* positions, const float* weights, int count) {
     if (!solver) {
         return set_error("invalid solver handle");
     }
@@ -5690,8 +5725,10 @@ bool update_pin_targets_internal(Solver* solver, const int* indices, const float
     if (count > solver->pin_capacity) {
         cudaFree(solver->pin_indices);
         cudaFree(solver->pin_targets);
+        cudaFree(solver->pin_weights);
         solver->pin_indices = nullptr;
         solver->pin_targets = nullptr;
+        solver->pin_weights = nullptr;
         solver->pin_capacity = count;
         if (!set_cuda_error(cudaMalloc(reinterpret_cast<void**>(&solver->pin_indices), sizeof(int) * count), "pin index allocation")) {
             return false;
@@ -5699,12 +5736,24 @@ bool update_pin_targets_internal(Solver* solver, const int* indices, const float
         if (!set_cuda_error(cudaMalloc(reinterpret_cast<void**>(&solver->pin_targets), sizeof(Vec3) * count), "pin target allocation")) {
             return false;
         }
+        if (!set_cuda_error(cudaMalloc(reinterpret_cast<void**>(&solver->pin_weights), sizeof(float) * count), "pin weight allocation")) {
+            return false;
+        }
     }
     solver->pin_count = count;
     if (!set_cuda_error(cudaMemcpy(solver->pin_indices, indices, sizeof(int) * count, cudaMemcpyHostToDevice), "pin index upload")) {
         return false;
     }
-    return set_cuda_error(cudaMemcpy(solver->pin_targets, positions, sizeof(float) * count * 3, cudaMemcpyHostToDevice), "pin target upload");
+    if (!set_cuda_error(cudaMemcpy(solver->pin_targets, positions, sizeof(float) * count * 3, cudaMemcpyHostToDevice), "pin target upload")) {
+        return false;
+    }
+    std::vector<float> default_weights;
+    const float* upload_weights = weights;
+    if (!upload_weights) {
+        default_weights.assign(count, 1.0f);
+        upload_weights = default_weights.data();
+    }
+    return set_cuda_error(cudaMemcpy(solver->pin_weights, upload_weights, sizeof(float) * count, cudaMemcpyHostToDevice), "pin weight upload");
 }
 
 bool update_runtime_colliders_internal(Solver* solver, const SsblXpbdRuntimeColliders* inputs) {
@@ -6238,9 +6287,9 @@ extern "C" SSBL_API int ssbl_reset_solver(void* handle) {
     return 1;
 }
 
-extern "C" SSBL_API int ssbl_update_pin_targets(void* handle, const int* indices, const float* positions, int count) {
+extern "C" SSBL_API int ssbl_update_pin_targets(void* handle, const int* indices, const float* positions, const float* weights, int count) {
     g_last_error.clear();
-    return update_pin_targets_internal(reinterpret_cast<Solver*>(handle), indices, positions, count) ? 1 : 0;
+    return update_pin_targets_internal(reinterpret_cast<Solver*>(handle), indices, positions, weights, count) ? 1 : 0;
 }
 
 extern "C" SSBL_API int ssbl_update_runtime_colliders(void* handle, const SsblXpbdRuntimeColliders* inputs) {
@@ -6273,7 +6322,7 @@ extern "C" SSBL_API int ssbl_update_frame_inputs(void* handle, const SsblXpbdFra
         return 0;
     }
     if (inputs->update_pin_targets
-        && !update_pin_targets_internal(solver, inputs->pin_indices, inputs->pin_positions, inputs->pin_count)) {
+        && !update_pin_targets_internal(solver, inputs->pin_indices, inputs->pin_positions, inputs->pin_weights, inputs->pin_count)) {
         return 0;
     }
     if (inputs->update_static_triangles
@@ -6467,7 +6516,7 @@ extern "C" SSBL_API int ssbl_get_diagnostics(void* handle, SsblXpbdDiagnostics* 
 }
 
 extern "C" SSBL_API unsigned int ssbl_capabilities(void) {
-    return SSBL_CAP_STRETCH_OPTIMIZATION;
+    return SSBL_CAP_STRETCH_OPTIMIZATION | SSBL_CAP_PIN_WEIGHTS;
 }
 
 extern "C" SSBL_API const char* ssbl_last_error(void) {

@@ -135,6 +135,7 @@ class _NativeFrameInputs(ctypes.Structure):
         ("update_pin_targets", ctypes.c_int),
         ("pin_indices", ctypes.POINTER(ctypes.c_int)),
         ("pin_positions", ctypes.POINTER(ctypes.c_float)),
+        ("pin_weights", ctypes.POINTER(ctypes.c_float)),
         ("pin_count", ctypes.c_int),
         ("update_runtime_colliders", ctypes.c_int),
         ("runtime_colliders", _NativeRuntimeColliders),
@@ -429,6 +430,7 @@ _LIB = None
 _LOAD_ERROR = ""
 _ABI41_DLL_NAME = "ssbl_xpbd_cuda_abi40.dll"
 _CAP_STRETCH_OPTIMIZATION = 1 << 0
+_CAP_PIN_WEIGHTS = 1 << 1
 
 
 def dll_path() -> str:
@@ -479,6 +481,7 @@ def _load_library():
     lib.ssbl_update_pin_targets.argtypes = [
         ctypes.c_void_p,
         ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.c_float),
         ctypes.POINTER(ctypes.c_float),
         ctypes.c_int,
     ]
@@ -670,6 +673,11 @@ class NativeXpbdSolver:
                     "Loaded CUDA solver DLL does not support hard stretch optimization. "
                     "Rebuild native/build_recon.ps1 to generate the ABI40 DLL."
                 )
+        if (_capabilities(self._lib) & _CAP_PIN_WEIGHTS) == 0:
+            raise NativeSolverError(
+                "Loaded CUDA solver DLL does not support vertex-group pin weights. "
+                "Rebuild native/build_recon.ps1 to generate the ABI40 DLL."
+            )
         self._vertex_count = int(len(cloth.positions_world))
         self._positions_out = np.empty((self._vertex_count, 3), dtype=np.float32)
         self._static_triangle_count = int(len(static_triangles))
@@ -697,7 +705,7 @@ class NativeXpbdSolver:
         if not self._handle:
             raise NativeSolverError(_last_error(self._lib))
         if len(cloth.pin_indices) > 0:
-            self.update_pin_targets(cloth.pin_indices, cloth.pin_targets_world)
+            self.update_pin_targets(cloth.pin_indices, cloth.pin_targets_world, cloth.pin_weights)
 
     def close(self) -> None:
         if getattr(self, "_handle", None):
@@ -708,13 +716,24 @@ class NativeXpbdSolver:
         if not self._lib.ssbl_reset_solver(self._handle):
             raise NativeSolverError(_last_error(self._lib))
 
-    def update_pin_targets(self, indices: np.ndarray, positions: np.ndarray) -> None:
+    def update_pin_targets(
+        self,
+        indices: np.ndarray,
+        positions: np.ndarray,
+        weights: np.ndarray | None = None,
+    ) -> None:
         indices = np.ascontiguousarray(indices, dtype=np.int32)
         positions = np.ascontiguousarray(positions, dtype=np.float32)
+        if weights is None:
+            weights = np.ones(len(indices), dtype=np.float32)
+        weights = np.ascontiguousarray(weights, dtype=np.float32).reshape((-1,))
+        if len(indices) != len(positions) or len(indices) != len(weights):
+            raise NativeSolverError("Pin index, target, and weight arrays must have matching lengths.")
         ok = self._lib.ssbl_update_pin_targets(
             self._handle,
             _as_int_ptr(indices),
             _as_float_ptr(positions),
+            _as_float_ptr(weights),
             int(len(indices)),
         )
         if not ok:
@@ -765,6 +784,7 @@ class NativeXpbdSolver:
         *,
         pin_indices: np.ndarray | None,
         pin_positions: np.ndarray | None,
+        pin_weights: np.ndarray | None,
         update_pin: bool,
         options: SolverOptions | None,
         update_runtime: bool,
@@ -784,6 +804,7 @@ class NativeXpbdSolver:
                 self.update_pin_targets(
                     np.asarray(pin_indices if pin_indices is not None else [], dtype=np.int32),
                     np.asarray(pin_positions if pin_positions is not None else np.empty((0, 3), dtype=np.float32), dtype=np.float32),
+                    None if pin_weights is None else np.asarray(pin_weights, dtype=np.float32),
                 )
             if update_runtime and options is not None:
                 self.update_runtime_colliders(options)
@@ -799,6 +820,12 @@ class NativeXpbdSolver:
             pin_positions if pin_positions is not None else np.empty((0, 3), dtype=np.float32),
             dtype=np.float32,
         )
+        if pin_weights is None:
+            pin_weights_arr = np.ones(len(pin_indices_arr), dtype=np.float32)
+        else:
+            pin_weights_arr = np.ascontiguousarray(pin_weights, dtype=np.float32).reshape((-1,))
+        if len(pin_indices_arr) != len(pin_positions_arr) or len(pin_indices_arr) != len(pin_weights_arr):
+            raise NativeSolverError("Pin index, target, and weight arrays must have matching lengths.")
         static_triangle_count = int(len(static_triangles)) if static_triangles is not None else 0
         dynamic_triangle_count = int(len(dynamic_triangles)) if dynamic_triangles is not None else 0
         static_arr = np.ascontiguousarray(
@@ -856,6 +883,7 @@ class NativeXpbdSolver:
             update_pin_targets=int(update_pin),
             pin_indices=_as_int_ptr(pin_indices_arr),
             pin_positions=_as_float_ptr(pin_positions_arr),
+            pin_weights=_as_float_ptr(pin_weights_arr),
             pin_count=int(len(pin_indices_arr)),
             update_runtime_colliders=int(update_runtime),
             runtime_colliders=runtime_inputs,

@@ -30,12 +30,14 @@ _TETHER_START_HARDNESS = 0.50
 _LEGACY_BALANCED_STRETCH = 1.0e-6
 _LEGACY_BALANCED_BEND = 1.0e-4
 _STARTUP_CACHE_LIMIT = 16
+PIN_HARD_WEIGHT_THRESHOLD = 0.75
 
 
 @dataclass
 class PinAttachmentBatch:
     pairs: np.ndarray
     targets_world: np.ndarray
+    weights: np.ndarray
 
 
 @dataclass
@@ -97,6 +99,7 @@ class ClothBuildData:
     pin_targets_world: np.ndarray
     matrix_world_inv: np.ndarray
     rest_volume: float
+    pin_weights: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
     pin_attachment_pairs: np.ndarray = field(default_factory=lambda: np.empty((0, 2), dtype=np.int32))
     pin_attachment_targets_world: np.ndarray = field(default_factory=lambda: np.empty((0, 3), dtype=np.float32))
 
@@ -110,7 +113,6 @@ class _TopologyCacheEntry:
     bend_color_offsets: np.ndarray
     lra_edges: np.ndarray
     lra_color_offsets: np.ndarray
-    pin_indices: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -147,21 +149,34 @@ def clear_cloth_topology_cache() -> None:
     _TOPOLOGY_CACHE_STATS["last_hit"] = False
 
 
-def make_pin_attachment_batch(pin_indices: np.ndarray, targets_world: np.ndarray) -> PinAttachmentBatch:
+def make_pin_attachment_batch(
+    pin_indices: np.ndarray,
+    targets_world: np.ndarray,
+    pin_weights: np.ndarray | None = None,
+) -> PinAttachmentBatch:
     pin_indices_arr = np.ascontiguousarray(pin_indices, dtype=np.int32).reshape((-1,))
     targets_arr = np.ascontiguousarray(targets_world, dtype=np.float32).reshape((-1, 3))
+    if pin_weights is None:
+        weights_arr = np.ones(len(pin_indices_arr), dtype=np.float32)
+    else:
+        weights_arr = np.ascontiguousarray(pin_weights, dtype=np.float32).reshape((-1,))
     if len(pin_indices_arr) != len(targets_arr):
         raise ValueError("Pin attachment indices and target positions must have matching lengths.")
+    if len(pin_indices_arr) != len(weights_arr):
+        raise ValueError("Pin attachment indices and weights must have matching lengths.")
+    weights_arr = np.ascontiguousarray(np.clip(weights_arr, 0.0, 1.0), dtype=np.float32)
     if len(pin_indices_arr) == 0:
         return PinAttachmentBatch(
             pairs=np.empty((0, 2), dtype=np.int32),
             targets_world=np.empty((0, 3), dtype=np.float32),
+            weights=np.empty(0, dtype=np.float32),
         )
     attachment_sources = np.arange(len(pin_indices_arr), dtype=np.int32)
     pairs = np.column_stack((pin_indices_arr, attachment_sources)).astype(np.int32, copy=False)
     return PinAttachmentBatch(
         pairs=np.ascontiguousarray(pairs, dtype=np.int32),
         targets_world=targets_arr,
+        weights=weights_arr,
     )
 
 
@@ -279,7 +294,7 @@ def _topology_cache_key(
     obj: bpy.types.Object,
     mesh: bpy.types.Mesh,
     use_evaluated_mesh: bool,
-    pin_indices: np.ndarray,
+    hard_pin_indices: np.ndarray,
     derived: HardnessDerivedSettings,
     matrix_world,
     local_positions: np.ndarray,
@@ -297,7 +312,7 @@ def _topology_cache_key(
         len(mesh.polygons),
         len(mesh.loops),
         _mesh_loop_signature(mesh),
-        _pin_indices_signature(pin_indices),
+        _pin_indices_signature(hard_pin_indices),
         bool(derived.hidden_tether_enabled),
         round(float(derived.hidden_tether_slack), 6),
         _matrix_linear_signature(matrix_world),
@@ -353,8 +368,10 @@ def _build_cloth_data_uncached(
     if len(triangles) == 0:
         raise ValueError("当前网格至少需要一个面")
 
-    pin_mask = pin_mask_from_group(obj, str(settings.pin_vertex_group).strip(), len(local))
-    if np.all(pin_mask):
+    pin_weights_by_vertex = pin_weights_from_group(obj, str(settings.pin_vertex_group).strip(), len(local))
+    pin_mask = pin_weights_by_vertex > 0.0
+    hard_pin_mask = pin_weights_by_vertex >= PIN_HARD_WEIGHT_THRESHOLD
+    if np.all(hard_pin_mask):
         raise ValueError("所有顶点都被固定了，没有可模拟的部分")
     rest_volume = signed_mesh_volume(world, triangles)
 
@@ -363,15 +380,16 @@ def _build_cloth_data_uncached(
     bends, bend_rest = bend_constraints(triangles, world)
     bends, bend_rest, bend_color_offsets = color_distance_constraints(bends, bend_rest, len(world))
     if derived.hidden_tether_enabled:
-        lra_edges, lra_rest = hidden_tether_constraints(world, pin_mask, derived.hidden_tether_slack)
+        lra_edges, lra_rest = hidden_tether_constraints(world, hard_pin_mask, derived.hidden_tether_slack)
     else:
         lra_edges = np.empty((0, 2), dtype=np.int32)
         lra_rest = np.empty(0, dtype=np.float32)
     lra_color_offsets = np.asarray([0], dtype=np.int32)
-    inv_mass = vertex_inverse_mass(world, triangles, float(settings.density), pin_mask)
+    inv_mass = vertex_inverse_mass(world, triangles, float(settings.density), hard_pin_mask)
     pin_indices = np.flatnonzero(pin_mask).astype(np.int32)
     pin_targets = world[pin_indices].astype(np.float32, copy=True)
-    pin_attachments = make_pin_attachment_batch(pin_indices, pin_targets)
+    pin_weights = pin_weights_by_vertex[pin_indices].astype(np.float32, copy=True)
+    pin_attachments = make_pin_attachment_batch(pin_indices, pin_targets, pin_weights)
 
     return ClothBuildData(
         positions_world=np.ascontiguousarray(world, dtype=np.float32),
@@ -388,6 +406,7 @@ def _build_cloth_data_uncached(
         lra_color_offsets=np.ascontiguousarray(lra_color_offsets, dtype=np.int32),
         pin_indices=pin_attachments.pairs[:, 0].copy(),
         pin_targets_world=pin_attachments.targets_world,
+        pin_weights=pin_attachments.weights,
         matrix_world_inv=matrix_world_inv,
         rest_volume=float(rest_volume),
         pin_attachment_pairs=pin_attachments.pairs,
@@ -448,13 +467,16 @@ def _build_cloth_data_from_mesh(
 ) -> ClothBuildData:
     world, _matrix_world = to_world(local, matrix_world)
     matrix_world_inv = np.array(matrix_world.inverted(), dtype=np.float32)
-    pin_mask = pin_mask_from_group(obj, str(settings.pin_vertex_group).strip(), len(local))
+    pin_weights_by_vertex = pin_weights_from_group(obj, str(settings.pin_vertex_group).strip(), len(local))
+    pin_mask = pin_weights_by_vertex > 0.0
+    hard_pin_mask = pin_weights_by_vertex >= PIN_HARD_WEIGHT_THRESHOLD
     pin_indices = np.flatnonzero(pin_mask).astype(np.int32)
+    hard_pin_indices = np.flatnonzero(hard_pin_mask).astype(np.int32)
     cache_key = _topology_cache_key(
         obj,
         mesh,
         use_evaluated_mesh,
-        pin_indices,
+        hard_pin_indices,
         derived,
         matrix_world,
         local,
@@ -468,7 +490,6 @@ def _build_cloth_data_from_mesh(
         bend_color_offsets = np.array(cache_entry.bend_color_offsets, dtype=np.int32, copy=True)
         lra_edges = np.array(cache_entry.lra_edges, dtype=np.int32, copy=True)
         lra_color_offsets = np.array(cache_entry.lra_color_offsets, dtype=np.int32, copy=True)
-        pin_indices = np.array(cache_entry.pin_indices, dtype=np.int32, copy=True)
     else:
         triangles = triangulated_faces(mesh)
         edges, edge_rest_for_coloring = edge_constraints(triangles, world)
@@ -476,7 +497,7 @@ def _build_cloth_data_from_mesh(
         bends, bend_rest_for_coloring = bend_constraints(triangles, world)
         bends, _bend_rest, bend_color_offsets = color_distance_constraints(bends, bend_rest_for_coloring, len(world))
         if derived.hidden_tether_enabled:
-            lra_edges, _lra_rest = hidden_tether_constraints(world, pin_mask, derived.hidden_tether_slack)
+            lra_edges, _lra_rest = hidden_tether_constraints(world, hard_pin_mask, derived.hidden_tether_slack)
         else:
             lra_edges = np.empty((0, 2), dtype=np.int32)
         lra_color_offsets = np.asarray([0], dtype=np.int32)
@@ -490,13 +511,12 @@ def _build_cloth_data_from_mesh(
                 bend_color_offsets=np.ascontiguousarray(bend_color_offsets, dtype=np.int32),
                 lra_edges=np.ascontiguousarray(lra_edges, dtype=np.int32),
                 lra_color_offsets=np.ascontiguousarray(lra_color_offsets, dtype=np.int32),
-                pin_indices=np.ascontiguousarray(pin_indices, dtype=np.int32),
             ),
         )
 
     if len(triangles) == 0:
         raise ValueError("The cloth mesh needs at least one face.")
-    if np.all(pin_mask):
+    if np.all(hard_pin_mask):
         raise ValueError("All vertices are pinned; there is no simulated cloth region.")
 
     rest_volume = signed_mesh_volume(world, triangles)
@@ -504,9 +524,10 @@ def _build_cloth_data_from_mesh(
     edge_rest = _distance_rest_lengths(edges, world)
     bend_rest = _distance_rest_lengths(bends, world)
     lra_rest = _distance_rest_lengths(lra_edges, world, derived.hidden_tether_slack)
-    inv_mass = vertex_inverse_mass(world, triangles, float(settings.density), pin_mask)
+    inv_mass = vertex_inverse_mass(world, triangles, float(settings.density), hard_pin_mask)
     pin_targets = world[pin_indices].astype(np.float32, copy=True)
-    pin_attachments = make_pin_attachment_batch(pin_indices, pin_targets)
+    pin_weights = pin_weights_by_vertex[pin_indices].astype(np.float32, copy=True)
+    pin_attachments = make_pin_attachment_batch(pin_indices, pin_targets, pin_weights)
 
     return ClothBuildData(
         positions_world=np.ascontiguousarray(world, dtype=np.float32),
@@ -525,6 +546,7 @@ def _build_cloth_data_from_mesh(
         pin_targets_world=pin_attachments.targets_world,
         matrix_world_inv=matrix_world_inv,
         rest_volume=float(rest_volume),
+        pin_weights=pin_attachments.weights,
         pin_attachment_pairs=pin_attachments.pairs,
         pin_attachment_targets_world=pin_attachments.targets_world,
     )
@@ -644,19 +666,25 @@ def signed_mesh_volume(rest_world: np.ndarray, triangles: np.ndarray) -> float:
 
 
 def pin_mask_from_group(obj: bpy.types.Object, group_name: str, vertex_count: int) -> np.ndarray:
-    mask = np.zeros(vertex_count, dtype=bool)
+    return pin_weights_from_group(obj, group_name, vertex_count) > 0.0
+
+
+def pin_weights_from_group(obj: bpy.types.Object, group_name: str, vertex_count: int) -> np.ndarray:
+    weights = np.zeros(vertex_count, dtype=np.float32)
     if not group_name:
-        return mask
+        return weights
     group = obj.vertex_groups.get(group_name)
     if group is None:
-        return mask
+        return weights
     group_index = group.index
     for vert in obj.data.vertices:
+        if vert.index >= vertex_count:
+            continue
         for assignment in vert.groups:
             if assignment.group == group_index and assignment.weight > 0.0:
-                mask[vert.index] = True
+                weights[vert.index] = max(float(weights[vert.index]), _clamp01(assignment.weight))
                 break
-    return mask
+    return weights
 
 
 def edge_constraints(triangles: np.ndarray, rest_world: np.ndarray) -> tuple[np.ndarray, np.ndarray]:

@@ -905,7 +905,8 @@ int run_tack_bending_smoke() {
         }
         int pins[] = {0};
         float pin_positions[] = {0.0f, 0.0f, 0.0f};
-        if (!ssbl_update_pin_targets(solver, pins, pin_positions, 1)) {
+        float pin_weights[] = {1.0f};
+        if (!ssbl_update_pin_targets(solver, pins, pin_positions, pin_weights, 1)) {
             std::fprintf(stderr, "SSBL_ABI41_TACK_BENDING_ERROR LRA pins: %s\n", ssbl_last_error());
             ssbl_destroy_solver(solver);
             return 111;
@@ -970,7 +971,8 @@ int run_tack_bending_smoke() {
         }
         int pins[] = {0};
         float moved_pin[] = {1.0f, 0.0f, 0.0f};
-        if (!ssbl_update_pin_targets(solver, pins, moved_pin, 1)) {
+        float pin_weights[] = {1.0f};
+        if (!ssbl_update_pin_targets(solver, pins, moved_pin, pin_weights, 1)) {
             std::fprintf(stderr, "SSBL_ABI41_TACK_BENDING_ERROR animated pins: %s\n", ssbl_last_error());
             ssbl_destroy_solver(solver);
             return 117;
@@ -1166,6 +1168,88 @@ int run_overpressure_smoke() {
     return 0;
 }
 
+int run_pin_weight_strength_smoke() {
+    std::vector<float> positions = {
+        0.0f, 0.0f, 0.0f,
+        1.0f, 0.0f, 0.0f,
+        2.0f, 0.0f, 0.0f,
+    };
+    std::vector<float> inv_mass = {1.0f, 1.0f, 1.0f};
+
+    SsblXpbdConfig cfg{};
+    cfg.vertex_count = 3;
+    cfg.dt = 1.0f / 60.0f;
+    cfg.damping = 1.0f;
+    cfg.gravity[0] = 0.0f;
+    cfg.gravity[1] = -9.8f;
+    cfg.gravity[2] = 0.0f;
+
+    SsblXpbdMesh mesh{};
+    mesh.positions = positions.data();
+    mesh.inv_mass = inv_mass.data();
+
+    void* solver = ssbl_create_solver(&cfg, &mesh);
+    if (!solver) {
+        std::fprintf(stderr, "SSBL_ABI41_PIN_WEIGHT_ERROR create: %s\n", ssbl_last_error());
+        return 130;
+    }
+
+    int pins[] = {0, 1};
+    float pin_positions[] = {
+        0.0f, 1.0f, 0.0f,
+        1.0f, 1.0f, 0.0f,
+    };
+    float pin_weights[] = {1.0f, 0.375f};
+    if (!ssbl_update_pin_targets(solver, pins, pin_positions, pin_weights, 2)) {
+        std::fprintf(stderr, "SSBL_ABI41_PIN_WEIGHT_ERROR pins: %s\n", ssbl_last_error());
+        ssbl_destroy_solver(solver);
+        return 131;
+    }
+    if (!ssbl_step_solver_ex(solver, 1, 3, 1, 1)) {
+        std::fprintf(stderr, "SSBL_ABI41_PIN_WEIGHT_ERROR step: %s\n", ssbl_last_error());
+        ssbl_destroy_solver(solver);
+        return 132;
+    }
+
+    std::vector<float> out(positions.size(), 0.0f);
+    if (!ssbl_download_positions(solver, out.data(), static_cast<int>(out.size()))) {
+        std::fprintf(stderr, "SSBL_ABI41_PIN_WEIGHT_ERROR download: %s\n", ssbl_last_error());
+        ssbl_destroy_solver(solver);
+        return 133;
+    }
+    SsblXpbdDiagnostics diag{};
+    if (!ssbl_get_diagnostics(solver, &diag)) {
+        std::fprintf(stderr, "SSBL_ABI41_PIN_WEIGHT_ERROR diagnostics: %s\n", ssbl_last_error());
+        ssbl_destroy_solver(solver);
+        return 134;
+    }
+    ssbl_destroy_solver(solver);
+
+    const float hard_y = out[1];
+    const float soft_y = out[4];
+    const float free_y = out[7];
+    if (!finite_positions(out) || !diag.finite_flag) {
+        std::fprintf(stderr, "SSBL_ABI41_PIN_WEIGHT_ERROR non-finite output\n");
+        return 135;
+    }
+    if (std::fabs(hard_y - 1.0f) > 1.0e-5f) {
+        std::fprintf(stderr, "SSBL_ABI41_PIN_WEIGHT_ERROR hard pin y=%.6f\n", hard_y);
+        return 136;
+    }
+    if (!(soft_y > 0.20f && soft_y < 0.95f && free_y < -1.0e-5f)) {
+        std::fprintf(
+            stderr,
+            "SSBL_ABI41_PIN_WEIGHT_ERROR soft/free mismatch soft=%.6f free=%.6f\n",
+            soft_y,
+            free_y
+        );
+        return 137;
+    }
+
+    std::printf("SSBL_ABI41_PIN_WEIGHT_OK hard_y=%.5f soft_y=%.5f free_y=%.5f\n", hard_y, soft_y, free_y);
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -1196,6 +1280,11 @@ int main() {
     int static_sdf_result = run_static_sdf_smoke();
     if (static_sdf_result != 0) {
         return static_sdf_result;
+    }
+    std::printf("SSBL_ABI41_SMOKE_BEFORE_PIN_WEIGHT\n");
+    int pin_weight_result = run_pin_weight_strength_smoke();
+    if (pin_weight_result != 0) {
+        return pin_weight_result;
     }
 
     std::vector<float> positions = {
@@ -1257,7 +1346,8 @@ int main() {
         0.0f, 0.2f, 0.0f,
         1.0f, 0.2f, 0.0f,
     };
-    if (!ssbl_update_pin_targets(solver, pins, pin_positions, 2)) {
+    float pin_weights[] = {1.0f, 1.0f};
+    if (!ssbl_update_pin_targets(solver, pins, pin_positions, pin_weights, 2)) {
         std::fprintf(stderr, "SSBL_ABI41_NATIVE_ERROR pins: %s\n", ssbl_last_error());
         ssbl_destroy_solver(solver);
         return 3;

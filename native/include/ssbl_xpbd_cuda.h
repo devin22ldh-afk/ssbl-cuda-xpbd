@@ -61,7 +61,8 @@ typedef struct SsblXpbdConfig {
 } SsblXpbdConfig;
 
 enum {
-    SSBL_CAP_STRETCH_OPTIMIZATION = 1u << 0
+    SSBL_CAP_STRETCH_OPTIMIZATION = 1u << 0,
+    SSBL_CAP_PIN_WEIGHTS = 1u << 1
 };
 
 typedef struct SsblXpbdDiagnostics {
@@ -240,6 +241,7 @@ typedef struct SsblXpbdFrameInputs {
     int update_pin_targets;
     const int* pin_indices;
     const float* pin_positions;
+    const float* pin_weights;
     int pin_count;
     int update_runtime_colliders;
     SsblXpbdRuntimeColliders runtime_colliders;
@@ -265,7 +267,7 @@ typedef struct SsblXpbdFrameInputs {
 SSBL_API void* ssbl_create_solver(const SsblXpbdConfig* config, const SsblXpbdMesh* mesh);
 SSBL_API int ssbl_destroy_solver(void* handle);
 SSBL_API int ssbl_reset_solver(void* handle);
-SSBL_API int ssbl_update_pin_targets(void* handle, const int* indices, const float* positions, int count);
+SSBL_API int ssbl_update_pin_targets(void* handle, const int* indices, const float* positions, const float* weights, int count);
 SSBL_API int ssbl_update_runtime_colliders(void* handle, const SsblXpbdRuntimeColliders* inputs);
 SSBL_API int ssbl_update_positions(void* handle, const float* positions, int max_floats);
 SSBL_API int ssbl_update_static_triangles(void* handle, const float* triangles, int triangle_count);
