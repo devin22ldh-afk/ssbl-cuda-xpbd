@@ -31,6 +31,7 @@ constexpr int kAbi41MinSelfHashBuckets = 1024;
 constexpr int kAbi41SelfTriangleHashMinCount = 64;
 constexpr int kAbi41SelfTriangleHashBucketSlots = 32;
 constexpr int kAbi41MinSelfTriangleHashBuckets = 1024;
+constexpr int kAbi41SelfHashMaxPrimitiveCells = 64;
 constexpr int kAbi41SelfEdgeHashMinCount = 64;
 constexpr int kAbi41SelfEdgeHashBucketSlots = 32;
 constexpr int kAbi41MinSelfEdgeHashBuckets = 1024;
@@ -64,7 +65,10 @@ constexpr int kAbi41PcgReductionDAD = 0;
 constexpr int kAbi41PcgReductionRZ = 1;
 constexpr int kAbi41PcgReductionRZNext = 2;
 constexpr int kAbi41PcgReductionStatus = 3;
-constexpr int kAbi41PcgReductionSlots = 4;
+constexpr int kAbi41PcgReductionInitialRZ = 4;
+constexpr int kAbi41PcgReductionIterations = 5;
+constexpr int kAbi41PcgReductionSlots = 6;
+constexpr int kAbi41PcgSubstepCadence = 1;
 constexpr float kAbi41PcgStatusOk = 0.0f;
 constexpr float kAbi41PcgStatusBadResidual = 1.0f;
 constexpr float kAbi41PcgStatusZeroResidual = 2.0f;
@@ -400,8 +404,44 @@ __device__ void atomic_add(Vec3* dst, Vec3 value) {
 
 __device__ void abi41_count(Abi41Solver solver, int slot) {
     if (solver.abi41_counts && slot >= 0 && slot < kAbi41CountSlots) {
-        atomicAdd(&solver.abi41_counts[slot], 1ull);
+        const unsigned int mask = __activemask();
+        const int leader_lane = __ffs(mask) - 1;
+        const int lane = threadIdx.x & 31;
+        if (lane == leader_lane) {
+            atomicAdd(&solver.abi41_counts[slot], static_cast<unsigned long long>(__popc(mask)));
+        }
     }
+}
+
+__device__ void abi41_guard_self_hash_primitive(
+    Abi41Solver solver,
+    int* min_x,
+    int* max_x,
+    int* min_y,
+    int* max_y,
+    int* min_z,
+    int* max_z,
+    int fallback_x,
+    int fallback_y,
+    int fallback_z
+) {
+    const long long span_x = static_cast<long long>(*max_x) - static_cast<long long>(*min_x) + 1ll;
+    const long long span_y = static_cast<long long>(*max_y) - static_cast<long long>(*min_y) + 1ll;
+    const long long span_z = static_cast<long long>(*max_z) - static_cast<long long>(*min_z) + 1ll;
+    if (span_x <= 0ll || span_y <= 0ll || span_z <= 0ll) {
+        return;
+    }
+    const long long cells = span_x * span_y * span_z;
+    if (cells <= static_cast<long long>(kAbi41SelfHashMaxPrimitiveCells)) {
+        return;
+    }
+    *min_x = fallback_x;
+    *max_x = fallback_x;
+    *min_y = fallback_y;
+    *max_y = fallback_y;
+    *min_z = fallback_z;
+    *max_z = fallback_z;
+    abi41_count(solver, kAbi41CountSelfOverflow);
 }
 
 __device__ float length(Vec3 value) {
@@ -1083,7 +1123,7 @@ __global__ void abi41_static_sdf_collision_kernel(Abi41Solver solver, float dt) 
     solver.pos[i] = corrected;
     solver.vel[i] = vel;
     solver.prev[i] = sub(corrected, mul(vel, fmaxf(dt, kEps)));
-    atomicAdd(&solver.abi41_counts[kAbi41CountStaticSdfContacts], 1ull);
+    abi41_count(solver, kAbi41CountStaticSdfContacts);
 }
 
 __global__ void abi41_integrate_kernel(Abi41Solver solver, float dt) {
@@ -1145,7 +1185,7 @@ __global__ void abi41_spring_project_kernel(Abi41Solver solver, float dt) {
     float max_corr = fmaxf(0.0025f, fminf(fmaxf(spring.rest_length, 0.0f) * 0.10f, 0.025f));
     if (corr_len > max_corr) {
         corr = mul(corr, max_corr / fmaxf(corr_len, kEps));
-        atomicAdd(&solver.abi41_counts[kAbi41CountHardFallbacks], 1ull);
+        abi41_count(solver, kAbi41CountHardFallbacks);
     }
     if (wi > 0.0f) {
         atomic_add(&solver.pos[i], mul(corr, -wi));
@@ -1381,6 +1421,9 @@ __global__ void abi41_pcg_reset_vertex_kernel(Abi41Solver solver) {
         solver.pcg_reductions[kAbi41PcgReductionDAD] = 0.0f;
         solver.pcg_reductions[kAbi41PcgReductionRZ] = 0.0f;
         solver.pcg_reductions[kAbi41PcgReductionRZNext] = 0.0f;
+        solver.pcg_reductions[kAbi41PcgReductionStatus] = kAbi41PcgStatusOk;
+        solver.pcg_reductions[kAbi41PcgReductionInitialRZ] = 0.0f;
+        solver.pcg_reductions[kAbi41PcgReductionIterations] = 0.0f;
     }
     if (i >= solver.cfg.vertex_count) {
         return;
@@ -1411,6 +1454,20 @@ __global__ void abi41_pcg_reset_vertex_kernel(Abi41Solver solver) {
     }
 }
 
+__global__ void abi41_pcg_prepare_iteration_kernel(Abi41Solver solver, int capture_initial) {
+    if (blockIdx.x != 0 || threadIdx.x != 0 || !solver.pcg_reductions) {
+        return;
+    }
+    if (capture_initial != 0) {
+        solver.pcg_reductions[kAbi41PcgReductionInitialRZ] =
+            solver.pcg_reductions[kAbi41PcgReductionRZ];
+        solver.pcg_reductions[kAbi41PcgReductionIterations] = 0.0f;
+    }
+    solver.pcg_reductions[kAbi41PcgReductionDAD] = 0.0f;
+    solver.pcg_reductions[kAbi41PcgReductionRZNext] = 0.0f;
+    solver.pcg_reductions[kAbi41PcgReductionStatus] = kAbi41PcgStatusOk;
+}
+
 __global__ void abi41_pcg_build_stretch_system_kernel(Abi41Solver solver) {
     const int s = blockIdx.x * blockDim.x + threadIdx.x;
     if (!solver.cfg.stretch_optimization_enabled
@@ -1435,10 +1492,6 @@ __global__ void abi41_pcg_build_stretch_system_kernel(Abi41Solver solver) {
     if (entry_ij < 0 || entry_ji < 0) {
         return;
     }
-    const ReconSymMat zero_block = zero_sym_mat();
-    write_sym_texels(solver.pcg_offdiag_texels, entry_ij, zero_block);
-    write_sym_texels(solver.pcg_offdiag_texels, entry_ji, zero_block);
-
     float wi = solver.inv_mass[i];
     float wj = solver.inv_mass[j];
     if (solver.state_flags) {
@@ -1563,7 +1616,10 @@ __global__ void abi41_pcg_finalize_preconditioner_kernel(Abi41Solver solver) {
 __global__ void abi41_pcg_compute_ad_kernel(Abi41Solver solver) {
     const int row = blockIdx.x * blockDim.x + threadIdx.x;
     float local_sum = 0.0f;
-    if (row < solver.cfg.vertex_count
+    const bool status_ok = !solver.pcg_reductions
+        || solver.pcg_reductions[kAbi41PcgReductionStatus] == kAbi41PcgStatusOk;
+    if (status_ok
+        && row < solver.cfg.vertex_count
         && solver.pcg_adir
         && solver.pcg_search_dir
         && solver.pcg_row_offsets
@@ -1626,7 +1682,7 @@ __global__ void abi41_pcg_update_solution_residual_z_kernel(Abi41Solver solver, 
             local_sum = dot(safe_residual, z);
 
             if (apply_solution_now != 0) {
-                Vec3 delta = safe_solution;
+                Vec3 delta = mul(solver.pcg_search_dir[i], alpha);
                 const float len = length(delta);
                 const float max_delta = 0.25f;
                 if (len > max_delta) {
@@ -1672,6 +1728,11 @@ __global__ void abi41_pcg_update_solution_residual_z_device_alpha_kernel(Abi41So
 
     if (blockIdx.x == 0 && threadIdx.x == 0) {
         solver.pcg_reductions[kAbi41PcgReductionStatus] = status;
+        if (status != kAbi41PcgStatusOk
+            && status != kAbi41PcgStatusZeroResidual
+            && solver.pcg_guard_count) {
+            atomicAdd(solver.pcg_guard_count, 1ull);
+        }
     }
     if (status != kAbi41PcgStatusOk) {
         return;
@@ -1703,7 +1764,7 @@ __global__ void abi41_pcg_update_solution_residual_z_device_alpha_kernel(Abi41So
             local_sum = dot(safe_residual, z);
 
             if (apply_solution_now != 0) {
-                Vec3 delta = safe_solution;
+                Vec3 delta = mul(solver.pcg_search_dir[i], alpha);
                 const float len = length(delta);
                 const float max_delta = 0.25f;
                 if (len > max_delta) {
@@ -1721,6 +1782,68 @@ __global__ void abi41_pcg_update_solution_residual_z_device_alpha_kernel(Abi41So
     }
     if ((threadIdx.x & 31) == 0) {
         atomicAdd(&solver.pcg_reductions[kAbi41PcgReductionRZNext], local_sum);
+    }
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        solver.pcg_reductions[kAbi41PcgReductionIterations] += 1.0f;
+    }
+}
+
+__global__ void abi41_pcg_update_search_dir_kernel(Abi41Solver solver, float beta) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= solver.cfg.vertex_count || !solver.pcg_search_dir || !solver.pcg_z || !isfinite(beta)) {
+        return;
+    }
+    const bool pinned = solver.state_flags
+        && ((solver.state_flags[i] & ssbl_abi41::kPinnedOrKinematicFlag) != 0u);
+    if (solver.inv_mass[i] <= 0.0f || pinned) {
+        solver.pcg_search_dir[i] = make_vec3(0.0f, 0.0f, 0.0f);
+        return;
+    }
+    solver.pcg_search_dir[i] = fma_vec(solver.pcg_search_dir[i], beta, solver.pcg_z[i]);
+}
+
+__global__ void abi41_pcg_update_search_dir_device_beta_kernel(Abi41Solver solver) {
+    if (!solver.pcg_reductions) {
+        return;
+    }
+    const float status = solver.pcg_reductions[kAbi41PcgReductionStatus];
+    const float rz_old = solver.pcg_reductions[kAbi41PcgReductionRZ];
+    const float rz_new = solver.pcg_reductions[kAbi41PcgReductionRZNext];
+    if (status != kAbi41PcgStatusOk
+        || !isfinite(rz_old)
+        || !isfinite(rz_new)
+        || rz_old <= 1.0e-14f
+        || rz_new < 0.0f) {
+        return;
+    }
+    const float beta = rz_new / rz_old;
+    if (!isfinite(beta)) {
+        return;
+    }
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= solver.cfg.vertex_count || !solver.pcg_search_dir || !solver.pcg_z) {
+        return;
+    }
+    const bool pinned = solver.state_flags
+        && ((solver.state_flags[i] & ssbl_abi41::kPinnedOrKinematicFlag) != 0u);
+    if (solver.inv_mass[i] <= 0.0f || pinned) {
+        solver.pcg_search_dir[i] = make_vec3(0.0f, 0.0f, 0.0f);
+        return;
+    }
+    solver.pcg_search_dir[i] = fma_vec(solver.pcg_search_dir[i], beta, solver.pcg_z[i]);
+}
+
+__global__ void abi41_pcg_advance_iteration_kernel(Abi41Solver solver) {
+    if (blockIdx.x != 0 || threadIdx.x != 0 || !solver.pcg_reductions) {
+        return;
+    }
+    const float status = solver.pcg_reductions[kAbi41PcgReductionStatus];
+    const float rz_next = solver.pcg_reductions[kAbi41PcgReductionRZNext];
+    if (status == kAbi41PcgStatusOk && isfinite(rz_next) && rz_next >= 0.0f) {
+        solver.pcg_reductions[kAbi41PcgReductionRZ] = rz_next;
+        solver.pcg_reductions[kAbi41PcgReductionDAD] = 0.0f;
+        solver.pcg_reductions[kAbi41PcgReductionRZNext] = 0.0f;
+        solver.pcg_reductions[kAbi41PcgReductionStatus] = kAbi41PcgStatusOk;
     }
 }
 
@@ -1947,7 +2070,7 @@ __global__ void abi41_build_dynamic_triangle_pairs_kernel(Abi41Solver solver) {
     }
     if (best_penetration > 0.0f) {
         const int pair_index = atomicAdd(solver.triangle_pair_count, 1);
-        atomicAdd(&solver.abi41_counts[kAbi41CountTrianglePairs], 1ull);
+        abi41_count(solver, kAbi41CountTrianglePairs);
         if (pair_index < solver.triangle_pair_capacity) {
             TriangleProximityPair pair{};
             pair.vertex = i;
@@ -1956,7 +2079,7 @@ __global__ void abi41_build_dynamic_triangle_pairs_kernel(Abi41Solver solver) {
             pair.delta = best_delta;
             solver.triangle_pairs[pair_index] = pair;
         } else {
-            atomicAdd(&solver.abi41_counts[kAbi41CountTrianglePairOverflow], 1ull);
+            abi41_count(solver, kAbi41CountTrianglePairOverflow);
         }
     }
 }
@@ -1977,14 +2100,14 @@ __global__ void abi41_resolve_triangle_pairs_kernel(Abi41Solver solver) {
     }
     solver.pos[i] = add(solver.pos[i], pair.delta);
     if (pair.source == 1) {
-        atomicAdd(&solver.abi41_counts[kAbi41CountExactImpulseContacts], 1ull);
+        abi41_count(solver, kAbi41CountExactImpulseContacts);
     } else {
         float vn = dot(solver.vel[i], pair.delta);
         if (vn < 0.0f) {
             float len_sq = fmaxf(dot(pair.delta, pair.delta), kEps);
             solver.vel[i] = sub(solver.vel[i], mul(pair.delta, vn / len_sq));
         }
-        atomicAdd(&solver.abi41_counts[kAbi41CountHardFallbacks], 1ull);
+        abi41_count(solver, kAbi41CountHardFallbacks);
     }
 }
 
@@ -2013,7 +2136,7 @@ __global__ void abi41_build_dynamic_particle_hash_kernel(Abi41Solver solver) {
             static_cast<int>(bucket) * kAbi41ParticleHashBucketSlots + slot
         ] = particle;
     } else {
-        atomicAdd(&solver.abi41_counts[kAbi41CountDynamicParticleOverflow], 1ull);
+        abi41_count(solver, kAbi41CountDynamicParticleOverflow);
     }
 }
 
@@ -2039,7 +2162,7 @@ __device__ void consider_dynamic_particle_candidate(
     if (dist >= radius) {
         return;
     }
-    atomicAdd(&solver.abi41_counts[kAbi41CountDynamicParticleCandidates], 1ull);
+    abi41_count(solver, kAbi41CountDynamicParticleCandidates);
     Vec3 normal = dist > kEps ? mul(d, 1.0f / dist) : make_vec3(0.0f, 0.0f, 1.0f);
     float penetration = radius - dist;
     if (penetration > *best_penetration) {
@@ -2112,8 +2235,8 @@ __global__ void abi41_dynamic_particle_collision_kernel(Abi41Solver solver) {
     }
     if (best_penetration > 0.0f) {
         solver.pos[i] = add(p, best_delta);
-        atomicAdd(&solver.abi41_counts[kAbi41CountExactImpulseContacts], 1ull);
-        atomicAdd(&solver.abi41_counts[kAbi41CountDynamicParticleContacts], 1ull);
+        abi41_count(solver, kAbi41CountExactImpulseContacts);
+        abi41_count(solver, kAbi41CountDynamicParticleContacts);
     }
 }
 
@@ -2144,7 +2267,7 @@ __global__ void abi41_build_self_hash_kernel(Abi41Solver solver) {
     if (slot < kAbi41SelfHashBucketSlots) {
         solver.self_bucket_indices[static_cast<int>(bucket) * kAbi41SelfHashBucketSlots + slot] = i;
     } else {
-        atomicAdd(&solver.abi41_counts[kAbi41CountSelfOverflow], 1ull);
+        abi41_count(solver, kAbi41CountSelfOverflow);
     }
 }
 
@@ -2227,12 +2350,25 @@ __global__ void abi41_build_self_triangle_hash_kernel(Abi41Solver solver) {
     const float max_x = fmaxf(a.x, fmaxf(b.x, c.x)) + margin;
     const float max_y = fmaxf(a.y, fmaxf(b.y, c.y)) + margin;
     const float max_z = fmaxf(a.z, fmaxf(b.z, c.z)) + margin;
-    const int min_cx = cell_coord(min_x, solver.self_triangle_hash_cell_size);
-    const int min_cy = cell_coord(min_y, solver.self_triangle_hash_cell_size);
-    const int min_cz = cell_coord(min_z, solver.self_triangle_hash_cell_size);
-    const int max_cx = cell_coord(max_x, solver.self_triangle_hash_cell_size);
-    const int max_cy = cell_coord(max_y, solver.self_triangle_hash_cell_size);
-    const int max_cz = cell_coord(max_z, solver.self_triangle_hash_cell_size);
+    int min_cx = cell_coord(min_x, solver.self_triangle_hash_cell_size);
+    int min_cy = cell_coord(min_y, solver.self_triangle_hash_cell_size);
+    int min_cz = cell_coord(min_z, solver.self_triangle_hash_cell_size);
+    int max_cx = cell_coord(max_x, solver.self_triangle_hash_cell_size);
+    int max_cy = cell_coord(max_y, solver.self_triangle_hash_cell_size);
+    int max_cz = cell_coord(max_z, solver.self_triangle_hash_cell_size);
+    const Vec3 centroid = mul(add(add(a, b), c), 1.0f / 3.0f);
+    abi41_guard_self_hash_primitive(
+        solver,
+        &min_cx,
+        &max_cx,
+        &min_cy,
+        &max_cy,
+        &min_cz,
+        &max_cz,
+        cell_coord(centroid.x, solver.self_triangle_hash_cell_size),
+        cell_coord(centroid.y, solver.self_triangle_hash_cell_size),
+        cell_coord(centroid.z, solver.self_triangle_hash_cell_size)
+    );
     solver.self_triangle_cell_coords[triangle_index * 3 + 0] = min_cx;
     solver.self_triangle_cell_coords[triangle_index * 3 + 1] = min_cy;
     solver.self_triangle_cell_coords[triangle_index * 3 + 2] = min_cz;
@@ -2247,7 +2383,7 @@ __global__ void abi41_build_self_triangle_hash_kernel(Abi41Solver solver) {
                         static_cast<int>(bucket) * kAbi41SelfTriangleHashBucketSlots + slot
                     ] = triangle_index;
                 } else {
-                    atomicAdd(&solver.abi41_counts[kAbi41CountSelfOverflow], 1ull);
+                    abi41_count(solver, kAbi41CountSelfOverflow);
                 }
             }
         }
@@ -2346,7 +2482,7 @@ __global__ void abi41_build_self_neighbor_table_hash_kernel(Abi41Solver solver) 
         }
     }
     if (accepted >= kAbi41SelfCollisionNeighborSlots) {
-        atomicAdd(&solver.abi41_counts[kAbi41CountSelfOverflow], 1ull);
+        abi41_count(solver, kAbi41CountSelfOverflow);
     }
     solver.self_collision_counts[source] = accepted;
 }
@@ -2372,7 +2508,7 @@ __global__ void abi41_build_self_neighbor_table_kernel(Abi41Solver solver) {
         ++accepted;
     }
     if (accepted >= kAbi41SelfCollisionNeighborSlots) {
-        atomicAdd(&solver.abi41_counts[kAbi41CountSelfOverflow], 1ull);
+        abi41_count(solver, kAbi41CountSelfOverflow);
     }
     solver.self_collision_counts[source] = accepted;
 }
@@ -2405,7 +2541,7 @@ __global__ void abi41_set_self_collision_repulsion_kernel(Abi41Solver solver) {
         if (other < 0 || other >= solver.cfg.vertex_count || other == source) {
             continue;
         }
-        atomicAdd(&solver.abi41_counts[kAbi41CountSelfCandidates], 1ull);
+        abi41_count(solver, kAbi41CountSelfCandidates);
         const Vec3 q_curr = solver.pos[other];
         const Vec3 q_prev = solver.prev[other];
         const float thickness = r_self + solver.self_collision_radii[other];
@@ -2482,7 +2618,7 @@ __global__ void abi41_set_self_collision_repulsion_kernel(Abi41Solver solver) {
                 response = mul(response, max_len / response_len);
             }
             abi41_accumulate_self_delta(solver, source, response, 1.0f);
-            atomicAdd(&solver.abi41_counts[kAbi41CountExactImpulseContacts], 1ull);
+            abi41_count(solver, kAbi41CountExactImpulseContacts);
         }
     }
 }
@@ -2552,7 +2688,7 @@ __device__ bool abi41_apply_soft_vertex_triangle_pair(
     if (dist >= onset) {
         return false;
     }
-    atomicAdd(&solver.abi41_counts[kAbi41CountSelfCandidates], 1ull);
+    abi41_count(solver, kAbi41CountSelfCandidates);
 
     Vec3 normal = make_vec3(0.0f, 0.0f, 1.0f);
     if (dist_sq > kEps) {
@@ -2614,7 +2750,7 @@ __device__ bool abi41_apply_soft_vertex_triangle_pair(
     if (wtc > 0.0f) {
         abi41_accumulate_self_delta(solver, ic, mul(delta, -wtc), 1.0f);
     }
-    atomicAdd(&solver.abi41_counts[kAbi41CountSoftContacts], 1ull);
+    abi41_count(solver, kAbi41CountSoftContacts);
     return true;
 }
 
@@ -2798,12 +2934,25 @@ __global__ void abi41_build_self_edge_hash_kernel(Abi41Solver solver) {
     const float max_x = fmaxf(a.x, b.x) + margin;
     const float max_y = fmaxf(a.y, b.y) + margin;
     const float max_z = fmaxf(a.z, b.z) + margin;
-    const int min_cx = cell_coord(min_x, solver.self_edge_hash_cell_size);
-    const int min_cy = cell_coord(min_y, solver.self_edge_hash_cell_size);
-    const int min_cz = cell_coord(min_z, solver.self_edge_hash_cell_size);
-    const int max_cx = cell_coord(max_x, solver.self_edge_hash_cell_size);
-    const int max_cy = cell_coord(max_y, solver.self_edge_hash_cell_size);
-    const int max_cz = cell_coord(max_z, solver.self_edge_hash_cell_size);
+    int min_cx = cell_coord(min_x, solver.self_edge_hash_cell_size);
+    int min_cy = cell_coord(min_y, solver.self_edge_hash_cell_size);
+    int min_cz = cell_coord(min_z, solver.self_edge_hash_cell_size);
+    int max_cx = cell_coord(max_x, solver.self_edge_hash_cell_size);
+    int max_cy = cell_coord(max_y, solver.self_edge_hash_cell_size);
+    int max_cz = cell_coord(max_z, solver.self_edge_hash_cell_size);
+    const Vec3 mid = mul(add(a, b), 0.5f);
+    abi41_guard_self_hash_primitive(
+        solver,
+        &min_cx,
+        &max_cx,
+        &min_cy,
+        &max_cy,
+        &min_cz,
+        &max_cz,
+        cell_coord(mid.x, solver.self_edge_hash_cell_size),
+        cell_coord(mid.y, solver.self_edge_hash_cell_size),
+        cell_coord(mid.z, solver.self_edge_hash_cell_size)
+    );
     solver.self_edge_cell_coords[edge_index * 3 + 0] = min_cx;
     solver.self_edge_cell_coords[edge_index * 3 + 1] = min_cy;
     solver.self_edge_cell_coords[edge_index * 3 + 2] = min_cz;
@@ -2818,14 +2967,20 @@ __global__ void abi41_build_self_edge_hash_kernel(Abi41Solver solver) {
                         static_cast<int>(bucket) * kAbi41SelfEdgeHashBucketSlots + slot
                     ] = edge_index;
                 } else {
-                    atomicAdd(&solver.abi41_counts[kAbi41CountSelfOverflow], 1ull);
+                    abi41_count(solver, kAbi41CountSelfOverflow);
                 }
             }
         }
     }
 }
 
-__device__ bool abi41_apply_soft_edge_edge_pair(Abi41Solver solver, int edge_a_index, int edge_b_index, float target, float onset) {
+__device__ bool abi41_apply_soft_edge_edge_pair(
+    Abi41Solver solver,
+    int edge_a_index,
+    int edge_b_index,
+    float target,
+    float onset
+) {
     if (edge_b_index <= edge_a_index
         || edge_a_index < 0
         || edge_b_index < 0
@@ -2858,7 +3013,7 @@ __device__ bool abi41_apply_soft_edge_edge_pair(Abi41Solver solver, int edge_a_i
     if (dist >= onset) {
         return false;
     }
-    atomicAdd(&solver.abi41_counts[kAbi41CountSelfCandidates], 1ull);
+    abi41_count(solver, kAbi41CountSelfCandidates);
 
     Vec3 normal = make_vec3(0.0f, 0.0f, 1.0f);
     if (dist_sq > kEps) {
@@ -2921,7 +3076,7 @@ __device__ bool abi41_apply_soft_edge_edge_pair(Abi41Solver solver, int edge_a_i
     if (wb1 > 0.0f) {
         abi41_accumulate_self_delta(solver, b1, mul(delta, -wb1), 1.0f);
     }
-    atomicAdd(&solver.abi41_counts[kAbi41CountEdgeEdgeContacts], 1ull);
+    abi41_count(solver, kAbi41CountEdgeEdgeContacts);
     return true;
 }
 
@@ -4049,6 +4204,46 @@ bool fetch_pcg_reductions(Abi41Solver* solver, float* out_values, const char* la
     );
 }
 
+bool update_pcg_diag_from_device_reductions(Abi41Solver* solver, const char* label) {
+    if (!solver || !solver->pcg_reductions) {
+        return true;
+    }
+    float reductions[kAbi41PcgReductionSlots]{};
+    if (!fetch_pcg_reductions(solver, reductions, label)) {
+        return false;
+    }
+
+    float initial_rz = reductions[kAbi41PcgReductionInitialRZ];
+    if ((!std::isfinite(initial_rz) || initial_rz <= 0.0f)
+        && std::isfinite(reductions[kAbi41PcgReductionRZ])
+        && reductions[kAbi41PcgReductionRZ] >= 0.0f) {
+        initial_rz = reductions[kAbi41PcgReductionRZ];
+    }
+    if (std::isfinite(initial_rz) && initial_rz >= 0.0f) {
+        const float initial_residual = sqrtf(fmaxf(initial_rz, 0.0f));
+        solver->diag.abi41_pcg_initial_residual = fmaxf(
+            solver->diag.abi41_pcg_initial_residual,
+            initial_residual
+        );
+        if (solver->diag.abi41_pcg_final_residual <= 0.0f) {
+            solver->diag.abi41_pcg_final_residual = initial_residual;
+        }
+    }
+
+    const float status = reductions[kAbi41PcgReductionStatus];
+    const float final_rz = status == kAbi41PcgStatusZeroResidual
+        ? reductions[kAbi41PcgReductionRZ]
+        : reductions[kAbi41PcgReductionRZNext];
+    if ((status == kAbi41PcgStatusOk || status == kAbi41PcgStatusZeroResidual)
+        && std::isfinite(final_rz)
+        && final_rz >= 0.0f) {
+        solver->diag.abi41_pcg_final_residual = sqrtf(fmaxf(final_rz, 0.0f));
+    } else if (status != kAbi41PcgStatusOk && status != kAbi41PcgStatusZeroResidual) {
+        solver->diag.abi41_pcg_guarded += 1;
+    }
+    return true;
+}
+
 bool run_abi41_hard_stretch_pcg(Abi41Solver* solver, int v_blocks, int e_blocks) {
     if (!solver || !solver->cfg.stretch_optimization_enabled || solver->cfg.stretch_optimization_strength <= 0.0f) {
         return true;
@@ -4057,108 +4252,130 @@ bool run_abi41_hard_stretch_pcg(Abi41Solver* solver, int v_blocks, int e_blocks)
         return set_error("PCG stretch optimization is enabled without a ready CSR texture");
     }
 
+    const auto system_started = std::chrono::high_resolution_clock::now();
     abi41_pcg_reset_vertex_kernel<<<v_blocks, kThreads>>>(*solver);
+    if (solver->pcg_offdiag_texels && solver->pcg_csr_nnz > 0) {
+        if (!set_cuda_error(
+                cudaMemset(
+                    solver->pcg_offdiag_texels,
+                    0,
+                    sizeof(float4) * static_cast<size_t>(solver->pcg_csr_nnz) * 2u),
+                "reset PCG offdiag texture buffer")) {
+            return false;
+        }
+    }
     abi41_pcg_build_stretch_system_kernel<<<e_blocks, kThreads>>>(*solver);
     abi41_pcg_finalize_preconditioner_kernel<<<v_blocks, kThreads>>>(*solver);
     if (!set_cuda_error(cudaGetLastError(), "launch PCG stretch system build")) {
         return false;
     }
+    solver->diag.abi41_pcg_system_ms += elapsed_ms_since(system_started);
 
+    const auto solve_started = std::chrono::high_resolution_clock::now();
+    if (kAbi41PcgMaxIterations > 1) {
+        abi41_pcg_prepare_iteration_kernel<<<1, 1>>>(*solver, 1);
+        if (!set_cuda_error(cudaGetLastError(), "launch PCG iteration prepare")) {
+            return false;
+        }
+    }
     if (abi41_pcg_device_scalar_enabled()) {
+        for (int iteration = 0; iteration < kAbi41PcgMaxIterations; ++iteration) {
+            const auto ad_started = std::chrono::high_resolution_clock::now();
+            abi41_pcg_compute_ad_kernel<<<v_blocks, kThreads>>>(*solver);
+            solver->diag.abi41_pcg_ad_ms += elapsed_ms_since(ad_started);
+            abi41_pcg_update_solution_residual_z_device_alpha_kernel<<<v_blocks, kThreads>>>(*solver, 1);
+            if (iteration + 1 < kAbi41PcgMaxIterations) {
+                abi41_pcg_update_search_dir_device_beta_kernel<<<v_blocks, kThreads>>>(*solver);
+                abi41_pcg_advance_iteration_kernel<<<1, 1>>>(*solver);
+            }
+            if (!set_cuda_error(cudaGetLastError(), "launch PCG device-scalar iteration")) {
+                return false;
+            }
+        }
+        // Device-scalar PCG computes alpha/status on the GPU. Do not fetch the
+        // reduction slots here: that D2H read serializes every substep and can
+        // accidentally absorb pending collision work into the PCG timing.
+        solver->diag.abi41_pcg_iterations += kAbi41PcgMaxIterations;
+        solver->diag.abi41_pcg_solve_ms += elapsed_ms_since(solve_started);
+        return true;
+    }
+
+    float initial_rz = 0.0f;
+    float final_rz = 0.0f;
+    for (int iteration = 0; iteration < kAbi41PcgMaxIterations; ++iteration) {
+        float rz_old = 0.0f;
+        if (!fetch_pcg_reduction(solver, kAbi41PcgReductionRZ, &rz_old, "fetch PCG residual")) {
+            return false;
+        }
+        if (!std::isfinite(rz_old) || rz_old < 0.0f) {
+            solver->diag.abi41_pcg_guarded += 1;
+            solver->diag.abi41_pcg_solve_ms += elapsed_ms_since(solve_started);
+            return true;
+        }
+        if (iteration == 0) {
+            initial_rz = rz_old;
+            const float initial_residual = sqrtf(fmaxf(initial_rz, 0.0f));
+            solver->diag.abi41_pcg_initial_residual = fmaxf(
+                solver->diag.abi41_pcg_initial_residual,
+                initial_residual
+            );
+            solver->diag.abi41_pcg_final_residual = initial_residual;
+        }
+        if (rz_old <= 1.0e-14f) {
+            break;
+        }
+
+        const auto ad_started = std::chrono::high_resolution_clock::now();
         abi41_pcg_compute_ad_kernel<<<v_blocks, kThreads>>>(*solver);
-        abi41_pcg_update_solution_residual_z_device_alpha_kernel<<<v_blocks, kThreads>>>(*solver, 1);
-        if (!set_cuda_error(cudaGetLastError(), "launch PCG device-scalar solve")) {
+        if (!set_cuda_error(cudaGetLastError(), "launch PCG dAd reduction")) {
             return false;
         }
-
-        float reductions[kAbi41PcgReductionSlots]{};
-        if (!fetch_pcg_reductions(solver, reductions, "fetch PCG device-scalar reductions")) {
+        float dad = 0.0f;
+        if (!fetch_pcg_reduction(solver, kAbi41PcgReductionDAD, &dad, "fetch PCG dAd")) {
             return false;
         }
-
-        const float rz_old = reductions[kAbi41PcgReductionRZ];
-        const float rz_new = reductions[kAbi41PcgReductionRZNext];
-        const float status = reductions[kAbi41PcgReductionStatus];
-        if (!std::isfinite(rz_old) || rz_old < 0.0f || status == kAbi41PcgStatusBadResidual) {
+        solver->diag.abi41_pcg_ad_ms += elapsed_ms_since(ad_started);
+        if (!std::isfinite(dad) || dad <= 1.0e-14f) {
             solver->diag.abi41_pcg_guarded += 1;
-            return true;
+            break;
         }
 
-        const float initial_residual = sqrtf(fmaxf(rz_old, 0.0f));
-        solver->diag.abi41_pcg_initial_residual = fmaxf(
-            solver->diag.abi41_pcg_initial_residual,
-            initial_residual
-        );
-        solver->diag.abi41_pcg_final_residual = initial_residual;
-        if (status == kAbi41PcgStatusZeroResidual || rz_old <= 1.0e-14f) {
-            return true;
-        }
-        if (status != kAbi41PcgStatusOk) {
+        const float alpha = rz_old / dad;
+        if (!std::isfinite(alpha)) {
             solver->diag.abi41_pcg_guarded += 1;
-            return true;
+            break;
+        }
+        abi41_pcg_update_solution_residual_z_kernel<<<v_blocks, kThreads>>>(*solver, alpha, 1);
+        if (!set_cuda_error(cudaGetLastError(), "launch PCG residual update")) {
+            return false;
+        }
+        float rz_new = 0.0f;
+        if (!fetch_pcg_reduction(solver, kAbi41PcgReductionRZNext, &rz_new, "fetch PCG updated residual")) {
+            return false;
         }
         if (!std::isfinite(rz_new) || rz_new < 0.0f) {
             solver->diag.abi41_pcg_guarded += 1;
-            return true;
+            break;
         }
 
-        solver->diag.abi41_pcg_iterations += kAbi41PcgMaxIterations;
-        solver->diag.abi41_pcg_final_residual = sqrtf(fmaxf(rz_new, 0.0f));
-        return true;
+        final_rz = rz_new;
+        solver->diag.abi41_pcg_iterations += 1;
+        solver->diag.abi41_pcg_final_residual = sqrtf(fmaxf(final_rz, 0.0f));
+        if (iteration + 1 >= kAbi41PcgMaxIterations || rz_new <= 1.0e-14f) {
+            break;
+        }
+        const float beta = rz_new / rz_old;
+        if (!std::isfinite(beta)) {
+            solver->diag.abi41_pcg_guarded += 1;
+            break;
+        }
+        abi41_pcg_update_search_dir_kernel<<<v_blocks, kThreads>>>(*solver, beta);
+        abi41_pcg_advance_iteration_kernel<<<1, 1>>>(*solver);
+        if (!set_cuda_error(cudaGetLastError(), "launch PCG search direction update")) {
+            return false;
+        }
     }
-
-    float rz_old = 0.0f;
-    if (!fetch_pcg_reduction(solver, kAbi41PcgReductionRZ, &rz_old, "fetch PCG initial residual")) {
-        return false;
-    }
-    if (!std::isfinite(rz_old) || rz_old < 0.0f) {
-        solver->diag.abi41_pcg_guarded += 1;
-        return true;
-    }
-
-    const float initial_residual = sqrtf(fmaxf(rz_old, 0.0f));
-    solver->diag.abi41_pcg_initial_residual = fmaxf(
-        solver->diag.abi41_pcg_initial_residual,
-        initial_residual
-    );
-    solver->diag.abi41_pcg_final_residual = initial_residual;
-    if (rz_old <= 1.0e-14f) {
-        return true;
-    }
-
-    abi41_pcg_compute_ad_kernel<<<v_blocks, kThreads>>>(*solver);
-    if (!set_cuda_error(cudaGetLastError(), "launch PCG dAd reduction")) {
-        return false;
-    }
-    float dad = 0.0f;
-    if (!fetch_pcg_reduction(solver, kAbi41PcgReductionDAD, &dad, "fetch PCG dAd")) {
-        return false;
-    }
-    if (!std::isfinite(dad) || dad <= 1.0e-14f) {
-        solver->diag.abi41_pcg_guarded += 1;
-        return true;
-    }
-
-    const float alpha = rz_old / dad;
-    if (!std::isfinite(alpha)) {
-        solver->diag.abi41_pcg_guarded += 1;
-        return true;
-    }
-    abi41_pcg_update_solution_residual_z_kernel<<<v_blocks, kThreads>>>(*solver, alpha, 1);
-    if (!set_cuda_error(cudaGetLastError(), "launch PCG residual update")) {
-        return false;
-    }
-    float rz_new = 0.0f;
-    if (!fetch_pcg_reduction(solver, kAbi41PcgReductionRZNext, &rz_new, "fetch PCG updated residual")) {
-        return false;
-    }
-    if (!std::isfinite(rz_new) || rz_new < 0.0f) {
-        solver->diag.abi41_pcg_guarded += 1;
-        return true;
-    }
-
-    solver->diag.abi41_pcg_iterations += kAbi41PcgMaxIterations;
-    solver->diag.abi41_pcg_final_residual = sqrtf(fmaxf(rz_new, 0.0f));
+    solver->diag.abi41_pcg_solve_ms += elapsed_ms_since(solve_started);
     return true;
 }
 
@@ -4210,6 +4427,7 @@ bool fetch_abi41_counts(Abi41Solver* solver) {
     solver->diag.dynamic_particle_candidate_count = static_cast<long long>(counts[kAbi41CountDynamicParticleCandidates]);
     solver->diag.dynamic_particle_contacts = static_cast<long long>(counts[kAbi41CountDynamicParticleContacts]);
     solver->diag.dynamic_particle_overflow = 0;
+    solver->diag.self_candidate_count = static_cast<long long>(counts[kAbi41CountSelfCandidates]);
     solver->diag.static_sdf_contact_count = static_cast<long long>(counts[kAbi41CountStaticSdfContacts]);
     solver->diag.candidate_count = static_cast<long long>(
         counts[kAbi41CountDynamicParticleCandidates] + counts[kAbi41CountTrianglePairs]
@@ -4226,6 +4444,9 @@ bool fetch_abi41_counts(Abi41Solver* solver) {
     solver->diag.abi41_bending_texture_ready = solver->bending_texture_ready;
     solver->diag.abi41_tack_jitter_guarded = static_cast<long long>(counts[kAbi41CountTackGuards]);
     solver->diag.abi41_bending_guarded = static_cast<long long>(counts[kAbi41CountBendingGuards]);
+    if (!update_pcg_diag_from_device_reductions(solver, "fetch final PCG reductions")) {
+        return false;
+    }
     if (solver->pcg_guard_count) {
         unsigned long long guarded = 0;
         if (!set_cuda_error(
@@ -4781,6 +5002,11 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
         || solver->runtime_colliders.use_wall != 0
         || solver->runtime_colliders.use_sphere != 0
     );
+    const bool stretch_pcg_enabled = (
+        solver->cfg.edge_count > 0
+        && solver->cfg.stretch_optimization_enabled
+        && solver->cfg.stretch_optimization_strength > 0.0f
+    );
     for (int s = 0; s < substeps; ++s) {
         abi41_integrate_kernel<<<v_blocks, kThreads>>>(*solver, sub_dt);
         if (solver->pin_count > 0) {
@@ -4790,15 +5016,13 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
             return 0;
         }
         for (int it = 0; it < iterations; ++it) {
-            const bool run_stretch_pcg = (
-                solver->cfg.edge_count > 0
-                && solver->cfg.stretch_optimization_enabled
-                && solver->cfg.stretch_optimization_strength > 0.0f
-                && s == substeps - 1
+            const bool run_stretch_pcg = stretch_pcg_enabled
                 && it == iterations - 1
-            );
-            if (solver->cfg.edge_count > 0 && !run_stretch_pcg) {
+                && (((s + 1) % kAbi41PcgSubstepCadence) == 0 || s == substeps - 1);
+            if (solver->cfg.edge_count > 0 && !stretch_pcg_enabled) {
+                const auto direct_stretch_started = std::chrono::high_resolution_clock::now();
                 abi41_spring_project_kernel<<<e_blocks, kThreads>>>(*solver, sub_dt);
+                solver->diag.abi41_direct_stretch_ms += elapsed_ms_since(direct_stretch_started);
             }
             if (run_stretch_pcg) {
                 if (!run_abi41_hard_stretch_pcg(solver, v_blocks, e_blocks)) {
@@ -4824,24 +5048,48 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
                 solver->diag.static_collision_ms += elapsed_ms_since(static_started);
             }
             const bool run_dynamic_collision = (it == iterations - 1);
-            if (run_dynamic_collision && solver->dynamic_triangle_count > 0) {
-                const auto dynamic_started = std::chrono::high_resolution_clock::now();
-                if (!set_cuda_error(cudaMemset(solver->triangle_pair_count, 0, sizeof(int)), "reset dynamic triangle pair count")) {
-                    return 0;
+            if (run_dynamic_collision) {
+                if (solver->dynamic_triangle_count > 0) {
+                    const auto dynamic_started = std::chrono::high_resolution_clock::now();
+                    if (!set_cuda_error(cudaMemset(solver->triangle_pair_count, 0, sizeof(int)), "reset dynamic triangle pair count")) {
+                        return 0;
+                    }
+                    abi41_build_dynamic_triangle_pairs_kernel<<<v_blocks, kThreads>>>(*solver);
+                    const int resolve_capacity = std::min(solver->triangle_pair_capacity, solver->cfg.vertex_count);
+                    if (resolve_capacity > 0) {
+                        abi41_resolve_triangle_pairs_kernel<<<block_count(resolve_capacity), kThreads>>>(*solver);
+                    } else {
+                        solver->diag.dynamic_collision_skipped_launches += 1;
+                    }
+                    solver->diag.dynamic_collision_ms += elapsed_ms_since(dynamic_started);
+                } else if (solver->dynamic_triangle_capacity > 0) {
+                    solver->diag.dynamic_collision_skipped_launches += 1;
                 }
-                abi41_build_dynamic_triangle_pairs_kernel<<<v_blocks, kThreads>>>(*solver);
-                abi41_resolve_triangle_pairs_kernel<<<block_count(solver->triangle_pair_capacity), kThreads>>>(*solver);
-                solver->diag.dynamic_collision_ms += elapsed_ms_since(dynamic_started);
-            }
-            if (run_dynamic_collision && solver->dynamic_particle_count > 0) {
-                const auto dynamic_particle_started = std::chrono::high_resolution_clock::now();
-                abi41_dynamic_particle_collision_kernel<<<v_blocks, kThreads>>>(*solver);
-                solver->diag.dynamic_particle_collision_ms += elapsed_ms_since(dynamic_particle_started);
+                if (solver->dynamic_particle_count > 0) {
+                    const auto dynamic_particle_started = std::chrono::high_resolution_clock::now();
+                    abi41_dynamic_particle_collision_kernel<<<v_blocks, kThreads>>>(*solver);
+                    solver->diag.dynamic_particle_collision_ms += elapsed_ms_since(dynamic_particle_started);
+                } else if (solver->dynamic_particle_capacity > 0) {
+                    solver->diag.dynamic_collision_skipped_launches += 1;
+                }
             }
             const int self_interval = std::max(solver->cfg.self_collision_interval, 1);
-            const bool run_self_collision = solver->cfg.self_collision
-                && it == iterations - 1
+            const bool self_collision_iteration = solver->cfg.self_collision
+                && it == iterations - 1;
+            const bool scheduled_self_collision = self_collision_iteration
                 && (((s + 1) % self_interval) == 0 || s == substeps - 1);
+            const float self_collision_width = std::max(
+                std::max(solver->cfg.cloth_thickness, solver->cfg.collision_margin),
+                0.0f
+            );
+            const bool run_self_collision = scheduled_self_collision
+                && solver->cfg.vertex_count > 0
+                && self_collision_width > 0.0f;
+            if (scheduled_self_collision && !run_self_collision) {
+                solver->diag.self_collision_skipped_launches += 1;
+            } else if (self_collision_iteration && !scheduled_self_collision) {
+                solver->diag.self_collision_skipped_launches += 1;
+            }
             if (run_self_collision) {
                 if (solver->self_hash_ready != 0) {
                     const auto self_hash_started = std::chrono::high_resolution_clock::now();

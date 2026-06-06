@@ -284,6 +284,17 @@ class _NativeDiagnostics(ctypes.Structure):
         ("dynamic_particle_upload_ms", ctypes.c_float),
         ("dynamic_collider_cache_hits", ctypes.c_longlong),
         ("dynamic_collider_cache_misses", ctypes.c_longlong),
+        ("abi41_pcg_solve_ms", ctypes.c_float),
+        ("abi41_pcg_system_ms", ctypes.c_float),
+        ("abi41_pcg_ad_ms", ctypes.c_float),
+        ("abi41_direct_stretch_ms", ctypes.c_float),
+        ("dynamic_pair_cache_hits", ctypes.c_longlong),
+        ("dynamic_pair_cache_misses", ctypes.c_longlong),
+        ("dynamic_pair_cache_reused_triangles", ctypes.c_longlong),
+        ("dynamic_pair_cache_reused_particles", ctypes.c_longlong),
+        ("dynamic_collision_skipped_launches", ctypes.c_longlong),
+        ("self_collision_skipped_launches", ctypes.c_longlong),
+        ("self_candidate_count", ctypes.c_longlong),
     ]
 
 
@@ -413,6 +424,17 @@ class NativeStepDiagnostics:
     dynamic_particle_upload_ms: float = 0.0
     dynamic_collider_cache_hits: int = 0
     dynamic_collider_cache_misses: int = 0
+    abi41_pcg_solve_ms: float = 0.0
+    abi41_pcg_system_ms: float = 0.0
+    abi41_pcg_ad_ms: float = 0.0
+    abi41_direct_stretch_ms: float = 0.0
+    dynamic_pair_cache_hits: int = 0
+    dynamic_pair_cache_misses: int = 0
+    dynamic_pair_cache_reused_triangles: int = 0
+    dynamic_pair_cache_reused_particles: int = 0
+    dynamic_collision_skipped_launches: int = 0
+    self_collision_skipped_launches: int = 0
+    self_candidate_count: int = 0
     frame_ms: float = 0.0
     frame_set_ms: float = 0.0
     input_refresh_ms: float = 0.0
@@ -683,6 +705,7 @@ def _as_force_field_ptr(arr):
 class NativeXpbdSolver:
     def __init__(self, cloth: ClothBuildData, options: SolverOptions, static_triangles: np.ndarray):
         self._lib = _load_library()
+        self._is_abi41_abi39 = "abi39" in os.path.basename(dll_path()).lower()
         if bool(getattr(options, "stretch_optimization_enabled", False)):
             if (_capabilities(self._lib) & _CAP_STRETCH_OPTIMIZATION) == 0:
                 raise NativeSolverError(
@@ -837,18 +860,24 @@ class NativeXpbdSolver:
             (dynamic_particles or {}).get("radii", np.empty(0, dtype=np.float32)),
             dtype=np.float32,
         ).reshape((-1,))
-        particle_inv_mass = np.ascontiguousarray(
-            (dynamic_particles or {}).get("inv_mass", np.empty(0, dtype=np.float32)),
-            dtype=np.float32,
-        ).reshape((-1,))
-        particle_slot_ids = np.ascontiguousarray(
-            (dynamic_particles or {}).get("slot_ids", np.empty(0, dtype=np.int32)),
-            dtype=np.int32,
-        ).reshape((-1,))
-        particle_phases = np.ascontiguousarray(
-            (dynamic_particles or {}).get("phases", np.empty(0, dtype=np.int32)),
-            dtype=np.int32,
-        ).reshape((-1,))
+        needs_particle_extras = dynamic_particle_count > 0 and not bool(getattr(self, "_is_abi41_abi39", False))
+        if needs_particle_extras:
+            particle_inv_mass = np.ascontiguousarray(
+                (dynamic_particles or {}).get("inv_mass", np.ones(dynamic_particle_count, dtype=np.float32)),
+                dtype=np.float32,
+            ).reshape((-1,))
+            particle_slot_ids = np.ascontiguousarray(
+                (dynamic_particles or {}).get("slot_ids", np.ones(dynamic_particle_count, dtype=np.int32)),
+                dtype=np.int32,
+            ).reshape((-1,))
+            particle_phases = np.ascontiguousarray(
+                (dynamic_particles or {}).get("phases", np.ones(dynamic_particle_count, dtype=np.int32)),
+                dtype=np.int32,
+            ).reshape((-1,))
+        else:
+            particle_inv_mass = np.empty(0, dtype=np.float32)
+            particle_slot_ids = np.empty(0, dtype=np.int32)
+            particle_phases = np.empty(0, dtype=np.int32)
         if dynamic_particle_count <= 0:
             particle_radii = np.empty(0, dtype=np.float32)
             particle_inv_mass = np.empty(0, dtype=np.float32)
@@ -856,9 +885,9 @@ class NativeXpbdSolver:
             particle_phases = np.empty(0, dtype=np.int32)
         elif not (
             len(particle_radii) == dynamic_particle_count
-            and len(particle_inv_mass) == dynamic_particle_count
-            and len(particle_slot_ids) == dynamic_particle_count
-            and len(particle_phases) == dynamic_particle_count
+            and (not needs_particle_extras or len(particle_inv_mass) == dynamic_particle_count)
+            and (not needs_particle_extras or len(particle_slot_ids) == dynamic_particle_count)
+            and (not needs_particle_extras or len(particle_phases) == dynamic_particle_count)
         ):
             raise NativeSolverError("Dynamic particle arrays must have matching lengths.")
         force_field_arr = _force_field_array(force_fields)
@@ -1055,6 +1084,17 @@ class NativeXpbdSolver:
             dynamic_particle_upload_ms=float(raw.dynamic_particle_upload_ms),
             dynamic_collider_cache_hits=int(raw.dynamic_collider_cache_hits),
             dynamic_collider_cache_misses=int(raw.dynamic_collider_cache_misses),
+            abi41_pcg_solve_ms=float(raw.abi41_pcg_solve_ms),
+            abi41_pcg_system_ms=float(raw.abi41_pcg_system_ms),
+            abi41_pcg_ad_ms=float(raw.abi41_pcg_ad_ms),
+            abi41_direct_stretch_ms=float(raw.abi41_direct_stretch_ms),
+            dynamic_pair_cache_hits=int(raw.dynamic_pair_cache_hits),
+            dynamic_pair_cache_misses=int(raw.dynamic_pair_cache_misses),
+            dynamic_pair_cache_reused_triangles=int(raw.dynamic_pair_cache_reused_triangles),
+            dynamic_pair_cache_reused_particles=int(raw.dynamic_pair_cache_reused_particles),
+            dynamic_collision_skipped_launches=int(raw.dynamic_collision_skipped_launches),
+            self_collision_skipped_launches=int(raw.self_collision_skipped_launches),
+            self_candidate_count=int(raw.self_candidate_count),
         )
         self._last_diagnostics = diag
         return diag

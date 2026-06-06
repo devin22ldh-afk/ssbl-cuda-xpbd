@@ -189,6 +189,17 @@ typedef struct SsblXpbdDiagnostics {
     float dynamic_particle_upload_ms;
     long long dynamic_collider_cache_hits;
     long long dynamic_collider_cache_misses;
+    float abi41_pcg_solve_ms;
+    float abi41_pcg_system_ms;
+    float abi41_pcg_ad_ms;
+    float abi41_direct_stretch_ms;
+    long long dynamic_pair_cache_hits;
+    long long dynamic_pair_cache_misses;
+    long long dynamic_pair_cache_reused_triangles;
+    long long dynamic_pair_cache_reused_particles;
+    long long dynamic_collision_skipped_launches;
+    long long self_collision_skipped_launches;
+    long long self_candidate_count;
 } SsblXpbdDiagnostics;
 
 typedef struct SsblXpbdMesh {

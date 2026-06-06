@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import hashlib
 import math
 import os
@@ -20,6 +20,7 @@ from .native_backend import NativeStepDiagnostics, NativeXpbdSolver, status as n
 from .xpbd_core import (
     ClothBuildData,
     PinAttachmentBatch,
+    SELF_COLLISION_FAST,
     build_cloth_data,
     clear_cloth_topology_cache,
     make_pin_attachment_batch,
@@ -42,6 +43,8 @@ _AUTO_WRITEBACK_INTERVAL = 0
 _MIN_WRITEBACK_INTERVAL = 1
 _MAX_AUTO_WRITEBACK_INTERVAL = 8
 _WRITEBACK_EWMA_ALPHA = 0.25
+_PREVIEW_SELF_COLLISION_BUDGET_VERTEX_THRESHOLD = 4096
+_PREVIEW_SELF_COLLISION_BUDGET_TRIANGLE_THRESHOLD = 8192
 STATUS_IDLE = "Idle"
 STATUS_PREVIEW_RUNNING = "Preview Running"
 STATUS_PREVIEW_PAUSED = "Preview Paused"
@@ -81,6 +84,10 @@ class FramePerf:
     dynamic_collider_pack_ms: float = 0.0
     dynamic_collider_cache_hits: int = 0
     dynamic_collider_cache_misses: int = 0
+    dynamic_pair_cache_hits: int = 0
+    dynamic_pair_cache_misses: int = 0
+    dynamic_pair_cache_reused_triangles: int = 0
+    dynamic_pair_cache_reused_particles: int = 0
     dynamic_triangle_count: int = 0
     dynamic_particle_count: int = 0
     cuda_step_call_ms: float = 0.0
@@ -93,6 +100,25 @@ class FramePerf:
     writeback_performed: bool = False
     diagnostics_ms: float = 0.0
     viewport_tag_ms: float = 0.0
+
+
+@dataclass
+class CrossClothPairColliderPackage:
+    key: tuple = ()
+    cover_lower: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
+    cover_upper: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
+    source_motion_stamp: float = 0.0
+    full_vertex_selection: bool = False
+    full_triangle_selection: bool = False
+    selected_vertices: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int32))
+    selected_triangles: np.ndarray = field(default_factory=lambda: np.empty((0, 3), dtype=np.int32))
+    triangles: np.ndarray = field(default_factory=lambda: np.empty((0, 3, 3), dtype=np.float32))
+    particle_positions: np.ndarray = field(default_factory=lambda: np.empty((0, 3), dtype=np.float32))
+    particle_radii: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
+    triangle_buffer: np.ndarray = field(default_factory=lambda: np.empty((0, 3, 3), dtype=np.float32))
+    triangle_index_buffer: np.ndarray = field(default_factory=lambda: np.empty((0, 3), dtype=np.int32))
+    particle_position_buffer: np.ndarray = field(default_factory=lambda: np.empty((0, 3), dtype=np.float32))
+    particle_radius_buffer: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
 
 
 @dataclass
@@ -116,6 +142,9 @@ class CrossClothColliderCache:
     triangle_mask: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=bool))
     triangle_mask_tmp: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=bool))
     motion_sq: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
+    positions_generation: int = 0
+    motion_accumulated: float = 0.0
+    pair_packages: dict[tuple[str, str], CrossClothPairColliderPackage] = field(default_factory=dict)
 
 
 @dataclass
@@ -334,6 +363,10 @@ def record_viewport_tag_ms(object_name: str, elapsed_ms: float) -> None:
         abi41_pcg_initial_residual=diag.abi41_pcg_initial_residual,
         abi41_pcg_final_residual=diag.abi41_pcg_final_residual,
         abi41_pcg_max_delta=diag.abi41_pcg_max_delta,
+        abi41_pcg_solve_ms=diag.abi41_pcg_solve_ms,
+        abi41_pcg_system_ms=diag.abi41_pcg_system_ms,
+        abi41_pcg_ad_ms=diag.abi41_pcg_ad_ms,
+        abi41_direct_stretch_ms=diag.abi41_direct_stretch_ms,
         abi41_lra_tack_count=diag.abi41_lra_tack_count,
         abi41_bending_wing_count=diag.abi41_bending_wing_count,
         abi41_bending_texture_ready=diag.abi41_bending_texture_ready,
@@ -344,6 +377,13 @@ def record_viewport_tag_ms(object_name: str, elapsed_ms: float) -> None:
         dynamic_particle_upload_ms=diag.dynamic_particle_upload_ms,
         dynamic_collider_cache_hits=diag.dynamic_collider_cache_hits,
         dynamic_collider_cache_misses=diag.dynamic_collider_cache_misses,
+        dynamic_pair_cache_hits=diag.dynamic_pair_cache_hits,
+        dynamic_pair_cache_misses=diag.dynamic_pair_cache_misses,
+        dynamic_pair_cache_reused_triangles=diag.dynamic_pair_cache_reused_triangles,
+        dynamic_pair_cache_reused_particles=diag.dynamic_pair_cache_reused_particles,
+        dynamic_collision_skipped_launches=diag.dynamic_collision_skipped_launches,
+        self_collision_skipped_launches=diag.self_collision_skipped_launches,
+        self_candidate_count=diag.self_candidate_count,
         frame_ms=diag.frame_ms,
         frame_set_ms=diag.frame_set_ms,
         input_refresh_ms=diag.input_refresh_ms,
@@ -626,9 +666,17 @@ def start_preview(context: bpy.types.Context, obj: bpy.types.Object) -> SceneSes
 
         slots: dict[str, ClothSlot] = {}
         depsgraph = context.evaluated_depsgraph_get()
+        preview_slot_count = len(cloth_objects)
         for cloth_obj in cloth_objects:
             slot_settings = _settings_for_object(context, cloth_obj, settings)
-            slot = _create_cloth_slot(context, cloth_obj, slot_settings, depsgraph, auto_sphere_obj)
+            slot = _create_cloth_slot(
+                context,
+                cloth_obj,
+                slot_settings,
+                depsgraph,
+                auto_sphere_obj,
+                preview_slot_count=preview_slot_count,
+            )
             slots[slot.object_name] = slot
 
         solve_order = sorted(
@@ -694,12 +742,13 @@ def start_timeline_preview(context: bpy.types.Context, scene: bpy.types.Scene | 
 
     slots: dict[str, ClothSlot] = {}
     depsgraph = context.evaluated_depsgraph_get()
+    preview_slot_count = len(cloth_objects)
     for cloth_obj in cloth_objects:
         _ensure_supported_cloth_object(cloth_obj)
         settings = _settings_for_object(context, cloth_obj, require_enabled=True)
         if settings is None:
             continue
-        slot = _create_cloth_slot(context, cloth_obj, settings, depsgraph)
+        slot = _create_cloth_slot(context, cloth_obj, settings, depsgraph, preview_slot_count=preview_slot_count)
         slots[slot.object_name] = slot
     if not slots:
         return None
@@ -1089,15 +1138,57 @@ def _target_fps_from_settings(settings) -> float:
     return max(float(getattr(settings, "preview_target_fps", 30.0)), 1.0)
 
 
-def _options_from_settings(settings, runtime_mode_override: str | None = None, auto_sphere_object=None):
+def _env_enabled(name: str, default: bool = True) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    return raw.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _apply_preview_self_collision_budget(options, settings, cloth: ClothBuildData | None, preview_slot_count: int):
+    if not _env_enabled("SSBL_PREVIEW_SELF_COLLISION_BUDGET", True):
+        return options
+    if int(preview_slot_count) < 2:
+        return options
+    if not bool(getattr(options, "self_collision", False)):
+        return options
+    if int(getattr(options, "self_collision_mode", 0)) != SELF_COLLISION_FAST:
+        return options
+    vertex_count = int(len(getattr(cloth, "positions_world", ()))) if cloth is not None else 0
+    triangle_count = int(len(getattr(cloth, "triangles", ()))) if cloth is not None else 0
+    if (
+        vertex_count < _PREVIEW_SELF_COLLISION_BUDGET_VERTEX_THRESHOLD
+        and triangle_count < _PREVIEW_SELF_COLLISION_BUDGET_TRIANGLE_THRESHOLD
+    ):
+        return options
+    substeps = max(int(getattr(settings, "substeps", getattr(options, "self_collision_interval", 1))), 1)
+    interval = max(int(getattr(options, "self_collision_interval", 1)), substeps)
+    passes = min(int(getattr(options, "fast_self_collision_passes", 1)), 1)
+    if interval == int(getattr(options, "self_collision_interval", 1)) and passes == int(getattr(options, "fast_self_collision_passes", 1)):
+        return options
+    return replace(options, self_collision_interval=interval, fast_self_collision_passes=passes)
+
+
+def _options_from_settings(
+    settings,
+    runtime_mode_override: str | None = None,
+    auto_sphere_object=None,
+    cloth: ClothBuildData | None = None,
+    preview_slot_count: int = 1,
+):
     if auto_sphere_object is None:
-        return settings_to_options(settings, runtime_mode_override=runtime_mode_override)
-    explicit_sphere = getattr(settings, "sphere_object", None)
-    if bool(getattr(settings, "use_sphere", False)) and explicit_sphere is not None:
-        return settings_to_options(settings, runtime_mode_override=runtime_mode_override)
-    with _temporary_setting(settings, "use_sphere", True):
-        with _temporary_setting(settings, "sphere_object", auto_sphere_object):
-            return settings_to_options(settings, runtime_mode_override=runtime_mode_override)
+        options = settings_to_options(settings, runtime_mode_override=runtime_mode_override)
+    else:
+        explicit_sphere = getattr(settings, "sphere_object", None)
+        if bool(getattr(settings, "use_sphere", False)) and explicit_sphere is not None:
+            options = settings_to_options(settings, runtime_mode_override=runtime_mode_override)
+        else:
+            with _temporary_setting(settings, "use_sphere", True):
+                with _temporary_setting(settings, "sphere_object", auto_sphere_object):
+                    options = settings_to_options(settings, runtime_mode_override=runtime_mode_override)
+    if str(runtime_mode_override or "").lower() == "preview":
+        options = _apply_preview_self_collision_budget(options, settings, cloth, preview_slot_count)
+    return options
 
 
 def _external_contact_distance_from_options(options) -> float:
@@ -1309,6 +1400,7 @@ def _create_cloth_slot(
     settings,
     depsgraph: bpy.types.Depsgraph,
     auto_sphere_object: bpy.types.Object | None = None,
+    preview_slot_count: int = 1,
 ) -> ClothSlot:
     original_mesh = obj.data
     use_evaluated_mesh = _effective_use_evaluated_mesh(obj, settings)
@@ -1320,6 +1412,7 @@ def _create_cloth_slot(
         use_evaluated_mesh_override=use_evaluated_mesh,
         runtime_mode_override="preview",
         auto_sphere_object=auto_sphere_object,
+        preview_slot_count=preview_slot_count,
     )
     suspended_modifiers = _suspend_preview_modifiers(obj, suspend_all=use_evaluated_mesh)
     preview_mesh = original_mesh.copy()
@@ -1327,7 +1420,13 @@ def _create_cloth_slot(
     obj.data = preview_mesh
     writeback_flat_buffer = np.empty(cloth.positions_world.size, dtype=np.float32)
     writeback_local_buffer = writeback_flat_buffer.reshape(cloth.positions_world.shape)
-    options = _options_from_settings(settings, runtime_mode_override="preview", auto_sphere_object=auto_sphere_object)
+    options = _options_from_settings(
+        settings,
+        runtime_mode_override="preview",
+        auto_sphere_object=auto_sphere_object,
+        cloth=cloth,
+        preview_slot_count=preview_slot_count,
+    )
     return ClothSlot(
         object_name=obj.name,
         cloth=cloth,
@@ -1372,6 +1471,7 @@ def _create_native_solver(
     use_evaluated_mesh_override: bool | None = None,
     runtime_mode_override: str | None = None,
     auto_sphere_object: bpy.types.Object | None = None,
+    preview_slot_count: int = 1,
 ) -> tuple[ClothBuildData, NativeXpbdSolver, tuple[tuple[str, int, int], ...], np.ndarray]:
     try:
         depsgraph = depsgraph or context.evaluated_depsgraph_get()
@@ -1386,6 +1486,8 @@ def _create_native_solver(
             settings,
             runtime_mode_override=runtime_mode_override,
             auto_sphere_object=auto_sphere_object,
+            cloth=cloth,
+            preview_slot_count=preview_slot_count,
         )
         static_tris, static_signature = collect_static_triangles(
             settings.static_collider_collection,
@@ -1465,6 +1567,7 @@ def _rebuild_slot_native(
     solver_signature: tuple,
     perf: FramePerf | None = None,
     auto_sphere_object: bpy.types.Object | None = None,
+    preview_slot_count: int = 1,
 ) -> None:
     started = time.perf_counter()
     download_started = time.perf_counter()
@@ -1482,6 +1585,7 @@ def _rebuild_slot_native(
             use_evaluated_mesh_override=slot.use_evaluated_mesh,
             runtime_mode_override="preview",
             auto_sphere_object=auto_sphere_object,
+            preview_slot_count=preview_slot_count,
         )
         if len(cloth.positions_world) != len(slot.cloth.positions_world) or len(cloth.positions_world) != len(current_positions):
             raise ValueError("Cloth topology changed during preview tuning; restart the preview after topology changes.")
@@ -1552,6 +1656,8 @@ def _refresh_session_runtime_inputs(context: bpy.types.Context, session: SceneSe
                 settings,
                 runtime_mode_override="preview",
                 auto_sphere_object=auto_sphere_object,
+                cloth=slot.cloth,
+                preview_slot_count=len(session.slots),
             )
             slot.external_contact_distance = _external_contact_distance_from_options(options)
             runtime_signature = _runtime_options_signature(options)
@@ -1567,6 +1673,7 @@ def _refresh_session_runtime_inputs(context: bpy.types.Context, session: SceneSe
                     solver_signature,
                     perf,
                     auto_sphere_object,
+                    preview_slot_count=len(session.slots),
                 )
 
             static_collection = settings.static_collider_collection
@@ -1642,7 +1749,7 @@ def _step_session_slots(session: SceneSession, download_positions, perf: FramePe
         if cross_cloth_enabled:
             started = time.perf_counter()
             pack_started = time.perf_counter()
-            dynamic_triangles, dynamic_particles = _collect_cross_cloth_colliders(session, slot)
+            dynamic_triangles, dynamic_particles = _collect_cross_cloth_colliders(session, slot, perf)
             if perf is not None:
                 perf.dynamic_collider_pack_ms += _elapsed_ms(pack_started)
                 perf.dynamic_triangle_count += int(len(dynamic_triangles))
@@ -1722,6 +1829,238 @@ def _ensure_bool_buffer(buffer: np.ndarray, count: int) -> np.ndarray:
     if buffer.shape != (count,):
         return np.empty(count, dtype=bool)
     return buffer
+
+
+def _ensure_float32_capacity(buffer: np.ndarray, shape: tuple[int, ...]) -> np.ndarray:
+    if len(shape) == 0:
+        return np.empty(shape, dtype=np.float32)
+    if buffer.ndim == len(shape) and buffer.shape[1:] == shape[1:] and buffer.shape[0] >= shape[0]:
+        return buffer
+    return np.empty(shape, dtype=np.float32)
+
+
+def _ensure_int32_capacity(buffer: np.ndarray, shape: tuple[int, ...]) -> np.ndarray:
+    if len(shape) == 0:
+        return np.empty(shape, dtype=np.int32)
+    if buffer.ndim == len(shape) and buffer.shape[1:] == shape[1:] and buffer.shape[0] >= shape[0]:
+        return buffer
+    return np.empty(shape, dtype=np.int32)
+
+
+def _cross_cloth_pair_key(
+    mode: str,
+    target: ClothSlot,
+    source: ClothSlot,
+    expanded: tuple[np.ndarray, np.ndarray],
+) -> tuple:
+    target_cache = target.dynamic_collider_cache
+    source_cache = source.dynamic_collider_cache
+    lower = np.asarray(expanded[0], dtype=np.float32).reshape((3,))
+    upper = np.asarray(expanded[1], dtype=np.float32).reshape((3,))
+    return (
+        str(mode),
+        str(target.object_name),
+        str(source.object_name),
+        int(target_cache.positions_generation),
+        int(source_cache.positions_generation),
+        tuple(float(v) for v in lower),
+        tuple(float(v) for v in upper),
+        tuple(source_cache.triangle_signature),
+        tuple(source_cache.particle_signature),
+        float(target.external_contact_distance),
+        float(source.external_contact_distance),
+        int(target.collision_layer),
+        int(source.collision_layer),
+    )
+
+
+def _cross_pair_cover_padding(target: ClothSlot, source: ClothSlot) -> float:
+    _ = target
+    _ = source
+    return 0.0
+
+
+def _cross_pair_key_static_prefix(package_key: tuple) -> tuple:
+    # The first seven fields contain mode, target/source names, position generations, and AABB.
+    return tuple(package_key[:3]) + tuple(package_key[7:])
+
+
+def _cross_pair_cache_can_reuse(
+    package: CrossClothPairColliderPackage,
+    package_key: tuple,
+    lower: np.ndarray,
+    upper: np.ndarray,
+    source_motion_accumulated: float,
+) -> bool:
+    if package.cover_lower.size != 3 or package.cover_upper.size != 3 or not package.key:
+        return False
+    if _cross_pair_key_static_prefix(package.key) != _cross_pair_key_static_prefix(package_key):
+        return False
+    motion_since_filter = max(0.0, float(source_motion_accumulated) - float(package.source_motion_stamp))
+    padded_lower = np.asarray(lower, dtype=np.float32).reshape((3,)) - motion_since_filter
+    padded_upper = np.asarray(upper, dtype=np.float32).reshape((3,)) + motion_since_filter
+    return bool(np.all(padded_lower >= package.cover_lower) and np.all(padded_upper <= package.cover_upper))
+
+
+def _refresh_pair_collider_package(
+    package: CrossClothPairColliderPackage,
+    cache: CrossClothColliderCache,
+    positions: np.ndarray,
+) -> None:
+    if package.full_vertex_selection:
+        package.particle_positions = positions
+        package.particle_radii = cache.particle_radii
+    else:
+        selected_vertices = package.selected_vertices.reshape((-1,))
+        particle_count = int(len(selected_vertices))
+        if particle_count <= 0:
+            package.particle_positions = np.empty((0, 3), dtype=np.float32)
+            package.particle_radii = np.empty(0, dtype=np.float32)
+        else:
+            package.particle_position_buffer = _ensure_float32_capacity(
+                package.particle_position_buffer,
+                (particle_count, 3),
+            )
+            package.particle_radius_buffer = _ensure_float32_capacity(
+                package.particle_radius_buffer,
+                (particle_count,),
+            )
+            position_view = package.particle_position_buffer[:particle_count]
+            radius_view = package.particle_radius_buffer[:particle_count]
+            np.take(positions, selected_vertices, axis=0, out=position_view)
+            np.take(cache.particle_radii, selected_vertices, axis=0, out=radius_view)
+            package.particle_positions = position_view
+            package.particle_radii = radius_view
+
+    if package.full_triangle_selection:
+        selected_triangles = cache.triangle_indices
+    else:
+        selected_triangles = package.selected_triangles
+    triangle_count = int(len(selected_triangles))
+    if triangle_count <= 0:
+        package.triangles = np.empty((0, 3, 3), dtype=np.float32)
+        return
+    package.triangle_buffer = _ensure_float32_capacity(
+        package.triangle_buffer,
+        (triangle_count, 3, 3),
+    )
+    triangle_view = package.triangle_buffer[:triangle_count]
+    np.take(positions, selected_triangles.reshape((-1,)), axis=0, out=triangle_view.reshape((-1, 3)))
+    package.triangles = triangle_view
+
+
+def _build_pair_collider_package(
+    package: CrossClothPairColliderPackage,
+    cache: CrossClothColliderCache,
+    positions: np.ndarray,
+    lower: np.ndarray,
+    upper: np.ndarray,
+    cover_padding: float,
+    source_motion_accumulated: float,
+) -> None:
+    cover_lower = np.asarray(lower, dtype=np.float32).reshape((3,)) - float(cover_padding)
+    cover_upper = np.asarray(upper, dtype=np.float32).reshape((3,)) + float(cover_padding)
+    if (
+        cache.swept_min.size == 3
+        and cache.swept_max.size == 3
+        and bool(np.all(cover_lower <= cache.swept_min))
+        and bool(np.all(cover_upper >= cache.swept_max))
+    ):
+        package.full_vertex_selection = True
+        package.full_triangle_selection = True
+        package.selected_vertices = np.empty(0, dtype=np.int32)
+        package.selected_triangles = np.empty((0, 3), dtype=np.int32)
+        package.cover_lower = cover_lower
+        package.cover_upper = cover_upper
+        package.source_motion_stamp = float(source_motion_accumulated)
+        _refresh_pair_collider_package(package, cache, positions)
+        return
+
+    vertex_mask = _cross_source_vertex_mask(cache, positions, cover_lower, cover_upper)
+    if not bool(np.any(vertex_mask)):
+        package.full_vertex_selection = False
+        package.full_triangle_selection = False
+        package.selected_vertices = np.empty(0, dtype=np.int32)
+        package.selected_triangles = np.empty((0, 3), dtype=np.int32)
+        package.triangles = np.empty((0, 3, 3), dtype=np.float32)
+        package.particle_positions = np.empty((0, 3), dtype=np.float32)
+        package.particle_radii = np.empty(0, dtype=np.float32)
+        package.cover_lower = cover_lower
+        package.cover_upper = cover_upper
+        package.source_motion_stamp = float(source_motion_accumulated)
+        return
+
+    if bool(np.all(vertex_mask)):
+        package.full_vertex_selection = True
+        package.selected_vertices = np.empty(0, dtype=np.int32)
+        package.particle_positions = positions
+        package.particle_radii = cache.particle_radii
+    else:
+        selected_vertices = np.flatnonzero(vertex_mask)
+        particle_count = int(len(selected_vertices))
+        package.full_vertex_selection = False
+        package.selected_vertices = np.ascontiguousarray(selected_vertices, dtype=np.int32)
+        package.particle_position_buffer = _ensure_float32_capacity(
+            package.particle_position_buffer,
+            (particle_count, 3),
+        )
+        package.particle_radius_buffer = _ensure_float32_capacity(
+            package.particle_radius_buffer,
+            (particle_count,),
+        )
+        position_view = package.particle_position_buffer[:particle_count]
+        radius_view = package.particle_radius_buffer[:particle_count]
+        np.take(positions, selected_vertices, axis=0, out=position_view)
+        np.take(cache.particle_radii, selected_vertices, axis=0, out=radius_view)
+        package.particle_positions = position_view
+        package.particle_radii = radius_view
+
+    triangles = cache.triangle_indices
+    if len(triangles) == 0:
+        package.full_triangle_selection = False
+        package.selected_triangles = np.empty((0, 3), dtype=np.int32)
+        package.triangles = np.empty((0, 3, 3), dtype=np.float32)
+        package.cover_lower = cover_lower
+        package.cover_upper = cover_upper
+        package.source_motion_stamp = float(source_motion_accumulated)
+        return
+    tri_mask = _cross_source_triangle_mask(cache, triangles, vertex_mask)
+    if not bool(np.any(tri_mask)):
+        package.full_triangle_selection = False
+        package.selected_triangles = np.empty((0, 3), dtype=np.int32)
+        package.triangles = np.empty((0, 3, 3), dtype=np.float32)
+        package.cover_lower = cover_lower
+        package.cover_upper = cover_upper
+        package.source_motion_stamp = float(source_motion_accumulated)
+        return
+
+    if bool(np.all(tri_mask)):
+        package.full_triangle_selection = True
+        package.selected_triangles = np.empty((0, 3), dtype=np.int32)
+        selected_triangles = triangles
+        triangle_count = int(len(triangles))
+    else:
+        selected_triangle_ids = np.flatnonzero(tri_mask)
+        triangle_count = int(len(selected_triangle_ids))
+        package.full_triangle_selection = False
+        package.triangle_index_buffer = _ensure_int32_capacity(
+            package.triangle_index_buffer,
+            (triangle_count, 3),
+        )
+        selected_triangles = package.triangle_index_buffer[:triangle_count]
+        np.take(triangles, selected_triangle_ids, axis=0, out=selected_triangles)
+        package.selected_triangles = selected_triangles
+
+    package.triangle_buffer = _ensure_float32_capacity(
+        package.triangle_buffer,
+        (triangle_count, 3, 3),
+    )
+    triangle_view = package.triangle_buffer[:triangle_count]
+    np.take(positions, selected_triangles.reshape((-1,)), axis=0, out=triangle_view.reshape((-1, 3)))
+    package.triangles = triangle_view
+    package.cover_lower = cover_lower
+    package.cover_upper = cover_upper
+    package.source_motion_stamp = float(source_motion_accumulated)
 
 
 def _cross_source_vertex_mask(
@@ -1836,6 +2175,9 @@ def _prepare_cross_cloth_collider_caches(session: SceneSession, perf: FramePerf 
             cache.swept_min = np.asarray(swept[0], dtype=np.float32)
             cache.swept_max = np.asarray(swept[1], dtype=np.float32)
         cache.max_motion = _slot_max_motion_cached(cache, positions, previous)
+        if cache.particle_positions.shape != positions.shape or cache.max_motion > 1.0e-8:
+            cache.positions_generation += 1
+        cache.motion_accumulated += float(max(cache.max_motion, 0.0))
 
         triangles = np.asarray(source.cloth.triangles, dtype=np.int32)
         triangles_valid = (
@@ -1858,6 +2200,8 @@ def _prepare_cross_cloth_collider_caches(session: SceneSession, perf: FramePerf 
                 else np.empty((0, 3), dtype=np.int32)
             )
             cache.triangle_signature = triangle_signature
+            cache.pair_packages.clear()
+            cache.motion_accumulated = 0.0
             rest_lengths = np.asarray(source.cloth.edge_rest_lengths, dtype=np.float32).reshape((-1,))
             finite_rest = rest_lengths[np.isfinite(rest_lengths)]
             rest_max = float(np.max(finite_rest)) if len(finite_rest) else 0.0
@@ -1891,6 +2235,8 @@ def _prepare_cross_cloth_collider_caches(session: SceneSession, perf: FramePerf 
             cache.particle_slot_ids = np.full(count, slot_id, dtype=np.int32)
             cache.particle_phases = np.full(count, int(source.collision_layer), dtype=np.int32)
             cache.particle_signature = particle_signature
+            cache.pair_packages.clear()
+            cache.motion_accumulated = 0.0
             if perf is not None:
                 perf.dynamic_collider_cache_misses += 1
         else:
@@ -1973,6 +2319,7 @@ def _collect_cross_cloth_triangles(session: SceneSession, target: ClothSlot) -> 
 def _collect_cross_cloth_colliders(
     session: SceneSession,
     target: ClothSlot,
+    perf: FramePerf | None = None,
 ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
     mode = str(session.cross_cloth_mode or "off").lower()
     if mode == "off":
@@ -1980,9 +2327,6 @@ def _collect_cross_cloth_colliders(
     triangles_list: list[np.ndarray] = []
     positions_list: list[np.ndarray] = []
     radii_list: list[np.ndarray] = []
-    inv_mass_list: list[np.ndarray] = []
-    slot_ids_list: list[np.ndarray] = []
-    phase_list: list[np.ndarray] = []
     for source in session.slots.values():
         if not _cross_cloth_source_enabled(mode, target, source):
             continue
@@ -1993,30 +2337,62 @@ def _collect_cross_cloth_colliders(
         positions = cache.particle_positions
         if len(positions) == 0:
             continue
-        vertex_mask = _cross_source_vertex_mask(cache, positions, expanded[0], expanded[1])
-        if not bool(np.any(vertex_mask)):
-            continue
-        if bool(np.all(vertex_mask)):
-            positions_list.append(positions)
-            radii_list.append(cache.particle_radii)
-            inv_mass_list.append(cache.particle_inv_mass)
-            slot_ids_list.append(cache.particle_slot_ids)
-            phase_list.append(cache.particle_phases)
+        package_id = (str(target.object_name), str(source.object_name))
+        package = cache.pair_packages.get(package_id)
+        if package is None:
+            package = CrossClothPairColliderPackage()
+            cache.pair_packages[package_id] = package
+        target_cache = target.dynamic_collider_cache
+        can_attempt_reuse = (
+            float(cache.max_motion) <= 1.0e-8
+            and float(target_cache.max_motion) <= 1.0e-8
+        )
+        if can_attempt_reuse:
+            package_key = _cross_cloth_pair_key(mode, target, source, expanded)
+            if _cross_pair_cache_can_reuse(
+                package,
+                package_key,
+                expanded[0],
+                expanded[1],
+                cache.motion_accumulated,
+            ):
+                _refresh_pair_collider_package(package, cache, positions)
+                if perf is not None:
+                    perf.dynamic_pair_cache_hits += 1
+                    perf.dynamic_pair_cache_reused_triangles += int(len(package.triangles))
+                    perf.dynamic_pair_cache_reused_particles += int(len(package.particle_positions))
+            else:
+                _build_pair_collider_package(
+                    package,
+                    cache,
+                    positions,
+                    expanded[0],
+                    expanded[1],
+                    _cross_pair_cover_padding(target, source),
+                    cache.motion_accumulated,
+                )
+                package.key = package_key
+                if perf is not None:
+                    perf.dynamic_pair_cache_misses += 1
         else:
-            positions_list.append(np.ascontiguousarray(positions[vertex_mask], dtype=np.float32))
-            radii_list.append(np.ascontiguousarray(cache.particle_radii[vertex_mask], dtype=np.float32))
-            inv_mass_list.append(np.ascontiguousarray(cache.particle_inv_mass[vertex_mask], dtype=np.float32))
-            slot_ids_list.append(np.ascontiguousarray(cache.particle_slot_ids[vertex_mask], dtype=np.int32))
-            phase_list.append(np.ascontiguousarray(cache.particle_phases[vertex_mask], dtype=np.int32))
-
-        triangles = cache.triangle_indices
-        if len(triangles) == 0:
+            _build_pair_collider_package(
+                package,
+                cache,
+                positions,
+                expanded[0],
+                expanded[1],
+                _cross_pair_cover_padding(target, source),
+                cache.motion_accumulated,
+            )
+            package.key = ()
+            if perf is not None:
+                perf.dynamic_pair_cache_misses += 1
+        if len(package.particle_positions) == 0:
             continue
-        tri_mask = _cross_source_triangle_mask(cache, triangles, vertex_mask)
-        if not bool(np.any(tri_mask)):
-            continue
-        selected_triangles = triangles if bool(np.all(tri_mask)) else triangles[tri_mask]
-        triangles_list.append(np.ascontiguousarray(positions[selected_triangles], dtype=np.float32))
+        positions_list.append(package.particle_positions)
+        radii_list.append(package.particle_radii)
+        if len(package.triangles) > 0:
+            triangles_list.append(package.triangles)
 
     dynamic_triangles = _single_or_concat_float32(triangles_list, (0, 3, 3))
     if not positions_list:
@@ -2024,9 +2400,6 @@ def _collect_cross_cloth_colliders(
     return dynamic_triangles, {
         "positions": _single_or_concat_float32(positions_list, (0, 3)),
         "radii": _single_or_concat_float32(radii_list, (0,)).reshape((-1,)),
-        "inv_mass": _single_or_concat_float32(inv_mass_list, (0,)).reshape((-1,)),
-        "slot_ids": _single_or_concat_int32(slot_ids_list),
-        "phases": _single_or_concat_int32(phase_list),
     }
 
 
@@ -2606,6 +2979,10 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
     abi41_pcg_initial_residual = 0.0
     abi41_pcg_final_residual = 0.0
     abi41_pcg_max_delta = 0.0
+    abi41_pcg_solve_ms = 0.0
+    abi41_pcg_system_ms = 0.0
+    abi41_pcg_ad_ms = 0.0
+    abi41_direct_stretch_ms = 0.0
     abi41_lra_tack_count = 0
     abi41_bending_wing_count = 0
     abi41_bending_texture_ready = 0
@@ -2616,6 +2993,13 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
     dynamic_particle_upload_ms = 0.0
     dynamic_collider_cache_hits = 0
     dynamic_collider_cache_misses = 0
+    dynamic_pair_cache_hits = 0
+    dynamic_pair_cache_misses = 0
+    dynamic_pair_cache_reused_triangles = 0
+    dynamic_pair_cache_reused_particles = 0
+    dynamic_collision_skipped_launches = 0
+    self_collision_skipped_launches = 0
+    self_candidate_count = 0
     finite = True
     writeback_performed = False
     diag_started = time.perf_counter()
@@ -2727,6 +3111,10 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
         abi41_pcg_initial_residual = max(abi41_pcg_initial_residual, float(diag.abi41_pcg_initial_residual))
         abi41_pcg_final_residual = max(abi41_pcg_final_residual, float(diag.abi41_pcg_final_residual))
         abi41_pcg_max_delta = max(abi41_pcg_max_delta, float(diag.abi41_pcg_max_delta))
+        abi41_pcg_solve_ms += float(diag.abi41_pcg_solve_ms)
+        abi41_pcg_system_ms += float(diag.abi41_pcg_system_ms)
+        abi41_pcg_ad_ms += float(diag.abi41_pcg_ad_ms)
+        abi41_direct_stretch_ms += float(diag.abi41_direct_stretch_ms)
         abi41_lra_tack_count += int(diag.abi41_lra_tack_count)
         abi41_bending_wing_count += int(diag.abi41_bending_wing_count)
         abi41_bending_texture_ready = max(abi41_bending_texture_ready, int(diag.abi41_bending_texture_ready))
@@ -2737,6 +3125,13 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
         dynamic_particle_upload_ms += float(diag.dynamic_particle_upload_ms)
         dynamic_collider_cache_hits += int(diag.dynamic_collider_cache_hits)
         dynamic_collider_cache_misses += int(diag.dynamic_collider_cache_misses)
+        dynamic_pair_cache_hits += int(diag.dynamic_pair_cache_hits)
+        dynamic_pair_cache_misses += int(diag.dynamic_pair_cache_misses)
+        dynamic_pair_cache_reused_triangles += int(diag.dynamic_pair_cache_reused_triangles)
+        dynamic_pair_cache_reused_particles += int(diag.dynamic_pair_cache_reused_particles)
+        dynamic_collision_skipped_launches += int(diag.dynamic_collision_skipped_launches)
+        self_collision_skipped_launches += int(diag.self_collision_skipped_launches)
+        self_candidate_count += int(diag.self_candidate_count)
         finite = finite and bool(diag.finite)
         writeback_performed = writeback_performed or bool(diag.writeback_performed)
         if diag.min_gap is not None:
@@ -2855,6 +3250,10 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
         abi41_pcg_initial_residual=abi41_pcg_initial_residual,
         abi41_pcg_final_residual=abi41_pcg_final_residual,
         abi41_pcg_max_delta=abi41_pcg_max_delta,
+        abi41_pcg_solve_ms=abi41_pcg_solve_ms,
+        abi41_pcg_system_ms=abi41_pcg_system_ms,
+        abi41_pcg_ad_ms=abi41_pcg_ad_ms,
+        abi41_direct_stretch_ms=abi41_direct_stretch_ms,
         abi41_lra_tack_count=abi41_lra_tack_count,
         abi41_bending_wing_count=abi41_bending_wing_count,
         abi41_bending_texture_ready=abi41_bending_texture_ready,
@@ -2871,6 +3270,21 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
         dynamic_collider_cache_misses=(
             perf.dynamic_collider_cache_misses if perf is not None else dynamic_collider_cache_misses
         ),
+        dynamic_pair_cache_hits=(
+            perf.dynamic_pair_cache_hits if perf is not None else dynamic_pair_cache_hits
+        ),
+        dynamic_pair_cache_misses=(
+            perf.dynamic_pair_cache_misses if perf is not None else dynamic_pair_cache_misses
+        ),
+        dynamic_pair_cache_reused_triangles=(
+            perf.dynamic_pair_cache_reused_triangles if perf is not None else dynamic_pair_cache_reused_triangles
+        ),
+        dynamic_pair_cache_reused_particles=(
+            perf.dynamic_pair_cache_reused_particles if perf is not None else dynamic_pair_cache_reused_particles
+        ),
+        dynamic_collision_skipped_launches=dynamic_collision_skipped_launches,
+        self_collision_skipped_launches=self_collision_skipped_launches,
+        self_candidate_count=self_candidate_count,
         finite=finite,
         frame_ms=perf.frame_ms if perf is not None else 0.0,
         frame_set_ms=perf.frame_set_ms if perf is not None else 0.0,

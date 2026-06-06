@@ -197,6 +197,9 @@ def _render_frame(scene: bpy.types.Scene, frames_dir: Path, render_index: int) -
     path = frames_dir / f"frame_{render_index:04d}.png"
     scene.render.image_settings.file_format = "PNG"
     scene.render.filepath = str(path)
+    if bpy.app.background:
+        bpy.ops.render.render(write_still=True)
+        return str(path)
     try:
         bpy.ops.render.opengl(write_still=True, view_context=False)
     except RuntimeError:
