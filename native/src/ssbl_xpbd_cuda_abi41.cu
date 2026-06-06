@@ -59,6 +59,9 @@ constexpr int kAbi41CountSlots = 16;
 constexpr float kAbi41SpringRelaxation = 0.18f;
 constexpr float kAbi41StretchStrengthScale = 2.5f;
 constexpr float kAbi41StretchPrevSyncScale = 0.08f;
+constexpr float kAbi41LraPrevSyncScale = 0.16f;
+constexpr float kAbi41BendPrevSyncScale = 0.06f;
+constexpr float kAbi41SelfPrevSyncScale = 0.08f;
 constexpr float kAbi41DynamicNeighborImpulseScale = 0.5f;
 constexpr float kAbi41BendRelaxation = 0.10f;
 constexpr float kAbi41TackRelaxation = 0.35f;
@@ -455,6 +458,17 @@ __device__ float length(Vec3 value) {
 
 __device__ bool finite_vec(Vec3 value) {
     return isfinite(value.x) && isfinite(value.y) && isfinite(value.z);
+}
+
+__device__ Vec3 limit_delta(Vec3 delta, float max_len) {
+    if (!finite_vec(delta) || !isfinite(max_len) || max_len <= 0.0f) {
+        return make_vec3(0.0f, 0.0f, 0.0f);
+    }
+    const float len = length(delta);
+    if (!isfinite(len) || len <= kEps) {
+        return make_vec3(0.0f, 0.0f, 0.0f);
+    }
+    return len > max_len ? mul(delta, max_len / len) : delta;
 }
 
 __host__ __device__ ReconSymMat make_sym_mat(
@@ -1291,11 +1305,23 @@ __global__ void abi41_lra_tack_project_kernel(Abi41Solver solver, float dt) {
         corr = mul(corr, max_corr / fmaxf(corr_len, kEps));
         abi41_count(solver, kAbi41CountTackGuards);
     }
+    const bool has_thickness = solver.cfg.cloth_thickness > 0.0f;
+    const float applied_cap = has_thickness ? 0.0025f : 0.012f;
+    const float rest_limit = fmaxf(rest, 0.0f) * (has_thickness ? 0.02f : 0.08f);
+    const float thickness_limit = has_thickness ? solver.cfg.cloth_thickness * 0.12f : applied_cap;
+    const float applied_limit = fmaxf(
+        5.0e-4f,
+        fminf(fminf(rest_limit, thickness_limit), applied_cap)
+    );
     if (wi > 0.0f) {
-        atomic_add(&solver.pos[i], mul(corr, -wi));
+        const Vec3 delta_i = limit_delta(mul(corr, -wi / fmaxf(weight, kEps)), applied_limit);
+        atomic_add(&solver.pos[i], delta_i);
+        atomic_add(&solver.prev[i], mul(delta_i, kAbi41LraPrevSyncScale));
     }
     if (wj > 0.0f) {
-        atomic_add(&solver.pos[j], mul(corr, wj));
+        const Vec3 delta_j = limit_delta(mul(corr, wj / fmaxf(weight, kEps)), applied_limit);
+        atomic_add(&solver.pos[j], delta_j);
+        atomic_add(&solver.prev[j], mul(delta_j, kAbi41LraPrevSyncScale));
     }
     abi41_count(solver, kAbi41CountLraTacks);
 }
@@ -1369,10 +1395,14 @@ __global__ void abi41_bend_project_kernel(Abi41Solver solver, float dt) {
         abi41_count(solver, kAbi41CountBendingGuards);
     }
     if (wi > 0.0f) {
-        atomic_add(&solver.pos[i], mul(corr, -wi));
+        const Vec3 delta_i = mul(corr, -wi);
+        atomic_add(&solver.pos[i], delta_i);
+        atomic_add(&solver.prev[i], mul(delta_i, kAbi41BendPrevSyncScale));
     }
     if (wj > 0.0f) {
-        atomic_add(&solver.pos[j], mul(corr, wj));
+        const Vec3 delta_j = mul(corr, wj);
+        atomic_add(&solver.pos[j], delta_j);
+        atomic_add(&solver.prev[j], mul(delta_j, kAbi41BendPrevSyncScale));
     }
     abi41_count(solver, kAbi41CountBendingWings);
 }
@@ -1546,8 +1576,8 @@ __global__ void abi41_pcg_build_stretch_system_kernel(Abi41Solver solver) {
         return;
     }
     const float len = sqrtf(len_sq);
-    const float over = len - rest;
-    if (!isfinite(over) || over <= 0.0f) {
+    const float edge_error = len - rest;
+    if (!isfinite(edge_error) || fabsf(edge_error) <= 1.0e-6f) {
         return;
     }
 
@@ -1559,8 +1589,9 @@ __global__ void abi41_pcg_build_stretch_system_kernel(Abi41Solver solver) {
         1.0e-5f,
         fminf(fmaxf(rest, solver.cfg.cloth_thickness) * 0.5f, 0.25f)
     );
-    const float projected = fminf(over * strength, max_edge_delta);
-    if (!isfinite(projected) || projected <= 0.0f) {
+    float projected = edge_error * strength;
+    projected = fmaxf(-max_edge_delta, fminf(projected, max_edge_delta));
+    if (!isfinite(projected) || fabsf(projected) <= 1.0e-7f) {
         return;
     }
 
@@ -2715,7 +2746,9 @@ __global__ void abi41_apply_self_averaged_delta_kernel(Abi41Solver solver) {
     if (solver.inv_mass[i] <= 0.0f || (solver.state_flags[i] & ssbl_abi41::kPinnedOrKinematicFlag) != 0u) {
         return;
     }
-    solver.pos[i] = add(solver.pos[i], solver.self_averaged_delta[i]);
+    const Vec3 delta = solver.self_averaged_delta[i];
+    solver.pos[i] = add(solver.pos[i], delta);
+    solver.prev[i] = add(solver.prev[i], mul(delta, kAbi41SelfPrevSyncScale));
 }
 
 __device__ bool abi41_apply_soft_vertex_triangle_pair(
