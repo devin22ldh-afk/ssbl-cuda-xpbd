@@ -37,25 +37,34 @@ class SSBL_PT_physics_panel(bpy.types.Panel):
         row = layout.row(align=True)
         row.scale_y = 1.5
         is_enabled = settings.enabled
-        row.prop(settings, "enabled", text="SSBL 布料解算中" if is_enabled else "启用 SSBL 布料模拟", toggle=True, icon="PLAY" if is_enabled else "PHYSICS")
+        
+        if is_enabled:
+            row.prop(settings, "enabled", text="SSBL 布料解算中", toggle=True, icon="PLAY")
+        else:
+            row.prop(settings, "enabled", text="启用 SSBL 布料模拟", toggle=True, icon="PHYSICS")
 
         if settings.enabled:
+            layout.separator()
+            
             # Status Dashboard - Awesome Design: Boxed logical grouping
-            status_box = layout.box()
-            col = status_box.column(align=True)
+            col = layout.column(align=True)
+            col.label(text="运行状态", icon="PULSE")
+            status_box = col.box()
+            box_col = status_box.column(align=True)
             
             # Status display
             status_str = f"状态: {solver.session_status(obj)}"
-            fps_str = f"  |  FPS: {solver.session_fps(obj):.1f}" if solver.has_session(obj) else ""
+            fps_str = f" | FPS: {solver.session_fps(obj):.1f}" if solver.has_session(obj) else ""
             
-            row_status = col.row()
+            row_status = box_col.row()
             row_status.label(text=status_str + fps_str, icon="INFO")
             
-            row_backend = col.row()
+            row_backend = box_col.row()
             row_backend.label(text=solver.backend_status_text(), icon="CONSOLE")
 
-            col.separator()
-            col.operator("ssbl.reset_preview", text="重置引擎状态", icon="LOOP_BACK")
+            box_col.separator(factor=0.5)
+            row_reset = box_col.row()
+            row_reset.operator("ssbl.reset_preview", text="重置引擎状态", icon="LOOP_BACK")
 
 
 class SSBL_PT_material(bpy.types.Panel):
@@ -70,26 +79,33 @@ class SSBL_PT_material(bpy.types.Panel):
         layout.use_property_split = True
         layout.use_property_decorate = False
 
-        # Base Physics Box
-        box_base = layout.box()
-        box_base.label(text="基础属性", icon="MOD_CLOTH")
-        col_base = box_base.column(align=True)
-        col_base.prop(settings, "hardness", text="弯曲硬度", slider=True)
-        col_base.prop(settings, "cloth_thickness", text="表面厚度")
-        col_base.prop(settings, "density", text="材质密度")
+        # Base Physics
+        col = layout.column(align=True)
+        col.label(text="基础属性", icon="MOD_CLOTH")
+        box_base = col.box()
+        box_base.prop(settings, "hardness", text="弯曲硬度", slider=True)
+        box_base.prop(settings, "cloth_thickness", text="表面厚度")
+        box_base.prop(settings, "density", text="材质密度")
+        
+        layout.separator()
 
-        # Constraints Box
-        box_pin = layout.box()
-        box_pin.label(text="空间约束", icon="PINNED")
+        # Constraints
+        col = layout.column(align=True)
+        col.label(text="空间约束", icon="PINNED")
+        box_pin = col.box()
         box_pin.prop(settings, "pin_vertex_group", text="钉固顶点组")
         
-        # Inflation Box
-        box_pressure = layout.box()
-        box_pressure.label(text="充气与体积", icon="OUTLINER_OB_FORCE_FIELD")
-        box_pressure.prop(settings, "use_volume_pressure", text="启用体积气压")
+        layout.separator()
+
+        # Inflation
+        col = layout.column(align=True)
+        col.label(text="充气与体积", icon="OUTLINER_OB_FORCE_FIELD")
+        box_pressure = col.box()
+        box_pressure.prop(settings, "use_volume_pressure", text="启用体积气压", toggle=True)
         if settings.use_volume_pressure:
-            col_pressure = box_pressure.column(align=True)
-            col_pressure.prop(settings, "pressure_strength", text="内压强度")
+            sub = box_pressure.column(align=True)
+            sub.separator()
+            sub.prop(settings, "pressure_strength", text="内压强度")
 
 
 class SSBL_PT_collision(bpy.types.Panel):
@@ -104,38 +120,44 @@ class SSBL_PT_collision(bpy.types.Panel):
         layout.use_property_split = True
         layout.use_property_decorate = False
 
-        # World Interaction Box
-        box_world = layout.box()
-        box_world.label(text="场景交互", icon="WORLD")
-        col_world = box_world.column(align=True)
-        col_world.prop(settings, "collision_margin", text="碰撞容差 (Margin)")
-        col_world.separator()
+        # World Interaction
+        col = layout.column(align=True)
+        col.label(text="场景交互", icon="WORLD")
+        box_world = col.box()
+        box_world.prop(settings, "collision_margin", text="碰撞容差 (Margin)")
         
-        col_world.prop(settings, "use_ground", text="无限平面底座")
+        box_world.separator()
+        box_world.prop(settings, "use_ground", text="无限平面底座", toggle=True)
         if settings.use_ground:
-            col_world.prop(settings, "ground_height", text="平面高度")
+            sub = box_world.column(align=True)
+            sub.prop(settings, "ground_height", text="平面高度")
             
-        col_world.separator()
-        col_world.prop(settings, "static_collider_collection", text="静态碰撞体集合")
+        box_world.separator()
+        box_world.prop(settings, "static_collider_collection", text="静态碰撞体集合")
         
-        # Static SDF Settings (Only show if collection is set to save space)
+        # Static SDF Settings
         if settings.static_collider_collection:
             sdf_col = box_world.column(align=True)
+            sdf_col.separator()
             sdf_col.label(text="Voxel SDF 精度:", icon="MESH_GRID")
             sdf_col.prop(settings, "static_sdf_voxel_size", text="体素尺寸")
             sdf_col.prop(settings, "static_sdf_band_voxels", text="拓展带 (Band)")
             sdf_col.prop(settings, "static_sdf_max_resolution", text="最大分辨率")
 
-        # Self Collision Box
-        box_self = layout.box()
-        box_self.label(text="自碰撞解算", icon="OUTLINER_OB_MESH")
-        box_self.prop(settings, "self_collision", text="启用自碰撞")
+        layout.separator()
+
+        # Self Collision
+        col_self = layout.column(align=True)
+        col_self.label(text="自碰撞解算", icon="OUTLINER_OB_MESH")
+        box_self = col_self.box()
+        box_self.prop(settings, "self_collision", text="启用自碰撞", toggle=True)
         if settings.self_collision:
-            col_self = box_self.column(align=True)
-            col_self.prop(settings, "self_collision_mode", text="算法模式")
+            sub_self = box_self.column(align=True)
+            sub_self.separator()
+            sub_self.prop(settings, "self_collision_mode", text="算法模式")
             if str(getattr(settings, "self_collision_mode", "fast")).lower() == "fast":
-                col_self.prop(settings, "fast_self_collision_passes", text="快速遍数 (Passes)")
-            col_self.prop(settings, "max_self_collision_neighbors", text="最大邻居探测数")
+                sub_self.prop(settings, "fast_self_collision_passes", text="快速遍数 (Passes)")
+            sub_self.prop(settings, "max_self_collision_neighbors", text="最大邻居探测数")
 
 
 class SSBL_PT_force_fields(bpy.types.Panel):
@@ -151,15 +173,17 @@ class SSBL_PT_force_fields(bpy.types.Panel):
         layout.use_property_split = True
         layout.use_property_decorate = False
 
-        box = layout.box()
+        col = layout.column(align=True)
+        col.label(text="效果器", icon="FORCE_FORCE")
+        box = col.box()
         box.prop(settings, "force_field_collection", text="效果器集合")
         
         box.separator()
         flow = box.grid_flow(row_major=True, columns=0, even_columns=True, even_rows=False, align=True)
         for group in visible_force_field_weight_groups():
-            col = flow.column()
+            flow_col = flow.column()
             for prop_name in group:
-                col.prop(settings, prop_name, slider=True)
+                flow_col.prop(settings, prop_name, slider=True)
 
 
 class SSBL_PT_advanced(bpy.types.Panel):
@@ -176,30 +200,33 @@ class SSBL_PT_advanced(bpy.types.Panel):
         layout.use_property_decorate = False
 
         # Precision & Quality
-        box_solver = layout.box()
-        box_solver.label(text="引擎核心 (Core)", icon="MOD_BUILD")
-        col_solver = box_solver.column(align=True)
-        col_solver.prop(settings, "dt", text="步长 (Time Step)")
-        col_solver.prop(settings, "substeps", text="子步数 (Substeps)")
-        col_solver.prop(settings, "iterations", text="约束迭代 (Iterations)")
-        col_solver.prop(settings, "damping", text="全局阻尼 (Damping)")
+        col = layout.column(align=True)
+        col.label(text="引擎核心 (Core)", icon="MOD_BUILD")
+        box_solver = col.box()
+        box_solver.prop(settings, "dt", text="步长 (Time Step)")
+        box_solver.prop(settings, "substeps", text="子步数 (Substeps)")
+        box_solver.prop(settings, "iterations", text="约束迭代 (Iterations)")
+        box_solver.prop(settings, "damping", text="全局阻尼 (Damping)")
+
+        layout.separator()
 
         # Contact Dynamics
-        box_contact = layout.box()
-        box_contact.label(text="接触动力学", icon="GRAPH")
-        col_contact = box_contact.column(align=True)
-        col_contact.prop(settings, "contact_friction", text="表面摩擦力")
-        col_contact.prop(settings, "contact_tangent_damping", text="切向滑动阻尼")
-        col_contact.prop(settings, "contact_compliance", text="接触顺应性 (Compliance)")
+        col_contact = layout.column(align=True)
+        col_contact.label(text="接触动力学", icon="GRAPH")
+        box_contact = col_contact.box()
+        box_contact.prop(settings, "contact_friction", text="表面摩擦力")
+        box_contact.prop(settings, "contact_tangent_damping", text="切向滑动阻尼")
+        box_contact.prop(settings, "contact_compliance", text="接触顺应性 (Compliance)")
 
         if settings.self_collision:
+            layout.separator()
             # Advanced Self Collision
-            box_adv_self = layout.box()
-            box_adv_self.label(text="高级自碰撞设定", icon="TOOL_SETTINGS")
-            col_adv_self = box_adv_self.column(align=True)
-            col_adv_self.prop(settings, "self_collision_interval", text="求交判定间隔")
-            col_adv_self.prop(settings, "self_probe_interval", text="宽相 Probe 间隔")
-            col_adv_self.prop(settings, "self_surface_pair_interval", text="表面配对刷新间隔")
+            col_adv = layout.column(align=True)
+            col_adv.label(text="高级自碰撞设定", icon="TOOL_SETTINGS")
+            box_adv_self = col_adv.box()
+            box_adv_self.prop(settings, "self_collision_interval", text="求交判定间隔")
+            box_adv_self.prop(settings, "self_probe_interval", text="宽相 Probe 间隔")
+            box_adv_self.prop(settings, "self_surface_pair_interval", text="表面配对刷新间隔")
 
 
 class SSBL_PT_cache(bpy.types.Panel):
@@ -218,24 +245,18 @@ class SSBL_PT_cache(bpy.types.Panel):
         is_baking = bool(getattr(settings, "bake_in_progress", False))
         
         # Playback Settings
-        box_preview = layout.box()
-        box_preview.label(text="预览设定", icon="PLAY")
-        col_preview = box_preview.column(align=True)
-        col_preview.prop(settings, "preview_target_fps", text="目标预览帧率")
-        col_preview.prop(settings, "use_evaluated_mesh", text="使用修改器形态 (Evaluated)")
+        col = layout.column(align=True)
+        col.label(text="预览设定", icon="PLAY")
+        box_preview = col.box()
+        box_preview.prop(settings, "preview_target_fps", text="目标预览帧率")
+        box_preview.prop(settings, "use_evaluated_mesh", text="使用修改器形态 (Evaluated)")
         
-        box_preview.separator()
-        col_multi = box_preview.column(align=True)
-        col_multi.prop(settings, "multi_cloth_preview", text="多布料混合预览")
-        if settings.multi_cloth_preview:
-            col_multi.prop(settings, "cross_cloth_collision", text="交叉布料碰撞")
-            if obj is not None:
-                col_multi.prop(obj, "ssbl_collision_layer", text="碰撞图层 (Layer)")
-                col_multi.prop(obj, "ssbl_enable_cross_cloth_collision", text="允许碰撞此图层")
+        layout.separator()
 
         # Bake Workflow
-        box_bake = layout.box()
-        box_bake.label(text="烘焙工作流", icon="RENDER_ANIMATION")
+        col_bake = layout.column(align=True)
+        col_bake.label(text="烘焙工作流", icon="RENDER_ANIMATION")
+        box_bake = col_bake.box()
         
         if is_baking:
             current = int(getattr(settings, "bake_progress_current", 0))
@@ -245,15 +266,15 @@ class SSBL_PT_cache(bpy.types.Panel):
             row_progress.scale_y = 1.2
             row_progress.label(text=f"烘焙中: {current}/{total} ({percent:.0f}%)", icon="TIME")
 
-        col_bake = box_bake.column(align=True)
-        col_bake.enabled = not is_baking
+        sub_bake = box_bake.column(align=True)
+        sub_bake.enabled = not is_baking
         
-        row_frames = col_bake.row(align=True)
+        row_frames = sub_bake.row(align=True)
         row_frames.prop(settings, "bake_start", text="起始帧")
         row_frames.prop(settings, "bake_end", text="结束帧")
         
-        col_bake.separator()
-        row_actions = col_bake.row(align=True)
+        sub_bake.separator()
+        row_actions = sub_bake.row(align=True)
         row_actions.scale_y = 1.5
         row_actions.operator("ssbl.bake_xpbd_cache", text="开始烘焙", icon="REC")
         row_actions.operator("ssbl.clear_xpbd_cache", text="清除缓存", icon="TRASH")

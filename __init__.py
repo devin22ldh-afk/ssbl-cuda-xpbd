@@ -576,7 +576,7 @@ class SSBL_PreviewSettings(PropertyGroup):
     self_collision: BoolProperty(
         update=_apply_self_collision_toggle,
         name="自碰撞",
-        default=False,
+        default=True,
         description="兼容旧选项；启用后会映射到“快速”自碰撞",
     )
     self_collision_mode: EnumProperty(
