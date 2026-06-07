@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from dataclasses import replace
 
 import bpy
 from mathutils import Vector
@@ -31,6 +32,21 @@ SELECT_SUZANNE = os.environ.get("SSBL_CS2_SELECT_SUZANNE", "1").strip().lower() 
 DISABLE_SELF_COLLISION = (
     os.environ.get("SSBL_CS2_DISABLE_SELF_COLLISION", "0").strip().lower() in {"1", "true", "yes", "on"}
 )
+DISABLE_LRA = os.environ.get("SSBL_CS2_DISABLE_LRA", "0").strip().lower() in {"1", "true", "yes", "on"}
+DISABLE_BEND = os.environ.get("SSBL_CS2_DISABLE_BEND", "0").strip().lower() in {"1", "true", "yes", "on"}
+SKIP_RENDER = os.environ.get("SSBL_CS2_SKIP_RENDER", "0").strip().lower() in {"1", "true", "yes", "on"}
+SKIP_SURFACE_METRICS = (
+    os.environ.get("SSBL_CS2_SKIP_SURFACE_METRICS", "1" if SKIP_RENDER else "0").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+FORCE_OBJECT_HARDNESS_RAW = os.environ.get("SSBL_CS2_FORCE_OBJECT_HARDNESS")
+FORCE_OBJECT_HARDNESS = (
+    None
+    if FORCE_OBJECT_HARDNESS_RAW is None or FORCE_OBJECT_HARDNESS_RAW.strip() == ""
+    else max(0.0, min(1.0, float(FORCE_OBJECT_HARDNESS_RAW)))
+)
+MAX_EDGE_RATIO_LIMIT = float(os.environ.get("SSBL_CS2_MAX_EDGE_RATIO", "1.35"))
+RESTORE_TOLERANCE = float(os.environ.get("SSBL_CS2_RESTORE_TOLERANCE", "1.0e-7"))
 
 
 def _look_at(obj: bpy.types.Object, target: Vector) -> None:
@@ -58,6 +74,68 @@ def _slot_max_edge_ratio(slot) -> float:
     ratios = current / np.maximum(rest, 1.0e-8)
     finite = ratios[np.isfinite(ratios)]
     return float(np.max(finite)) if len(finite) else float("inf")
+
+
+def _slot_edge_ratio_summary(slot) -> dict[str, float | int | None]:
+    positions = np.asarray(slot.current_positions_world, dtype=np.float64)
+    edges = np.asarray(slot.cloth.edges, dtype=np.int32)
+    rest = np.asarray(slot.cloth.edge_rest_lengths, dtype=np.float64)
+    inv_mass = np.asarray(getattr(slot.cloth, "inv_mass", []), dtype=np.float64)
+    if len(edges) == 0 or len(rest) == 0:
+        return {
+            "max": 1.0,
+            "mean": 1.0,
+            "p99": 1.0,
+            "current_length": None,
+            "rest_length": None,
+            "edge_index": None,
+            "edge_v0": None,
+            "edge_v1": None,
+            "edge_v0_pinned": None,
+            "edge_v1_pinned": None,
+            "edge_v0_degree": None,
+            "edge_v1_degree": None,
+        }
+    current = np.linalg.norm(positions[edges[:, 0]] - positions[edges[:, 1]], axis=1)
+    ratios = current / np.maximum(rest, 1.0e-8)
+    finite_mask = np.isfinite(ratios)
+    if not np.any(finite_mask):
+        return {
+            "max": float("inf"),
+            "mean": float("inf"),
+            "p99": float("inf"),
+            "current_length": None,
+            "rest_length": None,
+            "edge_index": None,
+            "edge_v0": None,
+            "edge_v1": None,
+            "edge_v0_pinned": None,
+            "edge_v1_pinned": None,
+            "edge_v0_degree": None,
+            "edge_v1_degree": None,
+        }
+    finite = ratios[finite_mask]
+    finite_indices = np.flatnonzero(finite_mask)
+    local_max_index = int(np.argmax(finite))
+    edge_index = int(finite_indices[local_max_index])
+    edge = edges[edge_index]
+    v0 = int(edge[0])
+    v1 = int(edge[1])
+    degrees = np.bincount(edges.reshape(-1), minlength=len(positions)) if len(edges) else np.zeros(len(positions), dtype=np.int32)
+    return {
+        "max": float(finite[local_max_index]),
+        "mean": float(np.mean(finite)),
+        "p99": float(np.percentile(finite, 99.0)),
+        "current_length": float(current[edge_index]),
+        "rest_length": float(rest[edge_index]),
+        "edge_index": edge_index,
+        "edge_v0": v0,
+        "edge_v1": v1,
+        "edge_v0_pinned": bool(len(inv_mass) > v0 and inv_mass[v0] <= 0.0),
+        "edge_v1_pinned": bool(len(inv_mass) > v1 and inv_mass[v1] <= 0.0),
+        "edge_v0_degree": int(degrees[v0]) if len(degrees) > v0 else None,
+        "edge_v1_degree": int(degrees[v1]) if len(degrees) > v1 else None,
+    }
 
 
 def _sample_indices(count: int, limit: int) -> np.ndarray:
@@ -248,15 +326,76 @@ def _snapshot(obj: bpy.types.Object) -> list[tuple[float, float, float]]:
     return [(float(vertex.co.x), float(vertex.co.y), float(vertex.co.z)) for vertex in obj.data.vertices]
 
 
+def _settings_snapshot(obj: bpy.types.Object) -> dict[str, float | bool | str]:
+    settings = obj.ssbl_cloth
+    keys = (
+        "enabled",
+        "hardness",
+        "use_lra",
+        "lra_compliance",
+        "lra_slack",
+        "stretch_compliance",
+        "bend_compliance",
+        "self_collision",
+        "self_collision_mode",
+        "collision_margin",
+        "cloth_thickness",
+    )
+    result: dict[str, float | bool | str] = {}
+    for key in keys:
+        if hasattr(settings, key):
+            value = getattr(settings, key)
+            if isinstance(value, bool):
+                result[key] = bool(value)
+            elif isinstance(value, (int, float)):
+                result[key] = float(value)
+            else:
+                result[key] = str(value)
+    return result
+
+
+def _install_constraint_disable_patches(xpbd_core) -> None:
+    if not DISABLE_LRA and not DISABLE_BEND:
+        return
+    import ssbl.session_manager as session_manager
+
+    original_build_cloth_data = xpbd_core.build_cloth_data
+
+    def _filtered_build_cloth_data(*args, **kwargs):
+        cloth = original_build_cloth_data(*args, **kwargs)
+        updates = {}
+        if DISABLE_BEND:
+            updates.update(
+                bends=np.empty((0, 2), dtype=np.int32),
+                bend_rest_lengths=np.empty(0, dtype=np.float32),
+                bend_color_offsets=np.asarray([0], dtype=np.int32),
+            )
+        if DISABLE_LRA:
+            updates.update(
+                lra_edges=np.empty((0, 2), dtype=np.int32),
+                lra_rest_lengths=np.empty(0, dtype=np.float32),
+                lra_color_offsets=np.asarray([0], dtype=np.int32),
+            )
+        return replace(cloth, **updates)
+
+    xpbd_core.build_cloth_data = _filtered_build_cloth_data
+    session_manager.build_cloth_data = _filtered_build_cloth_data
+    xpbd_core.clear_cloth_topology_cache()
+
+
 def main() -> None:
     bpy.ops.wm.open_mainfile(filepath=BLEND_PATH, load_ui=False)
     import ssbl
+    import ssbl.xpbd_core as xpbd_core
 
     try:
         ssbl.unregister()
     except Exception:
         pass
     ssbl.register()
+    _install_constraint_disable_patches(xpbd_core)
+
+    sync_hardness_settings = xpbd_core.sync_hardness_settings
 
     frames_dir = OUTPUT_DIR / "frames"
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -280,6 +419,13 @@ def main() -> None:
         obj.hide_viewport = False
         obj.ssbl_cloth.enabled = True
         obj.ssbl_cloth.preview_writeback_interval = 0
+        if FORCE_OBJECT_HARDNESS is not None:
+            obj.ssbl_cloth.hardness = float(FORCE_OBJECT_HARDNESS)
+            obj.ssbl_cloth.hardness_initialized = True
+            sync_hardness_settings(obj.ssbl_cloth)
+        if DISABLE_LRA:
+            obj.ssbl_cloth.use_lra = False
+            obj.ssbl_cloth.lra_compliance = 0.0
         if DISABLE_SELF_COLLISION:
             obj.ssbl_cloth.self_collision = False
     cube.select_set(SELECT_CUBE)
@@ -316,6 +462,19 @@ def main() -> None:
     max_abi41_bending_texture_ready = 0
     total_abi41_tack_jitter_guarded = 0
     total_abi41_bending_guarded = 0
+    total_abi41_hard_projection_fallbacks = 0
+    max_abi41_hard_projection_fallbacks = 0
+    total_pcg_iterations = 0
+    total_pcg_solve_ms = 0.0
+    total_pcg_system_ms = 0.0
+    total_pcg_ad_ms = 0.0
+    max_pcg_initial_residual = 0.0
+    max_pcg_final_residual = 0.0
+    max_pcg_max_delta = 0.0
+    max_pcg_guarded = 0
+    max_pcg_csr_nnz = 0
+    max_pcg_texture_ready = 0
+    slot_edge_ratio_peaks: dict[str, dict[str, float | int | None]] = {}
     min_aabb_distance = float("inf")
     min_surface_distance = float("inf")
     max_near_contact_vertices = 0
@@ -358,8 +517,35 @@ def main() -> None:
         )
         total_abi41_tack_jitter_guarded += int(getattr(diag, "abi41_tack_jitter_guarded", 0))
         total_abi41_bending_guarded += int(getattr(diag, "abi41_bending_guarded", 0))
-        for slot in session.slots.values():
-            max_edge_ratio = max(max_edge_ratio, _slot_max_edge_ratio(slot))
+        hard_fallbacks = int(getattr(diag, "abi41_hard_projection_fallbacks", 0))
+        total_abi41_hard_projection_fallbacks += hard_fallbacks
+        max_abi41_hard_projection_fallbacks = max(max_abi41_hard_projection_fallbacks, hard_fallbacks)
+        total_pcg_iterations += int(getattr(diag, "abi41_pcg_iterations", 0))
+        total_pcg_solve_ms += float(getattr(diag, "abi41_pcg_solve_ms", 0.0))
+        total_pcg_system_ms += float(getattr(diag, "abi41_pcg_system_ms", 0.0))
+        total_pcg_ad_ms += float(getattr(diag, "abi41_pcg_ad_ms", 0.0))
+        max_pcg_initial_residual = max(
+            max_pcg_initial_residual,
+            float(getattr(diag, "abi41_pcg_initial_residual", 0.0)),
+        )
+        max_pcg_final_residual = max(
+            max_pcg_final_residual,
+            float(getattr(diag, "abi41_pcg_final_residual", 0.0)),
+        )
+        max_pcg_max_delta = max(max_pcg_max_delta, float(getattr(diag, "abi41_pcg_max_delta", 0.0)))
+        max_pcg_guarded = max(max_pcg_guarded, int(getattr(diag, "abi41_pcg_guarded", 0)))
+        max_pcg_csr_nnz = max(max_pcg_csr_nnz, int(getattr(diag, "abi41_pcg_csr_nnz", 0)))
+        max_pcg_texture_ready = max(max_pcg_texture_ready, int(getattr(diag, "abi41_pcg_texture_ready", 0)))
+        slot_edge_ratios = {}
+        for slot_name, slot in session.slots.items():
+            slot_ratio = _slot_edge_ratio_summary(slot)
+            slot_edge_ratios[slot_name] = slot_ratio
+            max_edge_ratio = max(max_edge_ratio, float(slot_ratio["max"]))
+            previous_peak = slot_edge_ratio_peaks.get(slot_name)
+            if previous_peak is None or float(slot_ratio["max"]) > float(previous_peak["max"]):
+                peak = dict(slot_ratio)
+                peak["frame"] = frame
+                slot_edge_ratio_peaks[slot_name] = peak
         active_slot = session.slots.get(active_obj.name)
         if active_slot is not None and cube.name not in session.slots:
             sphere_metrics = _sphere_gap_metrics(
@@ -385,7 +571,9 @@ def main() -> None:
             )
             min_aabb_distance = min(min_aabb_distance, aabb_distance)
             contact_distance = max(float(slot_a.external_contact_distance), float(slot_b.external_contact_distance))
-            if aabb_distance <= max(contact_distance * 4.0, 0.08) or int(diag.dynamic_triangle_count) > 0:
+            if not SKIP_SURFACE_METRICS and (
+                aabb_distance <= max(contact_distance * 4.0, 0.08) or int(diag.dynamic_triangle_count) > 0
+            ):
                 surface_metrics = _cross_surface_metrics(slot_a, slot_b, contact_distance)
             else:
                 surface_metrics = {"min_surface_distance": None, "near_contact_vertices": 0}
@@ -422,27 +610,58 @@ def main() -> None:
             "abi41_bending_texture_ready": int(getattr(diag, "abi41_bending_texture_ready", 0)),
             "abi41_tack_jitter_guarded": int(getattr(diag, "abi41_tack_jitter_guarded", 0)),
             "abi41_bending_guarded": int(getattr(diag, "abi41_bending_guarded", 0)),
+            "abi41_hard_projection_fallbacks": int(getattr(diag, "abi41_hard_projection_fallbacks", 0)),
+            "pcg_iterations": int(getattr(diag, "abi41_pcg_iterations", 0)),
+            "pcg_csr_nnz": int(getattr(diag, "abi41_pcg_csr_nnz", 0)),
+            "pcg_texture_ready": int(getattr(diag, "abi41_pcg_texture_ready", 0)),
+            "pcg_guarded": int(getattr(diag, "abi41_pcg_guarded", 0)),
+            "pcg_initial_residual": float(getattr(diag, "abi41_pcg_initial_residual", 0.0)),
+            "pcg_final_residual": float(getattr(diag, "abi41_pcg_final_residual", 0.0)),
+            "pcg_max_delta": float(getattr(diag, "abi41_pcg_max_delta", 0.0)),
+            "pcg_solve_ms": float(getattr(diag, "abi41_pcg_solve_ms", 0.0)),
+            "pcg_system_ms": float(getattr(diag, "abi41_pcg_system_ms", 0.0)),
+            "pcg_ad_ms": float(getattr(diag, "abi41_pcg_ad_ms", 0.0)),
             "min_gap": None if diag.min_gap is None else float(diag.min_gap),
             "aabb_distance": aabb_distance,
             "min_surface_distance": surface_metrics["min_surface_distance"],
             "near_contact_vertices": surface_metrics["near_contact_vertices"],
             "min_sphere_gap": sphere_metrics["min_sphere_gap"],
             "sphere_penetrating_vertices": sphere_metrics["sphere_penetrating_vertices"],
+            "slot_edge_ratios": slot_edge_ratios,
             "max_edge_ratio_so_far": float(max_edge_ratio),
         }
         samples.append(item)
-        if frame == 1 or frame % RENDER_STRIDE == 0 or int(diag.dynamic_triangle_count) > 0:
+        if not SKIP_RENDER and (frame == 1 or frame % RENDER_STRIDE == 0 or int(diag.dynamic_triangle_count) > 0):
             _render_frame(scene, frames_dir, render_index)
             render_index += 1
         if finished:
             break
     final_diag = ssbl.solver.session_diagnostics(active_obj)
     stopped = ssbl.solver.request_stop(active_obj)
-    video = _encode_video(frames_dir, OUTPUT_DIR / "cs2_multicloth_check.mp4")
+    video = "" if SKIP_RENDER else _encode_video(frames_dir, OUTPUT_DIR / "cs2_multicloth_check.mp4")
+    video_bytes = (
+        Path(video).stat().st_size
+        if video and Path(video).exists()
+        else 0
+    )
     summary = {
         "blend_file": bpy.data.filepath,
         "output_dir": str(OUTPUT_DIR),
         "video": video,
+        "video_bytes": int(video_bytes),
+        "skip_render": bool(SKIP_RENDER),
+        "skip_surface_metrics": bool(SKIP_SURFACE_METRICS),
+        "forced_hardness": None if FORCE_OBJECT_HARDNESS is None else float(FORCE_OBJECT_HARDNESS),
+        "disable_lra": bool(DISABLE_LRA),
+        "disable_bend": bool(DISABLE_BEND),
+        "settings": {
+            cube.name: _settings_snapshot(cube),
+            suzanne.name: _settings_snapshot(suzanne),
+        },
+        "limits": {
+            "max_edge_ratio": float(MAX_EDGE_RATIO_LIMIT),
+            "restore_delta": float(RESTORE_TOLERANCE),
+        },
         "frames_requested": FRAME_COUNT,
         "frames_sampled": len(samples),
         "slots": len(session.slots),
@@ -476,6 +695,19 @@ def main() -> None:
         "max_abi41_bending_texture_ready": int(max_abi41_bending_texture_ready),
         "total_abi41_tack_jitter_guarded": int(total_abi41_tack_jitter_guarded),
         "total_abi41_bending_guarded": int(total_abi41_bending_guarded),
+        "total_abi41_hard_projection_fallbacks": int(total_abi41_hard_projection_fallbacks),
+        "max_abi41_hard_projection_fallbacks": int(max_abi41_hard_projection_fallbacks),
+        "total_pcg_iterations": int(total_pcg_iterations),
+        "total_pcg_solve_ms": float(total_pcg_solve_ms),
+        "total_pcg_system_ms": float(total_pcg_system_ms),
+        "total_pcg_ad_ms": float(total_pcg_ad_ms),
+        "max_pcg_initial_residual": float(max_pcg_initial_residual),
+        "max_pcg_final_residual": float(max_pcg_final_residual),
+        "max_pcg_max_delta": float(max_pcg_max_delta),
+        "max_pcg_guarded": int(max_pcg_guarded),
+        "max_pcg_csr_nnz": int(max_pcg_csr_nnz),
+        "max_pcg_texture_ready": int(max_pcg_texture_ready),
+        "slot_edge_ratio_peaks": slot_edge_ratio_peaks,
         "finite": bool(finite),
         "stopped": bool(stopped),
         "restore_delta_cube": _restore_mesh_delta(cube, before_cube),
@@ -496,14 +728,33 @@ def main() -> None:
         "final_abi41_bending_texture_ready": int(getattr(final_diag, "abi41_bending_texture_ready", 0)),
         "final_abi41_tack_jitter_guarded": int(getattr(final_diag, "abi41_tack_jitter_guarded", 0)),
         "final_abi41_bending_guarded": int(getattr(final_diag, "abi41_bending_guarded", 0)),
+        "final_abi41_hard_projection_fallbacks": int(getattr(final_diag, "abi41_hard_projection_fallbacks", 0)),
         "final_analytic_collision_ms": float(final_diag.analytic_collision_ms),
         "final_dynamic_collision_ms": float(final_diag.dynamic_collision_ms),
         "final_dynamic_particle_collision_ms": float(final_diag.dynamic_particle_collision_ms),
         "samples": samples,
     }
+    failures = []
+    if len(session.slots) != EXPECTED_SLOTS:
+        failures.append(f"slots {len(session.slots)} != {EXPECTED_SLOTS}")
+    if str(session.cross_cloth_mode) != EXPECTED_CROSS_MODE:
+        failures.append(f"cross_mode {session.cross_cloth_mode} != {EXPECTED_CROSS_MODE}")
+    if not finite:
+        failures.append("simulation produced non-finite vertices")
+    if summary["restore_delta_cube"] > RESTORE_TOLERANCE:
+        failures.append(f"restore_delta_cube {summary['restore_delta_cube']} > {RESTORE_TOLERANCE}")
+    if summary["restore_delta_suzanne"] > RESTORE_TOLERANCE:
+        failures.append(f"restore_delta_suzanne {summary['restore_delta_suzanne']} > {RESTORE_TOLERANCE}")
+    if max_edge_ratio > MAX_EDGE_RATIO_LIMIT:
+        failures.append(f"max_edge_ratio {max_edge_ratio} > {MAX_EDGE_RATIO_LIMIT}")
+    if not SKIP_RENDER and video_bytes <= 0:
+        failures.append("video was not created or is empty")
+    summary["passed"] = not failures
+    summary["failures"] = failures
     (OUTPUT_DIR / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    print("SSBL_CS2_MULTICLOTH_CHECK", json.dumps({k: v for k, v in summary.items() if k != "samples"}, ensure_ascii=False, sort_keys=True))
-    if len(session.slots) != EXPECTED_SLOTS or str(session.cross_cloth_mode) != EXPECTED_CROSS_MODE or not finite:
+    marker = "SSBL_CS2_MULTICLOTH_CHECK" if not failures else "SSBL_CS2_MULTICLOTH_CHECK_FAIL"
+    print(marker, json.dumps({k: v for k, v in summary.items() if k != "samples"}, ensure_ascii=False, sort_keys=True))
+    if failures:
         raise RuntimeError(f"cs2 multi-cloth recording validation failed: {summary}")
 
 

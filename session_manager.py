@@ -5,7 +5,6 @@ from dataclasses import dataclass, field, replace
 import hashlib
 import math
 import os
-import re
 import struct
 import time
 from typing import Callable, Optional
@@ -15,6 +14,7 @@ from mathutils import Vector
 import numpy as np
 
 from .collision import clear_static_collision_cache, collect_static_triangles
+from .cache_names import safe_cache_stem
 from .force_fields import EMPTY_FORCE_FIELD_BATCH, ForceFieldBatch, collect_force_fields, has_force_field_sources
 from .native_backend import NativeStepDiagnostics, NativeXpbdSolver, status as native_status
 from .xpbd_core import (
@@ -2600,7 +2600,7 @@ def _apply_runtime_inputs(
 
 
 def _effective_use_evaluated_mesh(obj: bpy.types.Object, settings) -> bool:
-    if bool(getattr(settings, "use_evaluated_mesh", True)):
+    if bool(getattr(settings, "use_evaluated_mesh", False)):
         return True
     # Hook modifiers are often used as animated handles for pin targets. If we
     # read the raw mesh in that case, the handles move in Blender but the solver
@@ -3246,7 +3246,7 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
 
 
 def _cache_path_for_object(obj: bpy.types.Object) -> str:
-    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", obj.name).strip("_") or "cloth"
+    safe_name = safe_cache_stem(obj.name)
     if bpy.data.filepath:
         root = bpy.path.abspath("//")
     else:

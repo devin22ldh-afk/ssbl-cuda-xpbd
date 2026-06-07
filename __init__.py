@@ -260,7 +260,7 @@ class SSBL_PreviewSettings(PropertyGroup):
     )
     use_evaluated_mesh: BoolProperty(
         name="动态网格",
-        default=True,
+        default=False,
         description="读取 Blender 修改器和绑定后的动态网格输入；顶点数和拓扑必须保持不变",
     )
     multi_cloth_preview: BoolProperty(
@@ -345,7 +345,7 @@ class SSBL_PreviewSettings(PropertyGroup):
     )
     damping: FloatProperty(
         name="速度阻尼",
-        default=0.9999,
+        default=0.999,
         min=0.0,
         max=1.0,
         description="每个子步施加的速度阻尼",
@@ -415,9 +415,9 @@ class SSBL_PreviewSettings(PropertyGroup):
         name="Overpressure strength",
         default=0.02,
         min=0.0,
-        soft_max=2.0,
+        soft_max=0.2,
         precision=3,
-        description="Outward force strength applied along the cloth surface normal",
+        description="Density- and mesh-adaptive outward pressure applied along cloth surface normals",
     )
     volume_target_scale: FloatProperty(
         name="Legacy volume target scale",
@@ -596,6 +596,14 @@ class SSBL_PreviewSettings(PropertyGroup):
         soft_max=0.1,
         precision=4,
         description="自碰撞时布料表面之间保持的最小分离距离；值越大布料看起来越厚、不会重叠",
+    )
+    self_collision_distance: FloatProperty(
+        name="自碰撞距离",
+        default=0.0,
+        min=0.0,
+        soft_max=0.1,
+        precision=4,
+        description="0 means automatic; positive values override the self-collision contact distance",
     )
     self_collision_interval: IntProperty(
         name="自碰撞间隔",

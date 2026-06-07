@@ -1,0 +1,40 @@
+schema_version = "1.0.0"
+
+id = "ssbl_cuda_xpbd"
+name = "SSBL CUDA XPBD"
+tagline = "CUDA XPBD cloth preview and PC2 baking from the Physics panel"
+type = "add-on"
+tags = ["Animation", "Physics", "Bake"]
+version = "0.4.2"
+blender_version_min = "5.0.0"
+maintainer = "Devin <devin22ldh@gmail.com>"
+license = [
+    "SPDX:GPL-3.0-or-later",
+]
+website = "TODO: replace with the GitHub Issues URL before Ready for Review"
+copyright = [
+    "2026 Devin",
+]
+
+[permissions]
+files = "Writes PC2 cache files and binds Mesh Cache modifiers"
+
+[build]
+paths_exclude_pattern = [
+    "__pycache__/",
+    "tools/__pycache__/",
+    ".*",
+    "*.zip",
+    "findings.md",
+    "progress.md",
+    "task_plan.md",
+    "recordings/",
+    "tools/",
+    "native/build/",
+    "native/lib/",
+    "native/bin/*.exe",
+    "native/bin/*_abi36.dll",
+    "native/bin/*_candidate.dll",
+    "dist/",
+    "ssbl_cache/",
+]

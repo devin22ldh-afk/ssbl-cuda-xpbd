@@ -41,6 +41,12 @@ FORCE_OBJECT_HARDNESS = (
     if FORCE_OBJECT_HARDNESS_RAW is None or FORCE_OBJECT_HARDNESS_RAW.strip() == ""
     else float(FORCE_OBJECT_HARDNESS_RAW)
 )
+FORCE_PRESSURE_STRENGTH_RAW = os.environ.get("SSBL_CS3_FORCE_PRESSURE_STRENGTH")
+FORCE_PRESSURE_STRENGTH = (
+    None
+    if FORCE_PRESSURE_STRENGTH_RAW is None or FORCE_PRESSURE_STRENGTH_RAW.strip() == ""
+    else float(FORCE_PRESSURE_STRENGTH_RAW)
+)
 
 
 def _run_checked(command: list[str]) -> subprocess.CompletedProcess:
@@ -160,6 +166,40 @@ def _slot_max_edge_ratio(slot) -> float:
     return float(np.max(finite)) if len(finite) else float("inf")
 
 
+def _slot_worst_edge(slot, frame: int) -> dict:
+    positions = np.asarray(slot.current_positions_world, dtype=np.float64)
+    edges = np.asarray(slot.cloth.edges, dtype=np.int32)
+    rest = np.asarray(slot.cloth.edge_rest_lengths, dtype=np.float64)
+    if len(edges) == 0 or len(rest) == 0:
+        return {
+            "frame": int(frame),
+            "edge_index": -1,
+            "v0": -1,
+            "v1": -1,
+            "rest_length": 0.0,
+            "current_length": 0.0,
+            "ratio": 1.0,
+        }
+    count = min(len(edges), len(rest))
+    edges = edges[:count]
+    rest = rest[:count]
+    current = np.linalg.norm(positions[edges[:, 0]] - positions[edges[:, 1]], axis=1)
+    ratios = current / np.maximum(rest, 1.0e-8)
+    finite_ratios = np.where(np.isfinite(ratios), ratios, np.inf)
+    edge_index = int(np.argmax(finite_ratios))
+    v0 = int(edges[edge_index, 0])
+    v1 = int(edges[edge_index, 1])
+    return {
+        "frame": int(frame),
+        "edge_index": edge_index,
+        "v0": v0,
+        "v1": v1,
+        "rest_length": float(rest[edge_index]),
+        "current_length": float(current[edge_index]),
+        "ratio": float(ratios[edge_index]),
+    }
+
+
 def _active_settings(scene: bpy.types.Scene, obj: bpy.types.Object):
     if hasattr(obj, "ssbl_cloth") and bool(getattr(obj.ssbl_cloth, "enabled", False)):
         return obj.ssbl_cloth, "object"
@@ -168,7 +208,22 @@ def _active_settings(scene: bpy.types.Scene, obj: bpy.types.Object):
 
 def _settings_snapshot(settings, scope: str) -> dict:
     snapshot = {"settings_scope": scope}
-    for key in ("hardness", "use_lra", "lra_compliance", "lra_slack", "stretch_compliance", "bend_compliance"):
+    for key in (
+        "hardness",
+        "density",
+        "substeps",
+        "iterations",
+        "dt",
+        "self_collision",
+        "self_collision_mode",
+        "use_volume_pressure",
+        "pressure_strength",
+        "use_lra",
+        "lra_compliance",
+        "lra_slack",
+        "stretch_compliance",
+        "bend_compliance",
+    ):
         if not hasattr(settings, key):
             continue
         value = getattr(settings, key)
@@ -258,6 +313,15 @@ def main() -> None:
         settings.hardness = float(FORCE_OBJECT_HARDNESS)
         settings.hardness_initialized = True
         sync_hardness_settings(settings)
+    if FORCE_PRESSURE_STRENGTH is not None:
+        if hasattr(obj, "ssbl_cloth"):
+            settings = obj.ssbl_cloth
+            settings.enabled = True
+            settings_scope = "object"
+        if hasattr(settings, "use_volume_pressure"):
+            settings.use_volume_pressure = FORCE_PRESSURE_STRENGTH > 0.0
+        if hasattr(settings, "pressure_strength"):
+            settings.pressure_strength = float(FORCE_PRESSURE_STRENGTH)
     settings.frame_count = FRAME_COUNT
     settings.preview_writeback_interval = 1
     settings_snapshot = _settings_snapshot(settings, settings_scope)
@@ -301,6 +365,15 @@ def main() -> None:
     abi41_lra_tack_count = 0
     abi41_tack_jitter_guarded = 0
     max_edge_ratio = 1.0
+    worst_edge_peak = {
+        "frame": 0,
+        "edge_index": -1,
+        "v0": -1,
+        "v1": -1,
+        "rest_length": 0.0,
+        "current_length": 0.0,
+        "ratio": 1.0,
+    }
     frame_paths: list[str] = []
     frames_sampled = 0
     started = time.perf_counter()
@@ -342,7 +415,10 @@ def main() -> None:
         raw_max_step = max(raw_max_step, float(np.max(raw_step_lengths)))
         rms_steps.append(float(np.sqrt(np.mean(step_lengths * step_lengths))))
         raw_rms_steps.append(float(np.sqrt(np.mean(raw_step_lengths * raw_step_lengths))))
-        max_edge_ratio = max(max_edge_ratio, _slot_max_edge_ratio(slot))
+        worst_edge = _slot_worst_edge(slot, frame)
+        max_edge_ratio = max(max_edge_ratio, float(worst_edge["ratio"]))
+        if float(worst_edge["ratio"]) > float(worst_edge_peak["ratio"]):
+            worst_edge_peak = worst_edge
 
         diag = ssbl.solver.session_diagnostics(obj)
         pcg_iterations += int(getattr(diag, "abi41_pcg_iterations", 0))
@@ -381,6 +457,7 @@ def main() -> None:
         "stopped": bool(stopped),
         "restore_delta": float(restore_delta),
         "max_edge_ratio": float(max_edge_ratio),
+        "worst_edge_peak": worst_edge_peak,
         "max_step": float(max_step),
         "mean_rms_step": float(np.mean(rms_steps)) if rms_steps else 0.0,
         "raw_max_step": float(raw_max_step),

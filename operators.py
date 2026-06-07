@@ -135,6 +135,22 @@ def _tag_areas(context: bpy.types.Context, area_types: set[str] | None = None) -
                 area.tag_redraw()
 
 
+def _has_scene_settings(context: bpy.types.Context) -> bool:
+    scene = getattr(context, "scene", None)
+    return scene is not None and hasattr(scene, "ssbl_preview")
+
+
+def _active_mesh_object(context: bpy.types.Context) -> bpy.types.Object | None:
+    obj = getattr(context, "active_object", None)
+    if obj is None or getattr(obj, "type", None) != "MESH":
+        return None
+    return obj
+
+
+def _has_active_object(context: bpy.types.Context) -> bool:
+    return getattr(context, "active_object", None) is not None
+
+
 class SSBL_OT_start_preview(bpy.types.Operator):
     bl_idname = "ssbl.start_preview"
     bl_label = "开始预览"
@@ -143,6 +159,10 @@ class SSBL_OT_start_preview(bpy.types.Operator):
 
     _timer = None
     _object_name = ""
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        return _has_scene_settings(context) and _active_mesh_object(context) is not None
 
     def invoke(self, context: bpy.types.Context, event):
         obj = context.active_object
@@ -202,6 +222,10 @@ class SSBL_OT_stop_preview(bpy.types.Operator):
     bl_description = "停止本地 CUDA XPBD 预览并恢复源网格"
     bl_options = {"REGISTER"}
 
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        return _has_active_object(context)
+
     def execute(self, context: bpy.types.Context):
         obj = context.active_object
         if obj is None or not solver.request_stop(obj):
@@ -217,6 +241,10 @@ class SSBL_OT_reset_preview(bpy.types.Operator):
     bl_label = "重置预览"
     bl_description = "将活动对象从当前预览会话恢复到原始状态"
     bl_options = {"REGISTER"}
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        return _has_active_object(context)
 
     def execute(self, context: bpy.types.Context):
         obj = context.active_object
@@ -236,6 +264,10 @@ class SSBL_OT_bake_xpbd_cache(bpy.types.Operator):
     bl_label = "烘焙 XPBD 缓存"
     bl_description = "使用 CUDA XPBD 将当前活动布料网格烘焙到本地 PC2 缓存"
     bl_options = {"REGISTER"}
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        return _has_scene_settings(context) and _active_mesh_object(context) is not None
 
     def execute(self, context: bpy.types.Context):
         obj = context.active_object
@@ -286,6 +318,10 @@ class SSBL_OT_clear_xpbd_cache(bpy.types.Operator):
     bl_label = "清除 XPBD 缓存"
     bl_description = "移除活动对象上的 SSBL XPBD PC2 缓存绑定"
     bl_options = {"REGISTER"}
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        return _has_active_object(context)
 
     def execute(self, context: bpy.types.Context):
         obj = context.active_object

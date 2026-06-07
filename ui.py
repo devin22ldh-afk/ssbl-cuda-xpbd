@@ -106,6 +106,8 @@ class SSBL_PT_material(bpy.types.Panel):
             sub = box_pressure.column(align=True)
             sub.separator()
             sub.prop(settings, "pressure_strength", text="内压强度")
+            if settings.pressure_strength >= 0.2:
+                sub.label(text="High pressure: use cautiously on dense meshes", icon="ERROR")
 
 
 class SSBL_PT_collision(bpy.types.Panel):
@@ -155,6 +157,7 @@ class SSBL_PT_collision(bpy.types.Panel):
             sub_self = box_self.column(align=True)
             sub_self.separator()
             sub_self.prop(settings, "self_collision_mode", text="算法模式")
+            sub_self.prop(settings, "self_collision_distance", text="自碰撞距离")
             if str(getattr(settings, "self_collision_mode", "fast")).lower() == "fast":
                 sub_self.prop(settings, "fast_self_collision_passes", text="快速遍数 (Passes)")
             sub_self.prop(settings, "max_self_collision_neighbors", text="最大邻居探测数")

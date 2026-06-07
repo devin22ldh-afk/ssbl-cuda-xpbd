@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Iterable
 
 import bpy
@@ -117,6 +118,8 @@ def visible_force_field_weight_properties() -> tuple[str, ...]:
 
 
 def _clamp_weight(value: float) -> float:
+    if not math.isfinite(value):
+        return 0.0
     if value < 0.0:
         return 0.0
     if value > 1.0:
@@ -124,8 +127,31 @@ def _clamp_weight(value: float) -> float:
     return value
 
 
+def _finite_float(value, default: float = 0.0) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    return result if math.isfinite(result) else default
+
+
+def _non_negative_float(value, default: float = 0.0) -> float:
+    return max(_finite_float(value, default), 0.0)
+
+
+def _finite_int(value, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _setting_weight(settings, identifier: str, default: float = 1.0) -> float:
-    return _clamp_weight(float(getattr(settings, identifier, default)))
+    return _clamp_weight(_finite_float(getattr(settings, identifier, default), default))
+
+
+def _setting_scale(settings, identifier: str, default: float = 1.0) -> float:
+    return _non_negative_float(getattr(settings, identifier, default), default)
 
 
 def gravity_weight(settings) -> float:
@@ -134,6 +160,10 @@ def gravity_weight(settings) -> float:
 
 def all_force_field_weight(settings) -> float:
     return _setting_weight(settings, "force_field_weight_all", 1.0)
+
+
+def force_field_strength_scale(settings) -> float:
+    return _setting_scale(settings, "force_field_strength_scale", 1.0)
 
 
 def field_type_weight(settings, field_type_name: str) -> float:
@@ -197,7 +227,7 @@ def collect_force_fields(
     settings,
 ) -> ForceFieldBatch:
     collection = getattr(settings, "force_field_collection", None)
-    all_weight = all_force_field_weight(settings)
+    all_weight = all_force_field_weight(settings) * force_field_strength_scale(settings)
     fields: list[ForceFieldSample] = []
     unsupported_count = 0
 
@@ -218,7 +248,7 @@ def collect_force_fields(
         direction, axis = _matrix_axes(matrix)
         origin = matrix.translation
         type_weight = field_type_weight(settings, field_type_name)
-        strength = float(getattr(field, "strength", 0.0)) * all_weight * type_weight
+        strength = _finite_float(getattr(field, "strength", 0.0), 0.0) * all_weight * type_weight
         fields.append(
             ForceFieldSample(
                 field_type=field_type,
@@ -226,26 +256,26 @@ def collect_force_fields(
                 origin=(float(origin.x), float(origin.y), float(origin.z)),
                 direction=direction,
                 axis=axis,
-                falloff_power=float(getattr(field, "falloff_power", 0.0)),
-                distance_min=max(float(getattr(field, "distance_min", 0.0)), 0.0),
-                distance_max=max(float(getattr(field, "distance_max", 0.0)), 0.0),
-                radial_min=max(float(getattr(field, "radial_min", 0.0)), 0.0),
-                radial_max=max(float(getattr(field, "radial_max", 0.0)), 0.0),
+                falloff_power=_non_negative_float(getattr(field, "falloff_power", 0.0), 0.0),
+                distance_min=_non_negative_float(getattr(field, "distance_min", 0.0), 0.0),
+                distance_max=_non_negative_float(getattr(field, "distance_max", 0.0), 0.0),
+                radial_min=_non_negative_float(getattr(field, "radial_min", 0.0), 0.0),
+                radial_max=_non_negative_float(getattr(field, "radial_max", 0.0), 0.0),
                 use_min_distance=1 if bool(getattr(field, "use_min_distance", False)) else 0,
                 use_max_distance=1 if bool(getattr(field, "use_max_distance", False)) else 0,
                 use_radial_min=1 if bool(getattr(field, "use_radial_min", False)) else 0,
                 use_radial_max=1 if bool(getattr(field, "use_radial_max", False)) else 0,
                 use_2d_force=1 if bool(getattr(field, "use_2d_force", False)) else 0,
-                noise=max(float(getattr(field, "noise", 0.0)), 0.0),
-                seed=int(getattr(field, "seed", 0)),
-                linear_drag=float(getattr(field, "linear_drag", 0.0)),
-                quadratic_drag=float(getattr(field, "quadratic_drag", 0.0)),
-                harmonic_damping=float(getattr(field, "harmonic_damping", 0.0)),
-                flow=float(getattr(field, "flow", 0.0)),
-                size=float(getattr(field, "size", 0.0)),
-                rest_length=float(getattr(field, "rest_length", 0.0)),
-                radial_falloff=float(getattr(field, "radial_falloff", 0.0)),
-                texture_nabla=float(getattr(field, "texture_nabla", 0.0)),
+                noise=_non_negative_float(getattr(field, "noise", 0.0), 0.0),
+                seed=_finite_int(getattr(field, "seed", 0), 0),
+                linear_drag=_non_negative_float(getattr(field, "linear_drag", 0.0), 0.0),
+                quadratic_drag=_non_negative_float(getattr(field, "quadratic_drag", 0.0), 0.0),
+                harmonic_damping=_non_negative_float(getattr(field, "harmonic_damping", 0.0), 0.0),
+                flow=_finite_float(getattr(field, "flow", 0.0), 0.0),
+                size=_non_negative_float(getattr(field, "size", 0.0), 0.0),
+                rest_length=_non_negative_float(getattr(field, "rest_length", 0.0), 0.0),
+                radial_falloff=_non_negative_float(getattr(field, "radial_falloff", 0.0), 0.0),
+                texture_nabla=_non_negative_float(getattr(field, "texture_nabla", 0.0), 0.0),
             )
         )
 

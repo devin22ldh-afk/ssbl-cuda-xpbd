@@ -38,6 +38,7 @@ typedef struct SsblXpbdConfig {
     int self_collision;
     int self_collision_mode;
     float cloth_thickness;
+    float self_collision_distance;
     int self_collision_interval;
     int max_self_collision_neighbors;
     int use_volume_pressure;

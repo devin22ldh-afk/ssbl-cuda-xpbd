@@ -33,6 +33,9 @@ EXPECTED_VISIBLE_WEIGHT_ORDER = (
 )
 
 
+PARAMETER_EFFECT_EPSILON = 2.0e-4
+
+
 def _clear_scene() -> None:
     bpy.ops.object.select_all(action="SELECT")
     bpy.ops.object.delete()
@@ -70,15 +73,69 @@ def _make_cloth(
 
 
 def _add_wind(name: str, strength: float, rotation=(0.0, 0.0, 0.0)) -> bpy.types.Object:
-    bpy.ops.object.effector_add(type="WIND", location=(0.0, 0.0, 0.0), rotation=rotation)
+    return _add_effector("WIND", name, strength, rotation=rotation)
+
+
+def _add_effector(
+    field_type: str,
+    name: str,
+    strength: float,
+    location: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    rotation=(0.0, 0.0, 0.0),
+) -> bpy.types.Object:
+    bpy.ops.object.effector_add(type=field_type, location=location, rotation=rotation)
     obj = bpy.context.object
     obj.name = name
     obj.field.strength = strength
     return obj
 
 
+def _set_field_property(field, identifier: str, value) -> None:
+    if not hasattr(field, identifier):
+        raise RuntimeError(f"Force field {getattr(field, 'type', 'UNKNOWN')} has no parameter {identifier!r}")
+    setattr(field, identifier, value)
+
+
+def _apply_field_properties(field, values: dict[str, object]) -> None:
+    for identifier, value in values.items():
+        _set_field_property(field, identifier, value)
+
+
 def _average_axis(obj: bpy.types.Object, axis_name: str) -> float:
     return sum(float(getattr(vertex.co, axis_name)) for vertex in obj.data.vertices) / max(len(obj.data.vertices), 1)
+
+
+def _shape_signature(obj: bpy.types.Object) -> tuple[float, ...]:
+    vertices = list(obj.data.vertices)
+    if not vertices:
+        return (0.0,) * 13
+    xs = [float(vertex.co.x) for vertex in vertices]
+    ys = [float(vertex.co.y) for vertex in vertices]
+    zs = [float(vertex.co.z) for vertex in vertices]
+    count = float(len(vertices))
+    return (
+        sum(xs) / count,
+        sum(ys) / count,
+        sum(zs) / count,
+        min(xs),
+        max(xs),
+        min(ys),
+        max(ys),
+        min(zs),
+        max(zs),
+        sum(abs(value) for value in xs) / count,
+        sum(abs(value) for value in ys) / count,
+        sum(abs(value) for value in zs) / count,
+        math.sqrt(sum(x * x + y * y + z * z for x, y, z in zip(xs, ys, zs)) / count),
+    )
+
+
+def _signature_delta(left: dict[str, object], right: dict[str, object]) -> float:
+    left_signature = tuple(left.get("signature", ()))
+    right_signature = tuple(right.get("signature", ()))
+    if len(left_signature) != len(right_signature):
+        return math.inf
+    return max(abs(float(a) - float(b)) for a, b in zip(left_signature, right_signature))
 
 
 def _run_preview(scene: bpy.types.Scene, obj: bpy.types.Object, steps: int = 5) -> dict[str, object]:
@@ -92,7 +149,9 @@ def _run_preview(scene: bpy.types.Scene, obj: bpy.types.Object, steps: int = 5) 
         ssbl.solver.step_timeline_preview(bpy.context, scene)
     diag = ssbl.solver.session_diagnostics(obj)
     avg_x = _average_axis(obj, "x")
+    avg_y = _average_axis(obj, "y")
     avg_z = _average_axis(obj, "z")
+    signature = _shape_signature(obj)
     finite = all(
         math.isfinite(float(component))
         for vertex in obj.data.vertices
@@ -102,11 +161,96 @@ def _run_preview(scene: bpy.types.Scene, obj: bpy.types.Object, steps: int = 5) 
     return {
         "slots": len(session.slots) if session else 0,
         "avg_x": avg_x,
+        "avg_y": avg_y,
         "avg_z": avg_z,
+        "signature": signature,
         "finite": bool(finite and diag.finite),
         "force_field_count": int(diag.force_field_count),
         "unsupported_force_field_count": int(diag.unsupported_force_field_count),
     }
+
+
+def _run_single_field_case(
+    scene: bpy.types.Scene,
+    name: str,
+    field_type: str,
+    strength: float,
+    configure=None,
+    cloth_location: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    field_location: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    field_rotation=(0.0, 0.0, 0.0),
+    steps: int = 5,
+) -> tuple[dict[str, object], object | None]:
+    _clear_scene()
+    cloth = _make_cloth(f"SSBL_{name}_Cloth", location=cloth_location)
+    field_obj = _add_effector(
+        field_type,
+        f"SSBL_{name}_{field_type}",
+        strength,
+        location=field_location,
+        rotation=field_rotation,
+    )
+    if configure is not None:
+        configure(field_obj.field)
+    run = _run_preview(scene, cloth, steps=steps)
+    batch = collect_force_fields(scene, bpy.context.evaluated_depsgraph_get(), cloth.ssbl_cloth)
+    sample = batch.fields[0] if batch.fields else None
+    return run, sample
+
+
+def _run_gravity_drag_case(
+    scene: bpy.types.Scene,
+    name: str,
+    configure_drag=None,
+    steps: int = 8,
+) -> tuple[dict[str, object], object | None]:
+    _clear_scene()
+    cloth = _make_cloth(
+        f"SSBL_{name}_Cloth",
+        location=(0.0, 0.0, 1.0),
+        gravity=(0.0, 0.0, -9.8),
+    )
+    if configure_drag is not None:
+        field_obj = _add_effector("DRAG", f"SSBL_{name}_DRAG", 1.0)
+        configure_drag(field_obj.field)
+    run = _run_preview(scene, cloth, steps=steps)
+    batch = collect_force_fields(scene, bpy.context.evaluated_depsgraph_get(), cloth.ssbl_cloth)
+    sample = batch.fields[0] if batch.fields else None
+    return run, sample
+
+
+def _has_parameter_effect(left: dict[str, object], right: dict[str, object], epsilon: float = PARAMETER_EFFECT_EPSILON) -> bool:
+    return bool(left.get("finite")) and bool(right.get("finite")) and _signature_delta(left, right) > epsilon
+
+
+def _sample_dict(sample) -> dict[str, object]:
+    if sample is None:
+        return {}
+    keys = (
+        "field_type",
+        "strength",
+        "falloff_power",
+        "distance_min",
+        "distance_max",
+        "radial_min",
+        "radial_max",
+        "use_min_distance",
+        "use_max_distance",
+        "use_radial_min",
+        "use_radial_max",
+        "use_2d_force",
+        "noise",
+        "seed",
+        "linear_drag",
+        "quadratic_drag",
+        "harmonic_damping",
+        "flow",
+        "size",
+        "rest_length",
+        "radial_falloff",
+        "texture_nabla",
+    )
+    return {key: getattr(sample, key) for key in keys}
 
 
 def _read_pc2_average_axis(path: str, sample_index: int, axis: int) -> float:
@@ -242,6 +386,129 @@ def main() -> None:
         visible_weight_order = tuple(visible_force_field_weight_properties())
 
         _clear_scene()
+        scale_cloth = _make_cloth("SSBL_Force_StrengthScale")
+        scale_cloth.ssbl_cloth.force_field_strength_scale = 0.5
+        _add_wind("SSBL_Wind_StrengthScale", 4.0)
+        scale_batch = collect_force_fields(scene, bpy.context.evaluated_depsgraph_get(), scale_cloth.ssbl_cloth)
+        scaled_strength = scale_batch.fields[0].strength if scale_batch.fields else 0.0
+
+        wind_plain, wind_plain_sample = _run_single_field_case(scene, "WindPlain", "WIND", 30.0)
+        wind_noisy, wind_noisy_sample = _run_single_field_case(
+            scene,
+            "WindNoisy",
+            "WIND",
+            30.0,
+            configure=lambda field: _apply_field_properties(field, {"noise": 1.1, "seed": 23}),
+        )
+        wind_noise_delta = _signature_delta(wind_plain, wind_noisy)
+
+        force_plain, force_plain_sample = _run_single_field_case(
+            scene,
+            "ForcePlain",
+            "FORCE",
+            12.0,
+            cloth_location=(1.0, 0.0, 0.0),
+        )
+        force_max_limited, force_max_limited_sample = _run_single_field_case(
+            scene,
+            "ForceMaxLimited",
+            "FORCE",
+            12.0,
+            configure=lambda field: _apply_field_properties(field, {"use_max_distance": True, "distance_max": 0.35}),
+            cloth_location=(1.0, 0.0, 0.0),
+        )
+        force_distance_delta = _signature_delta(force_plain, force_max_limited)
+
+        force_radial_limited, force_radial_limited_sample = _run_single_field_case(
+            scene,
+            "ForceRadialLimited",
+            "FORCE",
+            12.0,
+            configure=lambda field: _apply_field_properties(field, {"use_radial_max": True, "radial_max": 0.35}),
+            cloth_location=(1.0, 0.0, 0.0),
+        )
+        force_radial_delta = _signature_delta(force_plain, force_radial_limited)
+
+        force_3d, force_3d_sample = _run_single_field_case(
+            scene,
+            "Force3D",
+            "FORCE",
+            12.0,
+            cloth_location=(0.0, 0.0, 1.0),
+        )
+        force_2d, force_2d_sample = _run_single_field_case(
+            scene,
+            "Force2D",
+            "FORCE",
+            12.0,
+            configure=lambda field: _apply_field_properties(field, {"use_2d_force": True}),
+            cloth_location=(0.0, 0.0, 1.0),
+        )
+        force_2d_delta = _signature_delta(force_3d, force_2d)
+
+        turbulence_baseline, turbulence_baseline_sample = _run_single_field_case(
+            scene,
+            "TurbulenceBaseline",
+            "TURBULENCE",
+            24.0,
+            configure=lambda field: _apply_field_properties(field, {"noise": 0.8, "seed": 19, "size": 0.9, "flow": 0.0}),
+        )
+        turbulence_tuned, turbulence_tuned_sample = _run_single_field_case(
+            scene,
+            "TurbulenceTuned",
+            "TURBULENCE",
+            24.0,
+            configure=lambda field: _apply_field_properties(field, {"noise": 1.35, "seed": 19, "size": 0.35, "flow": 2.4}),
+        )
+        turbulence_parameter_delta = _signature_delta(turbulence_baseline, turbulence_tuned)
+
+        turbulence_flow_off, turbulence_flow_off_sample = _run_single_field_case(
+            scene,
+            "TurbulenceFlowOff",
+            "TURBULENCE",
+            24.0,
+            configure=lambda field: _apply_field_properties(field, {"noise": 0.9, "seed": 31, "size": 0.65, "flow": 0.0}),
+        )
+        turbulence_flow_on, turbulence_flow_on_sample = _run_single_field_case(
+            scene,
+            "TurbulenceFlowOn",
+            "TURBULENCE",
+            24.0,
+            configure=lambda field: _apply_field_properties(field, {"noise": 0.9, "seed": 31, "size": 0.65, "flow": 2.5}),
+        )
+        turbulence_flow_delta = _signature_delta(turbulence_flow_off, turbulence_flow_on)
+
+        drag_low, drag_low_sample = _run_gravity_drag_case(
+            scene,
+            "DragLow",
+            configure_drag=lambda field: _apply_field_properties(field, {"linear_drag": 0.02, "quadratic_drag": 0.0}),
+        )
+        drag_high, drag_high_sample = _run_gravity_drag_case(
+            scene,
+            "DragHigh",
+            configure_drag=lambda field: _apply_field_properties(field, {"linear_drag": 8.0, "quadratic_drag": 2.0}),
+        )
+        drag_parameter_delta = _signature_delta(drag_low, drag_high)
+
+        harmonic_short, harmonic_short_sample = _run_single_field_case(
+            scene,
+            "HarmonicShort",
+            "HARMONIC",
+            8.0,
+            configure=lambda field: _apply_field_properties(field, {"rest_length": 0.0, "harmonic_damping": 0.0}),
+            cloth_location=(1.0, 0.0, 0.0),
+        )
+        harmonic_long, harmonic_long_sample = _run_single_field_case(
+            scene,
+            "HarmonicLong",
+            "HARMONIC",
+            8.0,
+            configure=lambda field: _apply_field_properties(field, {"rest_length": 2.0, "harmonic_damping": 4.0}),
+            cloth_location=(1.0, 0.0, 0.0),
+        )
+        harmonic_parameter_delta = _signature_delta(harmonic_short, harmonic_long)
+
+        _clear_scene()
         bake_cloth = _make_cloth("SSBL_Force_Bake")
         _add_wind("SSBL_Wind_Bake", 40.0)
         cache_path = ssbl.solver.bake_xpbd_cache(bpy.context, bake_cloth)
@@ -272,6 +539,32 @@ def main() -> None:
             "visible_weight_order": visible_weight_order,
             "supported_field_count": len(supported_batch.fields),
             "unsupported_field_count": int(supported_batch.unsupported_count),
+            "scaled_strength": scaled_strength,
+            "wind_noise_delta": wind_noise_delta,
+            "wind_plain_sample": _sample_dict(wind_plain_sample),
+            "wind_noisy_sample": _sample_dict(wind_noisy_sample),
+            "force_distance_delta": force_distance_delta,
+            "force_plain_sample": _sample_dict(force_plain_sample),
+            "force_max_limited_sample": _sample_dict(force_max_limited_sample),
+            "force_radial_delta": force_radial_delta,
+            "force_radial_limited_sample": _sample_dict(force_radial_limited_sample),
+            "force_2d_delta": force_2d_delta,
+            "force_3d_sample": _sample_dict(force_3d_sample),
+            "force_2d_sample": _sample_dict(force_2d_sample),
+            "turbulence_parameter_delta": turbulence_parameter_delta,
+            "turbulence_baseline_sample": _sample_dict(turbulence_baseline_sample),
+            "turbulence_tuned_sample": _sample_dict(turbulence_tuned_sample),
+            "turbulence_flow_delta": turbulence_flow_delta,
+            "turbulence_flow_off_sample": _sample_dict(turbulence_flow_off_sample),
+            "turbulence_flow_on_sample": _sample_dict(turbulence_flow_on_sample),
+            "drag_parameter_delta": drag_parameter_delta,
+            "drag_low_sample": _sample_dict(drag_low_sample),
+            "drag_high_sample": _sample_dict(drag_high_sample),
+            "drag_low_avg_z": drag_low["avg_z"],
+            "drag_high_avg_z": drag_high["avg_z"],
+            "harmonic_parameter_delta": harmonic_parameter_delta,
+            "harmonic_short_sample": _sample_dict(harmonic_short_sample),
+            "harmonic_long_sample": _sample_dict(harmonic_long_sample),
             "bake_first_sample_z": first_sample_z,
             "bake_last_sample_z": last_sample_z,
             "bake_cache_exists": cache_exists,
@@ -305,6 +598,42 @@ def main() -> None:
             and result["visible_weight_order"] == EXPECTED_VISIBLE_WEIGHT_ORDER
             and result["supported_field_count"] == created_supported
             and result["unsupported_field_count"] == created_unsupported
+            and abs(result["scaled_strength"] - 2.0) < 1.0e-4
+            and _has_parameter_effect(wind_plain, wind_noisy)
+            and wind_noisy_sample is not None
+            and abs(float(wind_noisy_sample.noise) - 1.1) < 1.0e-4
+            and int(wind_noisy_sample.seed) == 23
+            and _has_parameter_effect(force_plain, force_max_limited)
+            and force_max_limited["avg_x"] < force_plain["avg_x"] - 0.005
+            and force_max_limited_sample is not None
+            and int(force_max_limited_sample.use_max_distance) == 1
+            and abs(float(force_max_limited_sample.distance_max) - 0.35) < 1.0e-4
+            and _has_parameter_effect(force_plain, force_radial_limited)
+            and force_radial_limited["avg_x"] < force_plain["avg_x"] - 0.005
+            and force_radial_limited_sample is not None
+            and int(force_radial_limited_sample.use_radial_max) == 1
+            and abs(float(force_radial_limited_sample.radial_max) - 0.35) < 1.0e-4
+            and _has_parameter_effect(force_3d, force_2d)
+            and force_3d["avg_z"] > force_2d["avg_z"] + 0.005
+            and force_2d_sample is not None
+            and int(force_2d_sample.use_2d_force) == 1
+            and _has_parameter_effect(turbulence_baseline, turbulence_tuned)
+            and turbulence_tuned_sample is not None
+            and abs(float(turbulence_tuned_sample.noise) - 1.35) < 1.0e-4
+            and abs(float(turbulence_tuned_sample.size) - 0.35) < 1.0e-4
+            and abs(float(turbulence_tuned_sample.flow) - 2.4) < 1.0e-4
+            and _has_parameter_effect(turbulence_flow_off, turbulence_flow_on)
+            and turbulence_flow_on_sample is not None
+            and abs(float(turbulence_flow_on_sample.flow) - 2.5) < 1.0e-4
+            and _has_parameter_effect(drag_low, drag_high)
+            and drag_high["avg_z"] > drag_low["avg_z"] + 0.005
+            and drag_high_sample is not None
+            and abs(float(drag_high_sample.linear_drag) - 8.0) < 1.0e-4
+            and abs(float(drag_high_sample.quadratic_drag) - 2.0) < 1.0e-4
+            and _has_parameter_effect(harmonic_short, harmonic_long)
+            and harmonic_long_sample is not None
+            and abs(float(harmonic_long_sample.rest_length) - 2.0) < 1.0e-4
+            and abs(float(harmonic_long_sample.harmonic_damping) - 4.0) < 1.0e-4
             and result["bake_cache_exists"]
             and result["bake_last_sample_z"] > result["bake_first_sample_z"] + 0.005
         ):

@@ -17,8 +17,7 @@ def _clear_scene():
     bpy.ops.object.delete()
 
 
-def _make_open_grid(name: str) -> bpy.types.Object:
-    size = 4
+def _make_open_grid(name: str, size: int = 4) -> bpy.types.Object:
     verts = []
     faces = []
     for y in range(size + 1):
@@ -53,11 +52,18 @@ def _finite(obj: bpy.types.Object) -> bool:
     )
 
 
-def _run_case(enabled: bool) -> dict[str, object]:
+def _run_case(
+    enabled: bool,
+    *,
+    grid_size: int = 4,
+    density: float = 1.0,
+    pressure_strength: float = 0.08,
+) -> dict[str, object]:
     _clear_scene()
-    obj = _make_open_grid("SSBL_Overpressure_On" if enabled else "SSBL_Overpressure_Off")
+    obj = _make_open_grid("SSBL_Overpressure_On" if enabled else "SSBL_Overpressure_Off", grid_size)
     settings = bpy.context.scene.ssbl_preview
     settings.frame_count = 30
+    settings.density = float(density)
     settings.use_evaluated_mesh = False
     settings.pin_vertex_group = ""
     settings.use_ground = False
@@ -68,7 +74,7 @@ def _run_case(enabled: bool) -> dict[str, object]:
     settings.iterations = 1
     settings.preview_writeback_interval = 1
     settings.use_volume_pressure = bool(enabled)
-    settings.pressure_strength = 90.0 if enabled else 0.0
+    settings.pressure_strength = float(pressure_strength) if enabled else 0.0
 
     ssbl.solver.start_preview(bpy.context, obj)
     for _index in range(12):
@@ -76,6 +82,8 @@ def _run_case(enabled: bool) -> dict[str, object]:
     diag = ssbl.solver.session_diagnostics(obj)
     result = {
         "enabled": bool(enabled),
+        "grid_size": int(grid_size),
+        "density": float(density),
         "finite": bool(_finite(obj) and diag.finite),
         "average_z": _average_axis(obj, "z"),
         "force_field_count": int(diag.force_field_count),
@@ -93,17 +101,36 @@ def main():
     try:
         off = _run_case(False)
         on = _run_case(True)
+        dense_mesh = _run_case(True, grid_size=16)
+        heavy = _run_case(True, density=2.0)
+        base_delta = float(on["average_z"]) - float(off["average_z"])
+        dense_mesh_delta = float(dense_mesh["average_z"]) - float(off["average_z"])
+        heavy_delta = float(heavy["average_z"]) - float(off["average_z"])
         result = {
             "off": off,
             "on": on,
-            "average_z_delta": float(on["average_z"]) - float(off["average_z"]),
+            "average_z_delta": base_delta,
+            "mesh_adaptive": {
+                "base_delta": base_delta,
+                "dense_mesh_delta": dense_mesh_delta,
+                "dense_mesh_ratio": dense_mesh_delta / max(base_delta, 1.0e-8),
+            },
+            "density_adaptive": {
+                "density_1_delta": base_delta,
+                "density_2_delta": heavy_delta,
+                "density_2_ratio": heavy_delta / max(base_delta, 1.0e-8),
+            },
         }
         print("SSBL_OVERPRESSURE_COMPARE", json.dumps(result, ensure_ascii=False, sort_keys=True))
         if not (
             off["finite"]
             and on["finite"]
+            and dense_mesh["finite"]
+            and heavy["finite"]
             and abs(float(off["average_z"])) < 1.0e-4
-            and result["average_z_delta"] > 0.01
+            and base_delta > 0.01
+            and 0.85 <= result["mesh_adaptive"]["dense_mesh_ratio"] <= 1.15
+            and 0.40 <= result["density_adaptive"]["density_2_ratio"] <= 0.60
         ):
             raise RuntimeError(f"Overpressure comparison failed: {result}")
     finally:

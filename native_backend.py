@@ -46,6 +46,7 @@ class _NativeConfig(ctypes.Structure):
         ("self_collision", ctypes.c_int),
         ("self_collision_mode", ctypes.c_int),
         ("cloth_thickness", ctypes.c_float),
+        ("self_collision_distance", ctypes.c_float),
         ("self_collision_interval", ctypes.c_int),
         ("max_self_collision_neighbors", ctypes.c_int),
         ("use_volume_pressure", ctypes.c_int),
@@ -587,6 +588,7 @@ def _config_from_options(
     cfg.self_collision = int(options.self_collision)
     cfg.self_collision_mode = int(options.self_collision_mode)
     cfg.cloth_thickness = float(getattr(options, 'cloth_thickness', 0.02))
+    cfg.self_collision_distance = float(getattr(options, "self_collision_distance", 0.0))
     cfg.self_collision_interval = int(options.self_collision_interval)
     cfg.max_self_collision_neighbors = int(options.max_self_collision_neighbors)
     cfg.use_volume_pressure = int(options.use_volume_pressure)

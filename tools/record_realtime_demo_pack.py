@@ -363,7 +363,7 @@ def _encode_video(frames_dir: Path, video_path: Path, overlay_text_frames: list[
     filter_chain = (
         "scale=trunc(iw/2)*2:trunc(ih/2)*2,"
         "subtitles=overlay.srt:"
-        "force_style='FontName=Arial,FontSize=23,Bold=1,Alignment=7,MarginL=28,MarginV=24,"
+        "force_style='FontName=Arial,FontSize=20,Bold=1,Alignment=7,MarginL=28,MarginV=24,"
         "BorderStyle=3,Outline=0,Shadow=0,BackColour=&H66000000,PrimaryColour=&H00FFFFFF,LineSpacing=6'"
     )
     _run_checked(
@@ -376,6 +376,10 @@ def _encode_video(frames_dir: Path, video_path: Path, overlay_text_frames: list[
             "frame_%04d.png",
             "-c:v",
             "libx264",
+            "-preset",
+            "slow",
+            "-crf",
+            "18",
             "-pix_fmt",
             "yuv420p",
             "-movflags",
@@ -848,15 +852,169 @@ def _make_clothesline_visual() -> None:
         clip.data.materials.append(clip_mat)
 
 
+def _activate_only(obj: bpy.types.Object) -> None:
+    bpy.ops.object.select_all(action="DESELECT")
+    obj.select_set(True)
+    bpy.context.view_layer.objects.active = obj
+
+
+def _apply_object_rotation_scale(obj: bpy.types.Object) -> None:
+    _activate_only(obj)
+    bpy.ops.object.transform_apply(location=False, rotation=True, scale=True)
+
+
+def _apply_modifier(obj: bpy.types.Object, modifier_name: str) -> None:
+    _activate_only(obj)
+    bpy.ops.object.modifier_apply(modifier=modifier_name)
+
+
+def _move_object_to_collection(collection: bpy.types.Collection, obj: bpy.types.Object) -> None:
+    for owner in list(obj.users_collection):
+        try:
+            owner.objects.unlink(obj)
+        except Exception:
+            pass
+    if collection.objects.get(obj.name) is None:
+        collection.objects.link(obj)
+
+
+def _make_pressure_collision_chamber() -> bpy.types.Collection:
+    chamber_collection = bpy.data.collections.new("SSBL_Demo_Pressure_Chamber_Collection")
+    bpy.context.scene.collection.children.link(chamber_collection)
+    frame_mat = _material("SSBL_Demo_Chamber_Frame", (0.10, 0.12, 0.16, 1.0))
+    wall_mat = _material("SSBL_Demo_Chamber_Wall", (0.09, 0.105, 0.13, 1.0))
+    floor_mat = _material("SSBL_Demo_Chamber_Floor", (0.045, 0.052, 0.065, 1.0))
+    specs = [
+        ("Floor", (0.0, 0.10, 0.00), (1.95, 1.55, 0.06), floor_mat),
+        ("Back", (0.0, 1.55, 1.55), (1.95, 0.06, 1.55), wall_mat),
+        ("Left", (-1.95, 0.10, 1.55), (0.06, 1.55, 1.55), wall_mat),
+        ("Right", (1.95, 0.10, 1.55), (0.06, 1.55, 1.55), wall_mat),
+        ("Ceiling", (0.0, 0.10, 3.10), (1.95, 1.55, 0.06), wall_mat),
+    ]
+    for label, location, scale, material in specs:
+        bpy.ops.mesh.primitive_cube_add(location=location, scale=scale)
+        wall = bpy.context.object
+        wall.name = f"SSBL_Demo_Chamber_{label}"
+        wall.data.materials.append(material)
+        if label in {"Back", "Left", "Right", "Ceiling"}:
+            wall.hide_render = True
+            wall.hide_viewport = True
+        _move_object_to_collection(chamber_collection, wall)
+
+    frame_specs = [
+        ("Front_Left", (-1.95, -1.45, 1.55), (0.035, 0.035, 1.55)),
+        ("Front_Right", (1.95, -1.45, 1.55), (0.035, 0.035, 1.55)),
+        ("Front_Bottom", (0.0, -1.45, 0.00), (1.95, 0.035, 0.035)),
+    ]
+    for label, location, scale in frame_specs:
+        bpy.ops.mesh.primitive_cube_add(location=location, scale=scale)
+        frame = bpy.context.object
+        frame.name = f"SSBL_Demo_Chamber_Frame_{label}"
+        frame.data.materials.append(frame_mat)
+    return chamber_collection
+
+
+def _make_inflated_remeshed_monkey(name: str, color: tuple[float, float, float, float]) -> bpy.types.Object:
+    bpy.ops.mesh.primitive_monkey_add(
+        size=0.92,
+        location=(-0.66, -0.04, 2.48),
+        rotation=(math.radians(88.0), math.radians(-7.0), math.radians(22.0)),
+    )
+    obj = bpy.context.object
+    obj.name = name
+    obj.scale = (1.12, 0.96, 0.92)
+    _apply_object_rotation_scale(obj)
+    subdiv = obj.modifiers.new("SSBL_Demo_PreRemesh_Subsurf", "SUBSURF")
+    subdiv.levels = 2
+    subdiv.render_levels = 2
+    subdiv.subdivision_type = "CATMULL_CLARK"
+    _apply_modifier(obj, "SSBL_Demo_PreRemesh_Subsurf")
+    remesh = obj.modifiers.new("SSBL_Demo_Remesher", "REMESH")
+    remesh.mode = "VOXEL"
+    remesh.voxel_size = 0.12
+    if hasattr(remesh, "adaptivity"):
+        remesh.adaptivity = 0.0
+    if hasattr(remesh, "use_remove_disconnected"):
+        remesh.use_remove_disconnected = False
+    _apply_modifier(obj, "SSBL_Demo_Remesher")
+    obj.data.materials.clear()
+    obj.data.materials.append(_material(f"{name}_Mat", color))
+    _beautify_cloth(obj, levels=2)
+    return obj
+
+
+def _make_inflated_torus(name: str, color: tuple[float, float, float, float]) -> bpy.types.Object:
+    bpy.ops.mesh.primitive_torus_add(
+        major_segments=42,
+        minor_segments=22,
+        major_radius=0.62,
+        minor_radius=0.19,
+        location=(0.48, -0.16, 2.26),
+        rotation=(math.radians(72.0), math.radians(13.0), math.radians(20.0)),
+    )
+    obj = bpy.context.object
+    obj.name = name
+    obj.data.materials.clear()
+    obj.data.materials.append(_material(f"{name}_Mat", color))
+    _beautify_cloth(obj, levels=2)
+    return obj
+
+
+def _make_inflated_sphere(name: str, color: tuple[float, float, float, float]) -> bpy.types.Object:
+    bpy.ops.mesh.primitive_uv_sphere_add(
+        segments=26,
+        ring_count=18,
+        radius=0.56,
+        location=(-0.04, 0.36, 2.82),
+    )
+    obj = bpy.context.object
+    obj.name = name
+    obj.data.materials.clear()
+    obj.data.materials.append(_material(f"{name}_Mat", color))
+    _beautify_cloth(obj, levels=2)
+    return obj
+
+
+def _make_preview_auto_sphere_blocker() -> bpy.types.Object:
+    bpy.ops.mesh.primitive_uv_sphere_add(
+        segments=16,
+        ring_count=8,
+        radius=0.1,
+        location=(50.0, 50.0, -50.0),
+    )
+    obj = bpy.context.object
+    obj.name = "SSBL_Demo_AutoSphere_Blocker"
+    return obj
+
+
+def _configure_pressure_cloth(settings, *, frame_count: int, pressure_strength: float, collider_collection) -> None:
+    _configure_cloth_settings(settings, frame_count=frame_count)
+    settings.gravity = (0.0, 0.0, -8.6)
+    settings.substeps = 8
+    settings.iterations = 2
+    settings.damping = 0.988
+    settings.hardness = 0.34
+    settings.self_collision = True
+    settings.self_collision_mode = "fast"
+    settings.self_collision_interval = 1
+    settings.max_self_collision_neighbors = 56
+    settings.fast_self_collision_passes = 4
+    settings.use_volume_pressure = True
+    settings.pressure_strength = pressure_strength
+    settings.collision_margin = 0.028
+    settings.cloth_thickness = 0.03
+    settings.static_collider_collection = collider_collection
+
+
 def _record_multicloth_contact() -> DemoResult:
     name = "03_clothesline_multicloth_realtime"
-    title = "SSBL realtime clothesline - multi-cloth contact"
+    title = "SSBL realtime inflated trio - chamber contact"
     keywords = [
-        "Multi-Cloth Contact",
-        "Clothesline Drape",
-        "Wind Sway",
+        "Remeshed Suzanne",
+        "Inflated Multi-Cloth",
+        "Closed-Shell Collision",
     ]
-    frame_count = 60
+    frame_count = 112
     _clear_scene()
     _case_dir, frames_dir, video_path = _ensure_output_dir(name)
     scene = bpy.context.scene
@@ -865,63 +1023,39 @@ def _record_multicloth_contact() -> DemoResult:
     scene.frame_set(1)
     camera = _configure_scene_render(
         scene,
-        camera_location=(3.2, -4.7, 2.7),
-        target=(0.0, 0.0, 1.15),
-        ortho_scale=4.35,
+        camera_location=(3.15, -5.35, 2.85),
+        target=(0.0, 0.02, 2.18),
+        ortho_scale=4.4,
     )
     overlay = _create_overlay(scene, camera, title)
 
-    _make_clothesline_visual()
+    chamber_collection = _make_pressure_collision_chamber()
     cloths = [
-        _make_hanging_panel(
-            "SSBL_Demo_Left_Laundry",
-            location=(-0.9, -0.12, 0.2),
-            width=1.12,
-            height=1.72,
-            x_segments=18,
-            z_segments=28,
-            color=(0.11, 0.30, 0.92, 1.0),
-        ),
-        _make_hanging_panel(
-            "SSBL_Demo_Center_Laundry",
-            location=(-0.02, 0.0, 0.18),
-            width=0.98,
-            height=1.62,
-            x_segments=16,
-            z_segments=26,
-            color=(0.94, 0.30, 0.16, 1.0),
-        ),
-        _make_hanging_panel(
-            "SSBL_Demo_Right_Laundry",
-            location=(0.82, 0.12, 0.22),
-            width=1.04,
-            height=1.68,
-            x_segments=18,
-            z_segments=28,
-            color=(0.96, 0.88, 0.28, 1.0),
-        ),
+        _make_inflated_remeshed_monkey("SSBL_Demo_Inflated_Monkey", (0.91, 0.35, 0.18, 1.0)),
+        _make_inflated_torus("SSBL_Demo_Inflated_Torus", (0.17, 0.55, 0.95, 1.0)),
+        _make_inflated_sphere("SSBL_Demo_Inflated_Sphere", (0.97, 0.80, 0.23, 1.0)),
     ]
-    for layer, obj in enumerate(cloths):
+    preview_driver = cloths[1]
+    pressure_strengths = [0.15, 0.20, 0.18]
+    for layer, (obj, pressure_strength) in enumerate(zip(cloths, pressure_strengths)):
         obj.ssbl_collision_layer = layer
         obj.ssbl_enable_cross_cloth_collision = True
-        _configure_cloth_settings(obj.ssbl_cloth, frame_count=frame_count, pin_group="ssbl_pin")
-        obj.ssbl_cloth.gravity = (0.0, 0.0, -9.8)
-        obj.ssbl_cloth.hardness = 0.42
-        obj.ssbl_cloth.use_blender_force_fields = True
-        obj.ssbl_cloth.collision_margin = 0.028
-        obj.ssbl_cloth.cloth_thickness = 0.045
-
-    bpy.ops.object.effector_add(type="WIND", location=(0.0, -1.6, 1.2), rotation=(math.pi / 2.0, 0.0, 0.0))
-    wind = bpy.context.object
-    wind.name = "SSBL_Demo_Clothesline_Wind"
-    wind.field.strength = 8.0
+        _configure_pressure_cloth(
+            obj.ssbl_cloth,
+            frame_count=frame_count,
+            pressure_strength=pressure_strength,
+            collider_collection=chamber_collection,
+        )
+    auto_sphere_blocker = _make_preview_auto_sphere_blocker()
+    preview_driver.ssbl_cloth.use_sphere = True
+    preview_driver.ssbl_cloth.sphere_object = auto_sphere_blocker
 
     bpy.ops.object.select_all(action="DESELECT")
     for obj in cloths:
         obj.select_set(True)
-    bpy.context.view_layer.objects.active = cloths[1]
+    bpy.context.view_layer.objects.active = preview_driver
     before = {obj.name: _mesh_snapshot(obj) for obj in cloths}
-    session = ssbl.solver.start_preview(bpy.context, cloths[1])
+    session = ssbl.solver.start_preview(bpy.context, preview_driver)
     if len(session.slots) != len(cloths) or str(session.cross_cloth_mode) == "off":
         raise RuntimeError(
             f"multi-cloth demo expected three cloth slots with cross collision, got slots={len(session.slots)} "
@@ -935,37 +1069,37 @@ def _record_multicloth_contact() -> DemoResult:
     simulation_elapsed = 0.0
     max_edge_ratio = 0.0
     max_dynamic_triangles = 0
-    max_force_field_count = 0
-    min_panel_gap = float("inf")
+    min_centroid_distance = float("inf")
 
     for frame in range(0, frame_count + 1):
-        if frame == 16:
-            wind.field.strength = 18.0
-        if frame == 34:
-            wind.field.strength = 28.0
         last_ms = 0.0
         native_ms = 0.0
-        diag = ssbl.solver.session_diagnostics(cloths[1])
+        diag = ssbl.solver.session_diagnostics(cloths[0])
         if frame > 0:
             started = time.perf_counter()
             scene.frame_set(frame)
-            ssbl.solver.step_preview(bpy.context, cloths[1].name)
+            ssbl.solver.step_preview(bpy.context, cloths[0].name)
             elapsed = time.perf_counter() - started
             simulation_elapsed += elapsed
             last_ms = elapsed * 1000.0
-            diag = ssbl.solver.session_diagnostics(cloths[1])
+            diag = ssbl.solver.session_diagnostics(cloths[0])
             native_ms = float(diag.step_ms)
             step_ms_samples.append(last_ms)
         finite = finite and all(_finite_mesh(obj) for obj in cloths) and bool(diag.finite)
         max_dynamic_triangles = max(max_dynamic_triangles, int(diag.dynamic_triangle_count))
-        max_force_field_count = max(max_force_field_count, int(diag.force_field_count))
         for slot in session.slots.values():
             max_edge_ratio = max(max_edge_ratio, _slot_max_edge_ratio(slot))
-        ordered_slots = [session.slots[obj.name] for obj in cloths]
-        for first, second in zip(ordered_slots, ordered_slots[1:]):
-            first_y = np.asarray(first.current_positions_world, dtype=np.float64)[:, 1]
-            second_y = np.asarray(second.current_positions_world, dtype=np.float64)[:, 1]
-            min_panel_gap = min(min_panel_gap, float(np.min(second_y) - np.max(first_y)))
+        centers = []
+        for obj in cloths:
+            positions = np.asarray(session.slots[obj.name].current_positions_world, dtype=np.float64)
+            if len(positions):
+                centers.append(np.mean(positions, axis=0))
+        for index, first_center in enumerate(centers):
+            for second_center in centers[index + 1 :]:
+                min_centroid_distance = min(
+                    min_centroid_distance,
+                    float(np.linalg.norm(first_center - second_center)),
+                )
         metrics_line = _format_metrics_line(frame, frame_count, last_ms, native_ms)
         _update_overlay(
             overlay,
@@ -975,7 +1109,7 @@ def _record_multicloth_contact() -> DemoResult:
         overlay_text_frames.append(_compose_overlay_text(title, metrics_line, _keyword_line(*keywords)))
         frame_paths.append(_render_frame(scene, frames_dir, frame))
 
-    ssbl.solver.request_stop(cloths[1])
+    ssbl.solver.request_stop(cloths[0])
     restore_delta = max(_mesh_delta(obj, before[obj.name]) for obj in cloths)
     _encode_video(
         frames_dir,
@@ -985,8 +1119,8 @@ def _record_multicloth_contact() -> DemoResult:
     return _summarize_demo(
         name=name,
         title=title,
-        source_repo=SOURCE_GARMENTLAB,
-        source_scene="Hang scene inspiration adapted to a clothesline promo setup",
+        source_repo="",
+        source_scene="Custom pressure chamber with remeshed Suzanne, torus, and sphere",
         keywords=keywords,
         video_path=video_path,
         frames_dir=frames_dir,
@@ -1000,9 +1134,9 @@ def _record_multicloth_contact() -> DemoResult:
             "cross_mode": str(session.cross_cloth_mode),
             "max_edge_ratio": max_edge_ratio,
             "max_dynamic_triangle_count": max_dynamic_triangles,
-            "max_force_field_count": max_force_field_count,
-            "min_panel_gap": min_panel_gap,
-            "final_wind_strength": float(wind.field.strength),
+            "min_centroid_distance": min_centroid_distance,
+            "pressure_strengths": pressure_strengths,
+            "monkey_vertices": len(cloths[0].data.vertices),
         },
     )
 
@@ -1175,7 +1309,7 @@ def _record_object_collision_suite() -> DemoResult:
         "Rigid Edge Collision",
         "Stable Drape",
     ]
-    frame_count = 56
+    frame_count = 112
     _clear_scene()
     _case_dir, frames_dir, video_path = _ensure_output_dir(name)
     scene = bpy.context.scene
@@ -1334,10 +1468,10 @@ def _record_force_field_tuning() -> DemoResult:
     title = "SSBL realtime flag - live wind control"
     keywords = [
         "Realtime Wind",
-        "Stable Flag Response",
+        "Turbulent Gusts",
         "Live Tuning",
     ]
-    frame_count = 56
+    frame_count = 112
     _clear_scene()
     _case_dir, frames_dir, video_path = _ensure_output_dir(name)
     scene = bpy.context.scene
@@ -1365,11 +1499,18 @@ def _record_force_field_tuning() -> DemoResult:
     cloth.ssbl_cloth.gravity = (0.0, 0.0, 0.0)
     cloth.ssbl_cloth.hardness = 0.25
     cloth.ssbl_cloth.use_blender_force_fields = True
-    _make_arrow()
     bpy.ops.object.effector_add(type="WIND", location=(-1.25, 0.0, 0.9), rotation=(0.0, math.pi / 2.0, 0.0))
     wind = bpy.context.object
     wind.name = "SSBL_Demo_Wind_Field"
-    wind.field.strength = 18.0
+    wind.field.strength = 26.0
+    bpy.ops.object.effector_add(type="TURBULENCE", location=(-0.55, 0.0, 0.95))
+    turbulence = bpy.context.object
+    turbulence.name = "SSBL_Demo_Turbulence_Field"
+    turbulence.field.strength = 18.0
+    turbulence.field.size = 1.35
+    turbulence.field.flow = 1.1
+    turbulence.field.noise = 1.7
+    turbulence.field.seed = 11
 
     before = _mesh_snapshot(cloth)
     bpy.ops.object.select_all(action="DESELECT")
@@ -1384,11 +1525,22 @@ def _record_force_field_tuning() -> DemoResult:
     simulation_elapsed = 0.0
     max_avg_x = _average_x(cloth)
     force_field_counts: list[int] = []
+    max_turbulence_strength = float(turbulence.field.strength)
+
+    def _gust_curve(value: float) -> float:
+        return 0.5 + 0.5 * math.sin(value)
 
     for frame in range(0, frame_count + 1):
-        if frame == 22:
-            wind.field.strength = 52.0
-        if frame == 34:
+        progress = frame / max(frame_count, 1)
+        gust = _gust_curve(progress * math.tau * 3.5)
+        turbulence.field.strength = 16.0 + 19.0 * gust
+        turbulence.field.size = 0.95 + 0.55 * (1.0 - gust)
+        turbulence.field.flow = 0.8 + 0.9 * _gust_curve(progress * math.tau * 2.2 + 0.9)
+        turbulence.field.noise = 1.35 + 1.1 * _gust_curve(progress * math.tau * 4.8 + 1.7)
+        turbulence.location.y = math.sin(progress * math.tau * 1.6) * 0.38
+        turbulence.location.z = 0.95 + math.cos(progress * math.tau * 1.9) * 0.18
+        wind.field.strength = 24.0 + 26.0 * _gust_curve(progress * math.tau * 2.8 + 0.4)
+        if frame >= frame_count * 0.72:
             cloth.ssbl_cloth.hardness = 0.72
             cloth.ssbl_cloth.hardness_initialized = True
         last_ms = 0.0
@@ -1407,6 +1559,7 @@ def _record_force_field_tuning() -> DemoResult:
         finite = finite and _finite_mesh(cloth) and bool(diag.finite)
         max_avg_x = max(max_avg_x, _average_x(cloth))
         force_field_counts.append(int(diag.force_field_count))
+        max_turbulence_strength = max(max_turbulence_strength, float(turbulence.field.strength))
         metrics_line = _format_metrics_line(frame, frame_count, last_ms, native_ms)
         _update_overlay(
             overlay,
@@ -1441,6 +1594,8 @@ def _record_force_field_tuning() -> DemoResult:
             "max_average_x": max_avg_x,
             "max_force_field_count": max(force_field_counts) if force_field_counts else 0,
             "final_wind_strength": float(wind.field.strength),
+            "final_turbulence_strength": float(turbulence.field.strength),
+            "max_turbulence_strength": max_turbulence_strength,
             "final_hardness": float(cloth.ssbl_cloth.hardness),
         },
     )

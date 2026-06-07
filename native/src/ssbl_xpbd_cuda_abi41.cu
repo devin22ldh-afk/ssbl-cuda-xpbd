@@ -59,7 +59,43 @@ constexpr int kAbi41CountSlots = 16;
 constexpr float kAbi41SpringRelaxation = 0.18f;
 constexpr float kAbi41StretchStrengthScale = 2.5f;
 constexpr float kAbi41StretchPrevSyncScale = 0.08f;
-constexpr float kAbi41LraPrevSyncScale = 0.16f;
+constexpr float kAbi41HardStretchPolishStart = 0.95f;
+constexpr float kAbi41HardStretchMaxRatio = 1.18f;
+constexpr float kAbi41HardStretchHighMaxRatio = 1.08f;
+constexpr float kAbi41HardStretchPolishRelaxation = 0.90f;
+constexpr float kAbi41HardStretchPolishPrevSyncScale = 0.16f;
+constexpr int kAbi41HardStretchPolishPasses = 2;
+constexpr float kAbi41HardStretchFinalCapStartRatio = 1.32f;
+constexpr float kAbi41HardStretchFinalCapTargetRatio = 1.22f;
+constexpr float kAbi41HardStretchFinalCapHighStartRatio = 1.12f;
+constexpr float kAbi41HardStretchFinalCapHighTargetRatio = 1.04f;
+constexpr float kAbi41HardStretchFinalCapPrevSyncScale = 0.08f;
+constexpr float kAbi41HardStretchFinalCapVelocityTrimScale = 1.0f;
+constexpr int kAbi41HardStretchFinalCapPasses = 2;
+constexpr bool kAbi41HardStretchCountCapClamps = false;
+constexpr float kAbi41PcgHardStretchProjectionRestScale = 0.18f;
+constexpr float kAbi41PcgHardStretchProjectionThicknessScale = 0.06f;
+constexpr float kAbi41PcgHardStretchProjectionCeiling = 0.0035f;
+constexpr float kAbi41PcgHardStretchWritebackThicknessScale = 0.035f;
+constexpr float kAbi41PcgHardStretchWritebackFloor = 2.5e-4f;
+constexpr float kAbi41PcgHardStretchWritebackCeiling = 9.0e-4f;
+constexpr float kAbi41TinyStretchRestThreshold = 7.5e-4f;
+constexpr float kAbi41TinyStretchLenSqEps = 1.0e-14f;
+constexpr float kAbi41TinyStretchMaxRatio = 1.06f;
+constexpr float kAbi41TinyStretchRelaxation = 1.0f;
+constexpr float kAbi41TinyStretchPrevSyncScale = 0.24f;
+constexpr int kAbi41TinyStretchPasses = 2;
+constexpr float kAbi41TinyStretchHardCapStartRatio = 1.35f;
+constexpr float kAbi41TinyStretchHardCapTargetRatio = 1.12f;
+constexpr float kAbi41TinyStretchHardCapPrevSyncScale = 1.0f;
+constexpr float kAbi41TinyStretchHardCapVelocityTrimScale = 1.0f;
+constexpr int kAbi41TinyStretchHardCapPasses = 3;
+constexpr float kAbi41ExtremeStretchHardCapStartRatio = 1.24f;
+constexpr float kAbi41ExtremeStretchHardCapTargetRatio = 1.10f;
+constexpr float kAbi41ExtremeStretchHardCapPrevSyncScale = 0.30f;
+constexpr float kAbi41ExtremeStretchHardCapVelocityTrimScale = 1.0f;
+constexpr int kAbi41ExtremeStretchHardCapPasses = 3;
+constexpr float kAbi41LraPrevSyncScale = 0.32f;
 constexpr float kAbi41BendPrevSyncScale = 0.06f;
 constexpr float kAbi41SelfPrevSyncScale = 0.08f;
 constexpr float kAbi41DynamicNeighborImpulseScale = 0.5f;
@@ -67,7 +103,7 @@ constexpr float kAbi41BendRelaxation = 0.10f;
 constexpr float kAbi41TackRelaxation = 0.35f;
 constexpr float kAbi41SelfAveragingClampScale = 0.35f;
 constexpr float kPinHardWeightThreshold = 0.75f;
-constexpr int kAbi41PcgMaxIterations = 4;
+constexpr int kAbi41PcgMaxIterations = 8;
 constexpr int kAbi41PcgReductionDAD = 0;
 constexpr int kAbi41PcgReductionRZ = 1;
 constexpr int kAbi41PcgReductionRZNext = 2;
@@ -93,6 +129,18 @@ constexpr int kAbi41ForceFieldMagnet = 8;
 constexpr int kAbi41ForceFieldDrag = 9;
 constexpr int kAbi41ForceFieldTexture = 10;
 constexpr float kAbi41MaxForceFieldAcceleration = 5000.0f;
+constexpr float kAbi41PressureUiAccelerationScale = 1792.0f;
+constexpr float kAbi41PressureUiAccelerationScaleMin = 1.0f;
+constexpr float kAbi41PressureUiAccelerationScaleMax = 8192.0f;
+constexpr float kAbi41PressureImpulseRestScale = 0.85f;
+constexpr float kAbi41PressureImpulseRestScaleMin = 0.05f;
+constexpr float kAbi41PressureImpulseRestScaleMax = 8.0f;
+constexpr float kAbi41PressureVelocityRestScale = 2.25f;
+constexpr float kAbi41PressureVelocityRestScaleMin = 0.10f;
+constexpr float kAbi41PressureVelocityRestScaleMax = 16.0f;
+constexpr float kAbi41PressureVelocityObjectScale = 0.08f;
+constexpr float kAbi41PressureVelocityObjectScaleMin = 0.005f;
+constexpr float kAbi41PressureVelocityObjectScaleMax = 1.0f;
 
 std::string g_last_error;
 
@@ -113,6 +161,24 @@ bool abi41_env_flag(const char* name, bool default_value) {
 bool abi41_pcg_device_scalar_enabled() {
     static const bool enabled = abi41_env_flag("SSBL_ABI41_PCG_DEVICE_SCALAR", true);
     return enabled;
+}
+
+bool abi41_hard_stretch_graph_enabled() {
+    static const bool enabled = abi41_env_flag("SSBL_ABI41_HARD_STRETCH_GRAPH", true);
+    return enabled;
+}
+
+float abi41_env_float(const char* name, float default_value) {
+    const char* raw = std::getenv(name);
+    if (!raw || raw[0] == '\0') {
+        return default_value;
+    }
+    char* end = nullptr;
+    const float value = std::strtof(raw, &end);
+    if (end == raw || !std::isfinite(value)) {
+        return default_value;
+    }
+    return value;
 }
 
 struct Vec3 {
@@ -175,10 +241,18 @@ struct Abi41Solver {
     Vec3* vel = nullptr;
     Vec3* rest = nullptr;
     float* inv_mass = nullptr;
+    float* pressure_area_share = nullptr;
+    float* pressure_rest_scale = nullptr;
+    float pressure_accel_scale = 1.0f;
+    float pressure_impulse_rest_scale = kAbi41PressureImpulseRestScale;
+    float pressure_velocity_rest_scale = kAbi41PressureVelocityRestScale;
+    float pressure_velocity_length_scale = 1.0f;
     unsigned int* state_flags = nullptr;
     ReconSpring* springs = nullptr;
+    int* edge_color_offsets_host = nullptr;
     ReconPair* bends = nullptr;
     float* bend_rest = nullptr;
+    int* bend_color_offsets_host = nullptr;
     ReconPair* lra_edges = nullptr;
     float* lra_rest = nullptr;
     ReconTriangle* triangles = nullptr;
@@ -285,6 +359,10 @@ struct Abi41Solver {
     cudaTextureObject_t pcg_offdiag_texture = 0;
     int pcg_csr_nnz = 0;
     int pcg_texture_ready = 0;
+    cudaGraph_t hard_polish_graph = nullptr;
+    cudaGraphExec_t hard_polish_graph_exec = nullptr;
+    float hard_polish_graph_sub_dt = -1.0f;
+    int hard_polish_graph_normal_cap_passes = -1;
     uint4* bending_wing_indices = nullptr;
     float2* bending_wing_params = nullptr;
     cudaTextureObject_t bending_wing_index_texture = 0;
@@ -421,6 +499,12 @@ __device__ void abi41_count(Abi41Solver solver, int slot) {
     }
 }
 
+__device__ void abi41_count_hard_cap_clamp(Abi41Solver solver) {
+    if (kAbi41HardStretchCountCapClamps) {
+        abi41_count(solver, kAbi41CountHardFallbacks);
+    }
+}
+
 __device__ void abi41_guard_self_hash_primitive(
     Abi41Solver solver,
     int* min_x,
@@ -469,6 +553,42 @@ __device__ Vec3 limit_delta(Vec3 delta, float max_len) {
         return make_vec3(0.0f, 0.0f, 0.0f);
     }
     return len > max_len ? mul(delta, max_len / len) : delta;
+}
+
+__device__ float abi41_pcg_stretch_projection_limit(Abi41Solver solver, float rest) {
+    const float base_limit = fmaxf(
+        1.0e-5f,
+        fminf(fmaxf(rest, solver.cfg.cloth_thickness) * 0.5f, 0.25f)
+    );
+    if (solver.cfg.stretch_optimization_strength < kAbi41HardStretchPolishStart
+        || !isfinite(solver.cfg.cloth_thickness)
+        || solver.cfg.cloth_thickness <= kEps) {
+        return base_limit;
+    }
+    const float hard_limit = fmaxf(
+        1.0e-5f,
+        fminf(
+            fmaxf(rest * kAbi41PcgHardStretchProjectionRestScale,
+                  solver.cfg.cloth_thickness * kAbi41PcgHardStretchProjectionThicknessScale),
+            kAbi41PcgHardStretchProjectionCeiling
+        )
+    );
+    return fminf(base_limit, hard_limit);
+}
+
+__device__ float abi41_pcg_stretch_writeback_limit(Abi41Solver solver) {
+    if (solver.cfg.stretch_optimization_strength < kAbi41HardStretchPolishStart
+        || !isfinite(solver.cfg.cloth_thickness)
+        || solver.cfg.cloth_thickness <= kEps) {
+        return 0.25f;
+    }
+    return fmaxf(
+        kAbi41PcgHardStretchWritebackFloor,
+        fminf(
+            solver.cfg.cloth_thickness * kAbi41PcgHardStretchWritebackThicknessScale,
+            kAbi41PcgHardStretchWritebackCeiling
+        )
+    );
 }
 
 __host__ __device__ ReconSymMat make_sym_mat(
@@ -784,12 +904,18 @@ __device__ Vec3 evaluate_force_field(
         if (field.size > 1.0e-6f) {
             frequency = fmaxf(frequency, 1.0f / field.size);
         }
-        Vec3 q = mul(delta, frequency);
+        float flow = isfinite(field.flow) ? field.flow : 0.0f;
+        Vec3 flow_dir = normalize_or(array_vec3(field.direction), axis);
+        Vec3 q = add(mul(delta, frequency), mul(flow_dir, flow * (0.37f + 0.11f * frequency)));
+        float flow_salt = flow * 3.17f;
         Vec3 noise_vec = make_vec3(
-            force_field_noise(q, field.seed, 0.0f),
-            force_field_noise(q, field.seed, 7.0f),
-            force_field_noise(q, field.seed, 13.0f)
+            force_field_noise(q, field.seed, flow_salt),
+            force_field_noise(q, field.seed, 7.0f + flow_salt),
+            force_field_noise(q, field.seed, 13.0f + flow_salt)
         );
+        if (fabsf(flow) > 1.0e-6f) {
+            noise_vec = add(noise_vec, mul(flow_dir, fminf(fabsf(flow), 4.0f) * 0.15f));
+        }
         return limit_force_field_acceleration(mul(noise_vec, strength));
     }
     return make_vec3(0.0f, 0.0f, 0.0f);
@@ -1161,7 +1287,13 @@ __global__ void abi41_integrate_kernel(Abi41Solver solver, float dt) {
     Vec3 acceleration = make_vec3(solver.cfg.gravity[0], solver.cfg.gravity[1], solver.cfg.gravity[2]);
     if (solver.cfg.use_volume_pressure && solver.cfg.pressure_strength > 0.0f && has_surface_normal) {
         float pressure_force = fmaxf(solver.cfg.pressure_strength, 0.0f);
-        acceleration = add(acceleration, mul(surface_normal, pressure_force * solver.inv_mass[i]));
+        float area_share = solver.pressure_area_share ? solver.pressure_area_share[i] : 0.0f;
+        if (isfinite(area_share) && area_share > 0.0f) {
+            acceleration = add(
+                acceleration,
+                mul(surface_normal, pressure_force * solver.pressure_accel_scale * area_share * solver.inv_mass[i])
+            );
+        }
     }
     acceleration = add(acceleration, force_field_acceleration(
         solver,
@@ -1172,6 +1304,27 @@ __global__ void abi41_integrate_kernel(Abi41Solver solver, float dt) {
     ));
     Vec3 v = add(solver.vel[i], mul(acceleration, dt));
     v = mul(v, solver.cfg.damping);
+    if (solver.cfg.use_volume_pressure && solver.cfg.pressure_strength > 0.0f && has_surface_normal) {
+        const float local_rest = solver.pressure_rest_scale ? solver.pressure_rest_scale[i] : 0.0f;
+        if (isfinite(local_rest) && local_rest > kEps && isfinite(dt) && dt > kEps) {
+            const float pressure_accel = fmaxf(solver.cfg.pressure_strength, 0.0f)
+                * fmaxf(solver.pressure_accel_scale, 0.0f)
+                * fmaxf(solver.pressure_area_share ? solver.pressure_area_share[i] : 0.0f, 0.0f)
+                * fmaxf(solver.inv_mass[i], 0.0f);
+            const float max_pressure_delta = fmaxf(local_rest * fmaxf(solver.pressure_impulse_rest_scale, 0.0f), 1.0e-7f);
+            const float pressure_delta = pressure_accel * dt * dt;
+            if (isfinite(pressure_delta) && pressure_delta > max_pressure_delta) {
+                const float trim_speed = (pressure_delta - max_pressure_delta) / dt;
+                v = sub(v, mul(surface_normal, trim_speed));
+            }
+            const float velocity_rest = fmaxf(local_rest, fmaxf(solver.pressure_velocity_length_scale, 0.0f));
+            const float max_outward_speed = fmaxf(velocity_rest * fmaxf(solver.pressure_velocity_rest_scale, 0.0f) / dt, 1.0e-6f);
+            const float outward_speed = dot(v, surface_normal);
+            if (isfinite(outward_speed) && outward_speed > max_outward_speed) {
+                v = sub(v, mul(surface_normal, outward_speed - max_outward_speed));
+            }
+        }
+    }
     solver.vel[i] = v;
     solver.pos[i] = add(solver.pos[i], mul(v, dt));
 }
@@ -1227,6 +1380,734 @@ __global__ void abi41_spring_project_kernel(Abi41Solver solver, float dt) {
         atomic_add(&solver.pos[j], delta_j);
         if (over_stretched) {
             atomic_add(&solver.prev[j], mul(delta_j, kAbi41StretchPrevSyncScale));
+        }
+    }
+}
+
+__global__ void abi41_hard_stretch_polish_reset_kernel(Abi41Solver solver) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= solver.cfg.vertex_count) {
+        return;
+    }
+    if (solver.pcg_rhs) {
+        solver.pcg_rhs[i] = make_vec3(0.0f, 0.0f, 0.0f);
+    }
+    if (solver.pcg_solution) {
+        solver.pcg_solution[i] = make_vec3(0.0f, 0.0f, 0.0f);
+    }
+}
+
+__global__ void abi41_hard_stretch_polish_accumulate_kernel(Abi41Solver solver, float dt) {
+    int s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= solver.cfg.edge_count
+        || !solver.springs
+        || !solver.pcg_rhs
+        || !solver.pcg_solution
+        || solver.cfg.stretch_optimization_strength < kAbi41HardStretchPolishStart) {
+        return;
+    }
+    const ReconSpring spring = solver.springs[s];
+    const int i = static_cast<int>(spring.id0);
+    const int j = static_cast<int>(spring.id1);
+    if (i < 0 || j < 0 || i >= solver.cfg.vertex_count || j >= solver.cfg.vertex_count || i == j) {
+        return;
+    }
+    float wi = solver.inv_mass[i];
+    float wj = solver.inv_mass[j];
+    if (solver.state_flags) {
+        if ((solver.state_flags[i] & ssbl_abi41::kPinnedOrKinematicFlag) != 0u) {
+            wi = 0.0f;
+        }
+        if ((solver.state_flags[j] & ssbl_abi41::kPinnedOrKinematicFlag) != 0u) {
+            wj = 0.0f;
+        }
+    }
+    const float weight = wi + wj;
+    if (!isfinite(weight) || weight <= 0.0f) {
+        return;
+    }
+    const float rest = spring.rest_length;
+    if (!isfinite(rest) || rest <= kEps) {
+        return;
+    }
+    const Vec3 pi = solver.pos[i];
+    const Vec3 pj = solver.pos[j];
+    const Vec3 prev_i = solver.prev[i];
+    const Vec3 prev_j = solver.prev[j];
+    if (!finite_vec(pi) || !finite_vec(pj) || !finite_vec(prev_i) || !finite_vec(prev_j)) {
+        return;
+    }
+    const Vec3 edge = sub(pj, pi);
+    const float len_sq = dot(edge, edge);
+    if (!isfinite(len_sq) || len_sq <= kAbi41TinyStretchLenSqEps) {
+        return;
+    }
+    const float len = sqrtf(len_sq);
+    const bool high_hardness = solver.cfg.stretch_optimization_strength >= 0.95f;
+    const float target_len = rest * (high_hardness ? kAbi41HardStretchHighMaxRatio : kAbi41HardStretchMaxRatio);
+    const float excess = len - target_len;
+    if (!isfinite(excess) || excess <= 0.0f) {
+        return;
+    }
+    const Vec3 corr = mul(edge, -kAbi41HardStretchPolishRelaxation * excess / fmaxf(weight * len, kEps));
+    if (!finite_vec(corr)) {
+        abi41_count(solver, kAbi41CountHardFallbacks);
+        return;
+    }
+    const float corr_len = length(corr);
+    if (!isfinite(corr_len) || corr_len <= 1.0e-20f) {
+        return;
+    }
+    const float max_delta = fmaxf(
+        5.0e-4f,
+        fminf(fmaxf(rest * 2.0f, solver.cfg.cloth_thickness * 0.25f), 0.008f)
+    );
+    if (wi > 0.0f) {
+        const Vec3 raw_delta_i = mul(corr, -wi);
+        const Vec3 delta_i = limit_delta(raw_delta_i, max_delta);
+        if (finite_vec(delta_i) && length(delta_i) > 0.0f) {
+            if (length(raw_delta_i) > max_delta) {
+                abi41_count_hard_cap_clamp(solver);
+            }
+            atomic_add(&solver.pcg_rhs[i], delta_i);
+            atomicAdd(&solver.pcg_solution[i].x, 1.0f);
+        }
+    }
+    if (wj > 0.0f) {
+        const Vec3 raw_delta_j = mul(corr, wj);
+        const Vec3 delta_j = limit_delta(raw_delta_j, max_delta);
+        if (finite_vec(delta_j) && length(delta_j) > 0.0f) {
+            if (length(raw_delta_j) > max_delta) {
+                abi41_count_hard_cap_clamp(solver);
+            }
+            atomic_add(&solver.pcg_rhs[j], delta_j);
+            atomicAdd(&solver.pcg_solution[j].x, 1.0f);
+        }
+    }
+}
+
+__global__ void abi41_hard_stretch_polish_apply_kernel(Abi41Solver solver) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= solver.cfg.vertex_count || !solver.pcg_rhs || !solver.pcg_solution) {
+        return;
+    }
+    if (solver.inv_mass[i] <= 0.0f
+        || (solver.state_flags && (solver.state_flags[i] & ssbl_abi41::kPinnedOrKinematicFlag) != 0u)) {
+        return;
+    }
+    const float count = solver.pcg_solution[i].x;
+    if (!isfinite(count) || count <= 0.0f) {
+        return;
+    }
+    Vec3 delta = mul(solver.pcg_rhs[i], 1.0f / count);
+    if (!finite_vec(delta)) {
+        abi41_count(solver, kAbi41CountHardFallbacks);
+        return;
+    }
+    const float max_delta = fmaxf(
+        5.0e-4f,
+        fminf(fmaxf(solver.cfg.cloth_thickness * 0.20f, 1.0e-3f), 0.005f)
+    );
+    delta = limit_delta(delta, max_delta);
+    if (!finite_vec(delta) || length(delta) <= 0.0f) {
+        return;
+    }
+    solver.pos[i] = add(solver.pos[i], delta);
+    solver.prev[i] = add(solver.prev[i], mul(delta, kAbi41HardStretchPolishPrevSyncScale));
+}
+
+__global__ void abi41_hard_stretch_final_cap_reset_kernel(Abi41Solver solver) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= solver.cfg.vertex_count) {
+        return;
+    }
+    if (solver.pcg_rhs) {
+        solver.pcg_rhs[i] = make_vec3(0.0f, 0.0f, 0.0f);
+    }
+    if (solver.pcg_solution) {
+        solver.pcg_solution[i] = make_vec3(0.0f, 0.0f, 0.0f);
+    }
+    if (solver.pcg_residual) {
+        solver.pcg_residual[i] = make_vec3(0.0f, 0.0f, 0.0f);
+    }
+}
+
+__global__ void abi41_hard_stretch_final_cap_accumulate_range_kernel(Abi41Solver solver, int start, int count, float dt) {
+    const int local = blockIdx.x * blockDim.x + threadIdx.x;
+    if (local >= count
+        || !solver.springs
+        || !solver.pcg_rhs
+        || !solver.pcg_solution
+        || !solver.pcg_residual
+        || solver.cfg.stretch_optimization_strength < kAbi41HardStretchPolishStart) {
+        return;
+    }
+    const int s = start + local;
+    if (s < 0 || s >= solver.cfg.edge_count) {
+        return;
+    }
+    const ReconSpring spring = solver.springs[s];
+    const float rest = spring.rest_length;
+    if (!isfinite(rest) || rest <= kEps || rest <= kAbi41TinyStretchRestThreshold) {
+        return;
+    }
+    const int i = static_cast<int>(spring.id0);
+    const int j = static_cast<int>(spring.id1);
+    if (i < 0 || j < 0 || i >= solver.cfg.vertex_count || j >= solver.cfg.vertex_count || i == j) {
+        return;
+    }
+    float wi = solver.inv_mass[i];
+    float wj = solver.inv_mass[j];
+    if (solver.state_flags) {
+        if ((solver.state_flags[i] & ssbl_abi41::kPinnedOrKinematicFlag) != 0u) {
+            wi = 0.0f;
+        }
+        if ((solver.state_flags[j] & ssbl_abi41::kPinnedOrKinematicFlag) != 0u) {
+            wj = 0.0f;
+        }
+    }
+    const float weight = wi + wj;
+    if (!isfinite(weight) || weight <= 0.0f) {
+        return;
+    }
+    const Vec3 pi = solver.pos[i];
+    const Vec3 pj = solver.pos[j];
+    const Vec3 prev_i = solver.prev[i];
+    const Vec3 prev_j = solver.prev[j];
+    if (!finite_vec(pi) || !finite_vec(pj) || !finite_vec(prev_i) || !finite_vec(prev_j)) {
+        return;
+    }
+    const Vec3 edge = sub(pj, pi);
+    const float len_sq = dot(edge, edge);
+    if (!isfinite(len_sq) || len_sq <= kAbi41TinyStretchLenSqEps) {
+        return;
+    }
+    const float len = sqrtf(len_sq);
+    const bool high_hardness = solver.cfg.stretch_optimization_strength >= 0.95f;
+    const float start_ratio = high_hardness
+        ? kAbi41HardStretchFinalCapHighStartRatio
+        : kAbi41HardStretchFinalCapStartRatio;
+    const float target_ratio = high_hardness
+        ? kAbi41HardStretchFinalCapHighTargetRatio
+        : kAbi41HardStretchFinalCapTargetRatio;
+    const float start_len = rest * start_ratio;
+    if (!isfinite(len) || len <= start_len) {
+        return;
+    }
+    const float target_len = rest * target_ratio;
+    const float excess = len - target_len;
+    if (!isfinite(excess) || excess <= 0.0f) {
+        return;
+    }
+    const Vec3 corr = mul(edge, -excess / fmaxf(weight * len, kEps));
+    if (!finite_vec(corr) || length(corr) <= 1.0e-20f) {
+        return;
+    }
+    const float max_delta = fminf(fmaxf(rest * 0.60f, solver.cfg.cloth_thickness * 0.10f), 0.010f);
+    Vec3 prev_delta_i = make_vec3(0.0f, 0.0f, 0.0f);
+    Vec3 prev_delta_j = make_vec3(0.0f, 0.0f, 0.0f);
+    const Vec3 normal = mul(edge, 1.0f / fmaxf(len, kEps));
+    const float safe_dt = fmaxf(dt, kEps);
+    if (isfinite(safe_dt) && safe_dt > kEps) {
+        const float inv_dt = 1.0f / safe_dt;
+        const Vec3 vi = mul(sub(pi, prev_i), inv_dt);
+        const Vec3 vj = mul(sub(pj, prev_j), inv_dt);
+        const float separating_speed = dot(sub(vj, vi), normal);
+        if (isfinite(separating_speed) && separating_speed > 0.0f) {
+            const float trim = separating_speed * safe_dt * kAbi41HardStretchFinalCapVelocityTrimScale / weight;
+            if (wi > 0.0f) {
+                prev_delta_i = add(prev_delta_i, mul(normal, -wi * trim));
+            }
+            if (wj > 0.0f) {
+                prev_delta_j = add(prev_delta_j, mul(normal, wj * trim));
+            }
+        }
+    }
+    if (wi > 0.0f) {
+        const Vec3 raw_delta_i = mul(corr, -wi);
+        const Vec3 delta_i = limit_delta(raw_delta_i, max_delta);
+        if (finite_vec(delta_i) && length(delta_i) > 0.0f) {
+            if (length(raw_delta_i) > max_delta) {
+                abi41_count_hard_cap_clamp(solver);
+            }
+            prev_delta_i = add(prev_delta_i, mul(delta_i, kAbi41HardStretchFinalCapPrevSyncScale));
+            atomic_add(&solver.pcg_rhs[i], delta_i);
+            atomic_add(&solver.pcg_residual[i], prev_delta_i);
+            atomicAdd(&solver.pcg_solution[i].x, 1.0f);
+        }
+    }
+    if (wj > 0.0f) {
+        const Vec3 raw_delta_j = mul(corr, wj);
+        const Vec3 delta_j = limit_delta(raw_delta_j, max_delta);
+        if (finite_vec(delta_j) && length(delta_j) > 0.0f) {
+            if (length(raw_delta_j) > max_delta) {
+                abi41_count_hard_cap_clamp(solver);
+            }
+            prev_delta_j = add(prev_delta_j, mul(delta_j, kAbi41HardStretchFinalCapPrevSyncScale));
+            atomic_add(&solver.pcg_rhs[j], delta_j);
+            atomic_add(&solver.pcg_residual[j], prev_delta_j);
+            atomicAdd(&solver.pcg_solution[j].x, 1.0f);
+        }
+    }
+}
+
+__global__ void abi41_hard_stretch_direct_cap_range_kernel(Abi41Solver solver, int start, int count, float dt) {
+    const int local = blockIdx.x * blockDim.x + threadIdx.x;
+    if (local >= count
+        || !solver.springs
+        || solver.cfg.stretch_optimization_strength < kAbi41HardStretchPolishStart) {
+        return;
+    }
+    const int s = start + local;
+    if (s < 0 || s >= solver.cfg.edge_count) {
+        return;
+    }
+    const ReconSpring spring = solver.springs[s];
+    const float rest = spring.rest_length;
+    if (!isfinite(rest) || rest <= kEps || rest <= kAbi41TinyStretchRestThreshold) {
+        return;
+    }
+    const int i = static_cast<int>(spring.id0);
+    const int j = static_cast<int>(spring.id1);
+    if (i < 0 || j < 0 || i >= solver.cfg.vertex_count || j >= solver.cfg.vertex_count || i == j) {
+        return;
+    }
+    float wi = solver.inv_mass[i];
+    float wj = solver.inv_mass[j];
+    if (solver.state_flags) {
+        if ((solver.state_flags[i] & ssbl_abi41::kPinnedOrKinematicFlag) != 0u) {
+            wi = 0.0f;
+        }
+        if ((solver.state_flags[j] & ssbl_abi41::kPinnedOrKinematicFlag) != 0u) {
+            wj = 0.0f;
+        }
+    }
+    const float weight = wi + wj;
+    if (!isfinite(weight) || weight <= 0.0f) {
+        return;
+    }
+    const Vec3 pi = solver.pos[i];
+    const Vec3 pj = solver.pos[j];
+    const Vec3 prev_i = solver.prev[i];
+    const Vec3 prev_j = solver.prev[j];
+    if (!finite_vec(pi) || !finite_vec(pj) || !finite_vec(prev_i) || !finite_vec(prev_j)) {
+        return;
+    }
+    const Vec3 edge = sub(pj, pi);
+    const float len_sq = dot(edge, edge);
+    if (!isfinite(len_sq) || len_sq <= kAbi41TinyStretchLenSqEps) {
+        return;
+    }
+    const float len = sqrtf(len_sq);
+    const bool high_hardness = solver.cfg.stretch_optimization_strength >= 0.95f;
+    const float start_ratio = high_hardness
+        ? kAbi41HardStretchFinalCapHighStartRatio
+        : kAbi41HardStretchFinalCapStartRatio;
+    const float target_ratio = high_hardness
+        ? kAbi41HardStretchFinalCapHighTargetRatio
+        : kAbi41HardStretchFinalCapTargetRatio;
+    const float start_len = rest * start_ratio;
+    if (!isfinite(len) || len <= start_len) {
+        return;
+    }
+    abi41_count_hard_cap_clamp(solver);
+    const float target_len = rest * target_ratio;
+    const float excess = len - target_len;
+    if (!isfinite(excess) || excess <= 0.0f) {
+        return;
+    }
+    const Vec3 corr = mul(edge, -excess / fmaxf(weight * len, kEps));
+    if (!finite_vec(corr) || length(corr) <= 1.0e-20f) {
+        return;
+    }
+    const float max_delta = fminf(fmaxf(rest * 0.60f, solver.cfg.cloth_thickness * 0.10f), 0.010f);
+    Vec3 prev_delta_i = make_vec3(0.0f, 0.0f, 0.0f);
+    Vec3 prev_delta_j = make_vec3(0.0f, 0.0f, 0.0f);
+    const Vec3 normal = mul(edge, 1.0f / fmaxf(len, kEps));
+    const float safe_dt = fmaxf(dt, kEps);
+    if (isfinite(safe_dt) && safe_dt > kEps) {
+        const float inv_dt = 1.0f / safe_dt;
+        const Vec3 vi = mul(sub(pi, prev_i), inv_dt);
+        const Vec3 vj = mul(sub(pj, prev_j), inv_dt);
+        const float separating_speed = dot(sub(vj, vi), normal);
+        if (isfinite(separating_speed) && separating_speed > 0.0f) {
+            const float trim = separating_speed * safe_dt * kAbi41HardStretchFinalCapVelocityTrimScale / weight;
+            if (wi > 0.0f) {
+                prev_delta_i = add(prev_delta_i, mul(normal, -wi * trim));
+            }
+            if (wj > 0.0f) {
+                prev_delta_j = add(prev_delta_j, mul(normal, wj * trim));
+            }
+        }
+    }
+    if (wi > 0.0f) {
+        const Vec3 raw_delta_i = mul(corr, -wi);
+        const Vec3 delta_i = limit_delta(raw_delta_i, max_delta);
+        if (finite_vec(delta_i) && length(delta_i) > 0.0f) {
+            if (length(raw_delta_i) > max_delta) {
+                abi41_count_hard_cap_clamp(solver);
+            }
+            prev_delta_i = add(prev_delta_i, mul(delta_i, kAbi41HardStretchFinalCapPrevSyncScale));
+            atomic_add(&solver.pos[i], delta_i);
+            atomic_add(&solver.prev[i], prev_delta_i);
+        }
+    }
+    if (wj > 0.0f) {
+        const Vec3 raw_delta_j = mul(corr, wj);
+        const Vec3 delta_j = limit_delta(raw_delta_j, max_delta);
+        if (finite_vec(delta_j) && length(delta_j) > 0.0f) {
+            if (length(raw_delta_j) > max_delta) {
+                abi41_count_hard_cap_clamp(solver);
+            }
+            prev_delta_j = add(prev_delta_j, mul(delta_j, kAbi41HardStretchFinalCapPrevSyncScale));
+            atomic_add(&solver.pos[j], delta_j);
+            atomic_add(&solver.prev[j], prev_delta_j);
+        }
+    }
+}
+
+__global__ void abi41_hard_stretch_final_cap_apply_kernel(Abi41Solver solver) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= solver.cfg.vertex_count
+        || !solver.pcg_rhs
+        || !solver.pcg_solution
+        || !solver.pcg_residual) {
+        return;
+    }
+    if (solver.inv_mass[i] <= 0.0f
+        || (solver.state_flags && (solver.state_flags[i] & ssbl_abi41::kPinnedOrKinematicFlag) != 0u)) {
+        return;
+    }
+    const float count = solver.pcg_solution[i].x;
+    if (!isfinite(count) || count <= 0.0f) {
+        return;
+    }
+    Vec3 delta = mul(solver.pcg_rhs[i], 1.0f / count);
+    Vec3 prev_delta = mul(solver.pcg_residual[i], 1.0f / count);
+    if (!finite_vec(delta) || !finite_vec(prev_delta)) {
+        abi41_count(solver, kAbi41CountHardFallbacks);
+        return;
+    }
+    const float max_delta = fminf(fmaxf(solver.cfg.cloth_thickness * 0.20f, 1.0e-3f), 0.006f);
+    const float max_prev_delta = fminf(fmaxf(solver.cfg.cloth_thickness * 0.35f, 1.5e-3f), 0.010f);
+    delta = limit_delta(delta, max_delta);
+    prev_delta = limit_delta(prev_delta, max_prev_delta);
+    if (!finite_vec(delta) || length(delta) <= 0.0f) {
+        return;
+    }
+    solver.pos[i] = add(solver.pos[i], delta);
+    if (finite_vec(prev_delta) && length(prev_delta) > 0.0f) {
+        solver.prev[i] = add(solver.prev[i], prev_delta);
+    }
+}
+
+__global__ void abi41_tiny_stretch_accumulate_kernel(Abi41Solver solver, float dt) {
+    const int s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= solver.cfg.edge_count
+        || !solver.springs
+        || !solver.pcg_rhs
+        || !solver.pcg_solution
+        || solver.cfg.stretch_optimization_strength < kAbi41HardStretchPolishStart) {
+        return;
+    }
+    const ReconSpring spring = solver.springs[s];
+    const float rest = spring.rest_length;
+    if (!isfinite(rest) || rest <= kEps || rest > kAbi41TinyStretchRestThreshold) {
+        return;
+    }
+    const int i = static_cast<int>(spring.id0);
+    const int j = static_cast<int>(spring.id1);
+    if (i < 0 || j < 0 || i >= solver.cfg.vertex_count || j >= solver.cfg.vertex_count || i == j) {
+        return;
+    }
+    float wi = solver.inv_mass[i];
+    float wj = solver.inv_mass[j];
+    if (solver.state_flags) {
+        if ((solver.state_flags[i] & ssbl_abi41::kPinnedOrKinematicFlag) != 0u) {
+            wi = 0.0f;
+        }
+        if ((solver.state_flags[j] & ssbl_abi41::kPinnedOrKinematicFlag) != 0u) {
+            wj = 0.0f;
+        }
+    }
+    const float weight = wi + wj;
+    if (!isfinite(weight) || weight <= 0.0f) {
+        return;
+    }
+    const Vec3 pi = solver.pos[i];
+    const Vec3 pj = solver.pos[j];
+    if (!finite_vec(pi) || !finite_vec(pj)) {
+        return;
+    }
+    const Vec3 edge = sub(pj, pi);
+    const float len_sq = dot(edge, edge);
+    if (!isfinite(len_sq) || len_sq <= kAbi41TinyStretchLenSqEps) {
+        return;
+    }
+    const float len = sqrtf(len_sq);
+    const float target_len = rest * kAbi41TinyStretchMaxRatio;
+    const float excess = len - target_len;
+    if (!isfinite(excess) || excess <= 0.0f) {
+        return;
+    }
+    const Vec3 corr = mul(edge, -kAbi41TinyStretchRelaxation * excess / fmaxf(weight * len, kEps));
+    if (!finite_vec(corr) || length(corr) <= 1.0e-20f) {
+        return;
+    }
+    const float max_delta = fminf(fmaxf(rest * 3.0f, 2.5e-4f), 8.0e-4f);
+    if (wi > 0.0f) {
+        const Vec3 delta_i = limit_delta(mul(corr, -wi), max_delta);
+        if (finite_vec(delta_i) && length(delta_i) > 0.0f) {
+            atomic_add(&solver.pcg_rhs[i], delta_i);
+            atomicAdd(&solver.pcg_solution[i].x, 1.0f);
+        }
+    }
+    if (wj > 0.0f) {
+        const Vec3 delta_j = limit_delta(mul(corr, wj), max_delta);
+        if (finite_vec(delta_j) && length(delta_j) > 0.0f) {
+            atomic_add(&solver.pcg_rhs[j], delta_j);
+            atomicAdd(&solver.pcg_solution[j].x, 1.0f);
+        }
+    }
+}
+
+__global__ void abi41_tiny_stretch_apply_kernel(Abi41Solver solver) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= solver.cfg.vertex_count || !solver.pcg_rhs || !solver.pcg_solution) {
+        return;
+    }
+    if (solver.inv_mass[i] <= 0.0f
+        || (solver.state_flags && (solver.state_flags[i] & ssbl_abi41::kPinnedOrKinematicFlag) != 0u)) {
+        return;
+    }
+    const float count = solver.pcg_solution[i].x;
+    if (!isfinite(count) || count <= 0.0f) {
+        return;
+    }
+    Vec3 delta = mul(solver.pcg_rhs[i], 1.0f / count);
+    if (!finite_vec(delta)) {
+        abi41_count(solver, kAbi41CountHardFallbacks);
+        return;
+    }
+    const float max_delta = fminf(fmaxf(solver.cfg.cloth_thickness * 0.015f, 2.5e-4f), 9.0e-4f);
+    delta = limit_delta(delta, max_delta);
+    if (!finite_vec(delta) || length(delta) <= 0.0f) {
+        return;
+    }
+    solver.pos[i] = add(solver.pos[i], delta);
+    solver.prev[i] = add(solver.prev[i], mul(delta, kAbi41TinyStretchPrevSyncScale));
+}
+
+__global__ void abi41_tiny_stretch_hard_cap_range_kernel(Abi41Solver solver, int start, int count, float dt) {
+    const int local = blockIdx.x * blockDim.x + threadIdx.x;
+    if (local >= count
+        || !solver.springs
+        || solver.cfg.stretch_optimization_strength < kAbi41HardStretchPolishStart) {
+        return;
+    }
+    const int s = start + local;
+    if (s < 0 || s >= solver.cfg.edge_count) {
+        return;
+    }
+    const ReconSpring spring = solver.springs[s];
+    const float rest = spring.rest_length;
+    if (!isfinite(rest) || rest <= kEps || rest > kAbi41TinyStretchRestThreshold) {
+        return;
+    }
+    const int i = static_cast<int>(spring.id0);
+    const int j = static_cast<int>(spring.id1);
+    if (i < 0 || j < 0 || i >= solver.cfg.vertex_count || j >= solver.cfg.vertex_count || i == j) {
+        return;
+    }
+    float wi = solver.inv_mass[i];
+    float wj = solver.inv_mass[j];
+    if (solver.state_flags) {
+        if ((solver.state_flags[i] & ssbl_abi41::kPinnedOrKinematicFlag) != 0u) {
+            wi = 0.0f;
+        }
+        if ((solver.state_flags[j] & ssbl_abi41::kPinnedOrKinematicFlag) != 0u) {
+            wj = 0.0f;
+        }
+    }
+    const float weight = wi + wj;
+    if (!isfinite(weight) || weight <= 0.0f) {
+        return;
+    }
+    const Vec3 pi = solver.pos[i];
+    const Vec3 pj = solver.pos[j];
+    const Vec3 prev_i = solver.prev[i];
+    const Vec3 prev_j = solver.prev[j];
+    if (!finite_vec(pi) || !finite_vec(pj) || !finite_vec(prev_i) || !finite_vec(prev_j)) {
+        return;
+    }
+    const Vec3 edge = sub(pj, pi);
+    const float len_sq = dot(edge, edge);
+    if (!isfinite(len_sq) || len_sq <= kAbi41TinyStretchLenSqEps) {
+        return;
+    }
+    const float len = sqrtf(len_sq);
+    const float start_len = rest * kAbi41TinyStretchHardCapStartRatio;
+    if (!isfinite(len) || len <= start_len) {
+        return;
+    }
+    abi41_count_hard_cap_clamp(solver);
+    const float target_len = rest * kAbi41TinyStretchHardCapTargetRatio;
+    const float excess = len - target_len;
+    if (!isfinite(excess) || excess <= 0.0f) {
+        return;
+    }
+    const Vec3 corr = mul(edge, -excess / fmaxf(weight * len, kEps));
+    if (!finite_vec(corr) || length(corr) <= 1.0e-20f) {
+        return;
+    }
+    const float max_delta = fminf(fmaxf(rest * 6.0f, 5.0e-4f), 1.5e-3f);
+    Vec3 prev_delta_i = make_vec3(0.0f, 0.0f, 0.0f);
+    Vec3 prev_delta_j = make_vec3(0.0f, 0.0f, 0.0f);
+    const Vec3 normal = mul(edge, 1.0f / fmaxf(len, kEps));
+    if (isfinite(dt) && dt > kEps) {
+        const float inv_dt = 1.0f / dt;
+        const Vec3 vi = mul(sub(pi, prev_i), inv_dt);
+        const Vec3 vj = mul(sub(pj, prev_j), inv_dt);
+        const float separating_speed = dot(sub(vj, vi), normal);
+        if (isfinite(separating_speed) && separating_speed > 0.0f) {
+            const float trim = separating_speed * dt * kAbi41TinyStretchHardCapVelocityTrimScale / weight;
+            if (wi > 0.0f) {
+                prev_delta_i = add(prev_delta_i, mul(normal, -wi * trim));
+            }
+            if (wj > 0.0f) {
+                prev_delta_j = add(prev_delta_j, mul(normal, wj * trim));
+            }
+        }
+    }
+    if (wi > 0.0f) {
+        const Vec3 raw_delta_i = mul(corr, -wi);
+        const Vec3 delta_i = limit_delta(raw_delta_i, max_delta);
+        if (finite_vec(delta_i) && length(delta_i) > 0.0f) {
+            if (length(raw_delta_i) > max_delta) {
+                abi41_count_hard_cap_clamp(solver);
+            }
+            prev_delta_i = add(prev_delta_i, mul(delta_i, kAbi41TinyStretchHardCapPrevSyncScale));
+            atomic_add(&solver.pos[i], delta_i);
+            atomic_add(&solver.prev[i], prev_delta_i);
+        }
+    }
+    if (wj > 0.0f) {
+        const Vec3 raw_delta_j = mul(corr, wj);
+        const Vec3 delta_j = limit_delta(raw_delta_j, max_delta);
+        if (finite_vec(delta_j) && length(delta_j) > 0.0f) {
+            if (length(raw_delta_j) > max_delta) {
+                abi41_count_hard_cap_clamp(solver);
+            }
+            prev_delta_j = add(prev_delta_j, mul(delta_j, kAbi41TinyStretchHardCapPrevSyncScale));
+            atomic_add(&solver.pos[j], delta_j);
+            atomic_add(&solver.prev[j], prev_delta_j);
+        }
+    }
+}
+
+__global__ void abi41_extreme_stretch_hard_cap_range_kernel(Abi41Solver solver, int start, int count, float dt) {
+    const int local = blockIdx.x * blockDim.x + threadIdx.x;
+    if (local >= count
+        || !solver.springs
+        || solver.cfg.stretch_optimization_strength < kAbi41HardStretchPolishStart) {
+        return;
+    }
+    const int s = start + local;
+    if (s < 0 || s >= solver.cfg.edge_count) {
+        return;
+    }
+    const ReconSpring spring = solver.springs[s];
+    const float rest = spring.rest_length;
+    if (!isfinite(rest) || rest <= kEps || rest <= kAbi41TinyStretchRestThreshold) {
+        return;
+    }
+    const int i = static_cast<int>(spring.id0);
+    const int j = static_cast<int>(spring.id1);
+    if (i < 0 || j < 0 || i >= solver.cfg.vertex_count || j >= solver.cfg.vertex_count || i == j) {
+        return;
+    }
+    float wi = solver.inv_mass[i];
+    float wj = solver.inv_mass[j];
+    if (solver.state_flags) {
+        if ((solver.state_flags[i] & ssbl_abi41::kPinnedOrKinematicFlag) != 0u) {
+            wi = 0.0f;
+        }
+        if ((solver.state_flags[j] & ssbl_abi41::kPinnedOrKinematicFlag) != 0u) {
+            wj = 0.0f;
+        }
+    }
+    const float weight = wi + wj;
+    if (!isfinite(weight) || weight <= 0.0f) {
+        return;
+    }
+    const Vec3 pi = solver.pos[i];
+    const Vec3 pj = solver.pos[j];
+    const Vec3 prev_i = solver.prev[i];
+    const Vec3 prev_j = solver.prev[j];
+    if (!finite_vec(pi) || !finite_vec(pj) || !finite_vec(prev_i) || !finite_vec(prev_j)) {
+        return;
+    }
+    const Vec3 edge = sub(pj, pi);
+    const float len_sq = dot(edge, edge);
+    if (!isfinite(len_sq) || len_sq <= kAbi41TinyStretchLenSqEps) {
+        return;
+    }
+    const float len = sqrtf(len_sq);
+    const float start_len = rest * kAbi41ExtremeStretchHardCapStartRatio;
+    if (!isfinite(len) || len <= start_len) {
+        return;
+    }
+    abi41_count_hard_cap_clamp(solver);
+    const float target_len = rest * kAbi41ExtremeStretchHardCapTargetRatio;
+    const float excess = len - target_len;
+    if (!isfinite(excess) || excess <= 0.0f) {
+        return;
+    }
+    const Vec3 corr = mul(edge, -excess / fmaxf(weight * len, kEps));
+    if (!finite_vec(corr) || length(corr) <= 1.0e-20f) {
+        return;
+    }
+    const float max_delta = fminf(fmaxf(rest * 1.25f, solver.cfg.cloth_thickness * 0.10f), 0.006f);
+    Vec3 prev_delta_i = make_vec3(0.0f, 0.0f, 0.0f);
+    Vec3 prev_delta_j = make_vec3(0.0f, 0.0f, 0.0f);
+    const Vec3 normal = mul(edge, 1.0f / fmaxf(len, kEps));
+    if (isfinite(dt) && dt > kEps) {
+        const float inv_dt = 1.0f / dt;
+        const Vec3 vi = mul(sub(pi, prev_i), inv_dt);
+        const Vec3 vj = mul(sub(pj, prev_j), inv_dt);
+        const float separating_speed = dot(sub(vj, vi), normal);
+        if (isfinite(separating_speed) && separating_speed > 0.0f) {
+            const float trim = separating_speed * dt * kAbi41ExtremeStretchHardCapVelocityTrimScale / weight;
+            if (wi > 0.0f) {
+                prev_delta_i = add(prev_delta_i, mul(normal, -wi * trim));
+            }
+            if (wj > 0.0f) {
+                prev_delta_j = add(prev_delta_j, mul(normal, wj * trim));
+            }
+        }
+    }
+    if (wi > 0.0f) {
+        const Vec3 raw_delta_i = mul(corr, -wi);
+        const Vec3 delta_i = limit_delta(raw_delta_i, max_delta);
+        if (finite_vec(delta_i) && length(delta_i) > 0.0f) {
+            if (length(raw_delta_i) > max_delta) {
+                abi41_count_hard_cap_clamp(solver);
+            }
+            prev_delta_i = add(prev_delta_i, mul(delta_i, kAbi41ExtremeStretchHardCapPrevSyncScale));
+            atomic_add(&solver.pos[i], delta_i);
+            atomic_add(&solver.prev[i], prev_delta_i);
+        }
+    }
+    if (wj > 0.0f) {
+        const Vec3 raw_delta_j = mul(corr, wj);
+        const Vec3 delta_j = limit_delta(raw_delta_j, max_delta);
+        if (finite_vec(delta_j) && length(delta_j) > 0.0f) {
+            if (length(raw_delta_j) > max_delta) {
+                abi41_count_hard_cap_clamp(solver);
+            }
+            prev_delta_j = add(prev_delta_j, mul(delta_j, kAbi41ExtremeStretchHardCapPrevSyncScale));
+            atomic_add(&solver.pos[j], delta_j);
+            atomic_add(&solver.prev[j], prev_delta_j);
         }
     }
 }
@@ -1403,6 +2284,92 @@ __global__ void abi41_bend_project_kernel(Abi41Solver solver, float dt) {
         const Vec3 delta_j = mul(corr, wj);
         atomic_add(&solver.pos[j], delta_j);
         atomic_add(&solver.prev[j], mul(delta_j, kAbi41BendPrevSyncScale));
+    }
+    abi41_count(solver, kAbi41CountBendingWings);
+}
+
+__global__ void abi41_bend_project_range_kernel(Abi41Solver solver, float dt, int start, int count) {
+    const int local = blockIdx.x * blockDim.x + threadIdx.x;
+    if (local >= count || count <= 0 || !solver.bends || !solver.bend_rest) {
+        return;
+    }
+    const int bidx = start + local;
+    if (bidx < 0 || bidx >= solver.cfg.bend_count) {
+        abi41_count(solver, kAbi41CountBendingGuards);
+        return;
+    }
+    const ReconPair pair = solver.bends[bidx];
+    const int i = pair.x;
+    const int j = pair.y;
+    if (i < 0 || j < 0 || i >= solver.cfg.vertex_count || j >= solver.cfg.vertex_count || i == j) {
+        abi41_count(solver, kAbi41CountBendingGuards);
+        return;
+    }
+    float wi = solver.inv_mass[i];
+    float wj = solver.inv_mass[j];
+    if (solver.state_flags) {
+        if ((solver.state_flags[i] & ssbl_abi41::kPinnedOrKinematicFlag) != 0u) {
+            wi = 0.0f;
+        }
+        if ((solver.state_flags[j] & ssbl_abi41::kPinnedOrKinematicFlag) != 0u) {
+            wj = 0.0f;
+        }
+    }
+    const float weight = wi + wj;
+    if (!isfinite(weight) || weight <= 0.0f) {
+        return;
+    }
+    const float rest = solver.bend_rest[bidx];
+    if (!isfinite(rest) || rest <= kEps) {
+        abi41_count(solver, kAbi41CountBendingGuards);
+        return;
+    }
+    const Vec3 pi = solver.pos[i];
+    const Vec3 pj = solver.pos[j];
+    if (!finite_vec(pi) || !finite_vec(pj)) {
+        abi41_count(solver, kAbi41CountBendingGuards);
+        return;
+    }
+    const Vec3 delta = sub(pj, pi);
+    const float len_sq = fma_rn(delta.x, delta.x, fma_rn(delta.y, delta.y, delta.z * delta.z));
+    if (!isfinite(len_sq) || len_sq <= 1.0e-10f) {
+        abi41_count(solver, kAbi41CountBendingGuards);
+        return;
+    }
+    const float inv_len = rsqrtf(len_sq);
+    const float len = len_sq * inv_len;
+    const float c = len - rest;
+    if (!isfinite(c) || fabsf(c) <= 1.0e-6f) {
+        return;
+    }
+    const float alpha = fmaxf(solver.cfg.bend_compliance, 0.0f) / fmaxf(dt * dt, kEps);
+    const float dlambda = -c / fmaxf(weight + alpha, kEps);
+    Vec3 corr = mul(delta, kAbi41BendRelaxation * dlambda * inv_len);
+    if (!finite_vec(corr)) {
+        abi41_count(solver, kAbi41CountBendingGuards);
+        return;
+    }
+    const float corr_len = length(corr);
+    const float max_corr = fmaxf(
+        2.5e-4f,
+        fminf(fmaxf(rest, solver.cfg.cloth_thickness) * 0.08f, 0.020f)
+    );
+    if (!isfinite(corr_len) || corr_len <= 0.0f) {
+        return;
+    }
+    if (corr_len > max_corr) {
+        corr = mul(corr, max_corr / fmaxf(corr_len, kEps));
+        abi41_count(solver, kAbi41CountBendingGuards);
+    }
+    if (wi > 0.0f) {
+        const Vec3 delta_i = mul(corr, -wi);
+        solver.pos[i] = add(solver.pos[i], delta_i);
+        solver.prev[i] = add(solver.prev[i], mul(delta_i, kAbi41BendPrevSyncScale));
+    }
+    if (wj > 0.0f) {
+        const Vec3 delta_j = mul(corr, wj);
+        solver.pos[j] = add(solver.pos[j], delta_j);
+        solver.prev[j] = add(solver.prev[j], mul(delta_j, kAbi41BendPrevSyncScale));
     }
     abi41_count(solver, kAbi41CountBendingWings);
 }
@@ -1585,10 +2552,7 @@ __global__ void abi41_pcg_build_stretch_system_kernel(Abi41Solver solver) {
     if (strength <= 0.0f) {
         return;
     }
-    const float max_edge_delta = fmaxf(
-        1.0e-5f,
-        fminf(fmaxf(rest, solver.cfg.cloth_thickness) * 0.5f, 0.25f)
-    );
+    const float max_edge_delta = abi41_pcg_stretch_projection_limit(solver, rest);
     float projected = edge_error * strength;
     projected = fmaxf(-max_edge_delta, fminf(projected, max_edge_delta));
     if (!isfinite(projected) || fabsf(projected) <= 1.0e-7f) {
@@ -1737,9 +2701,10 @@ __global__ void abi41_pcg_update_solution_residual_z_kernel(Abi41Solver solver, 
             if (apply_solution_now != 0) {
                 Vec3 delta = mul(solver.pcg_search_dir[i], alpha);
                 const float len = length(delta);
-                const float max_delta = 0.25f;
+                const float max_delta = abi41_pcg_stretch_writeback_limit(solver);
                 if (len > max_delta) {
                     delta = mul(delta, max_delta / fmaxf(len, kEps));
+                    abi41_count(solver, kAbi41CountHardFallbacks);
                 }
                 solver.pos[i] = add(solver.pos[i], delta);
                 solver.prev[i] = add(solver.prev[i], mul(delta, kAbi41StretchPrevSyncScale));
@@ -1820,9 +2785,10 @@ __global__ void abi41_pcg_update_solution_residual_z_device_alpha_kernel(Abi41So
             if (apply_solution_now != 0) {
                 Vec3 delta = mul(solver.pcg_search_dir[i], alpha);
                 const float len = length(delta);
-                const float max_delta = 0.25f;
+                const float max_delta = abi41_pcg_stretch_writeback_limit(solver);
                 if (len > max_delta) {
                     delta = mul(delta, max_delta / fmaxf(len, kEps));
+                    abi41_count(solver, kAbi41CountHardFallbacks);
                 }
                 solver.pos[i] = add(solver.pos[i], delta);
                 solver.prev[i] = add(solver.prev[i], mul(delta, kAbi41StretchPrevSyncScale));
@@ -2332,6 +3298,10 @@ __global__ void abi41_dynamic_particle_collision_kernel(Abi41Solver solver) {
 }
 
 __host__ __device__ float abi41_self_contact_radius(SsblXpbdConfig cfg) {
+    const float requested = fmaxf(cfg.self_collision_distance, 0.0f);
+    if (requested > 0.0f) {
+        return requested;
+    }
     return fmaxf(fmaxf(cfg.cloth_thickness, cfg.collision_margin), 0.0f);
 }
 
@@ -3277,6 +4247,19 @@ bool alloc_and_copy(T** dst, const T* src, int count, const char* label) {
     return true;
 }
 
+bool copy_host_offsets(int** dst, const int* src, int offset_count, const char* label) {
+    *dst = nullptr;
+    if (offset_count <= 0) {
+        return true;
+    }
+    if (!src) {
+        return set_error(label);
+    }
+    *dst = new int[offset_count];
+    std::memcpy(*dst, src, sizeof(int) * offset_count);
+    return true;
+}
+
 bool upload_force_fields(
     Abi41Solver* solver,
     const SsblXpbdForceField* force_fields,
@@ -3691,7 +4674,7 @@ bool prepare_self_collision_hash_buffers(Abi41Solver* solver) {
     if (!solver->cfg.self_collision || solver->cfg.vertex_count < kAbi41SelfHashMinCount) {
         return true;
     }
-    const float target = std::max(std::max(solver->cfg.cloth_thickness, solver->cfg.collision_margin), 0.0f);
+    const float target = abi41_self_contact_radius(solver->cfg);
     if (target <= 0.0f) {
         return true;
     }
@@ -3775,7 +4758,7 @@ bool prepare_self_triangle_hash_buffers(Abi41Solver* solver) {
     if (!solver->cfg.self_collision || solver->cfg.triangle_count < kAbi41SelfTriangleHashMinCount) {
         return true;
     }
-    const float target = std::max(std::max(solver->cfg.cloth_thickness, solver->cfg.collision_margin), 0.0f);
+    const float target = abi41_self_contact_radius(solver->cfg);
     if (target <= 0.0f) {
         return true;
     }
@@ -3839,7 +4822,7 @@ bool prepare_self_edge_hash_buffers(Abi41Solver* solver) {
     if (!solver->cfg.self_collision || solver->cfg.edge_count < kAbi41SelfEdgeHashMinCount) {
         return true;
     }
-    const float target = std::max(std::max(solver->cfg.cloth_thickness, solver->cfg.collision_margin), 0.0f);
+    const float target = abi41_self_contact_radius(solver->cfg);
     if (target <= 0.0f) {
         return true;
     }
@@ -4312,6 +5295,179 @@ bool fetch_pcg_reductions(Abi41Solver* solver, float* out_values, const char* la
     );
 }
 
+std::vector<float> build_pressure_area_shares(
+    int vertex_count,
+    const std::vector<ReconTriangle>& triangles,
+    const Vec3* rest_positions
+) {
+    std::vector<float> shares(vertex_count, 0.0f);
+    if (vertex_count <= 0 || triangles.empty() || !rest_positions) {
+        return shares;
+    }
+    double total_area = 0.0;
+    int valid_triangle_count = 0;
+    for (const ReconTriangle& tri : triangles) {
+        const int i0 = static_cast<int>(tri.v0);
+        const int i1 = static_cast<int>(tri.v1);
+        const int i2 = static_cast<int>(tri.v2);
+        if (i0 < 0 || i0 >= vertex_count
+            || i1 < 0 || i1 >= vertex_count
+            || i2 < 0 || i2 >= vertex_count) {
+            continue;
+        }
+        const Vec3 a = rest_positions[i0];
+        const Vec3 b = rest_positions[i1];
+        const Vec3 c = rest_positions[i2];
+        const Vec3 area_vec = cross(sub(b, a), sub(c, a));
+        const float area_sq4 = dot(area_vec, area_vec);
+        if (!std::isfinite(area_sq4) || area_sq4 <= 0.0f) {
+            continue;
+        }
+        const float area = 0.5f * std::sqrt(area_sq4);
+        if (!std::isfinite(area) || area <= 0.0f) {
+            continue;
+        }
+        const float share = area / 3.0f;
+        shares[i0] += share;
+        shares[i1] += share;
+        shares[i2] += share;
+        total_area += static_cast<double>(area);
+        ++valid_triangle_count;
+    }
+    if (valid_triangle_count <= 0 || total_area <= 0.0 || !std::isfinite(total_area)) {
+        std::fill(shares.begin(), shares.end(), 0.0f);
+        return shares;
+    }
+
+    const float mean_vertex_area = static_cast<float>(total_area / static_cast<double>(std::max(vertex_count, 1)));
+    const float max_share = std::max(mean_vertex_area * 16.0f, 1.0e-12f);
+    for (float& share : shares) {
+        if (!std::isfinite(share) || share <= 0.0f) {
+            share = 0.0f;
+        } else {
+            share = std::min(share, max_share);
+        }
+    }
+    return shares;
+}
+
+std::vector<float> build_pressure_rest_scales(
+    int vertex_count,
+    const std::vector<ReconSpring>& springs,
+    const std::vector<float>& area_shares
+) {
+    std::vector<float> scales(vertex_count, 0.0f);
+    if (vertex_count <= 0) {
+        return scales;
+    }
+
+    std::vector<double> length_sums(static_cast<size_t>(vertex_count), 0.0);
+    std::vector<int> length_counts(static_cast<size_t>(vertex_count), 0);
+    for (const ReconSpring& spring : springs) {
+        const int i = static_cast<int>(spring.id0);
+        const int j = static_cast<int>(spring.id1);
+        const float rest = spring.rest_length;
+        if (i < 0 || i >= vertex_count
+            || j < 0 || j >= vertex_count
+            || !std::isfinite(rest)
+            || rest <= 0.0f) {
+            continue;
+        }
+        length_sums[static_cast<size_t>(i)] += static_cast<double>(rest);
+        length_sums[static_cast<size_t>(j)] += static_cast<double>(rest);
+        length_counts[static_cast<size_t>(i)] += 1;
+        length_counts[static_cast<size_t>(j)] += 1;
+    }
+
+    double total_scale = 0.0;
+    int valid_scale_count = 0;
+    for (int i = 0; i < vertex_count; ++i) {
+        float scale = 0.0f;
+        if (length_counts[static_cast<size_t>(i)] > 0) {
+            scale = static_cast<float>(
+                length_sums[static_cast<size_t>(i)] / static_cast<double>(length_counts[static_cast<size_t>(i)])
+            );
+        } else if (static_cast<size_t>(i) < area_shares.size()) {
+            const float area = area_shares[static_cast<size_t>(i)];
+            if (std::isfinite(area) && area > 0.0f) {
+                scale = std::sqrt(area);
+            }
+        }
+        if (std::isfinite(scale) && scale > 0.0f) {
+            scales[static_cast<size_t>(i)] = scale;
+            total_scale += static_cast<double>(scale);
+            ++valid_scale_count;
+        }
+    }
+
+    const float mean_scale = valid_scale_count > 0
+        ? static_cast<float>(total_scale / static_cast<double>(valid_scale_count))
+        : 1.0f;
+    const float floor_scale = std::max(mean_scale * 0.02f, 1.0e-7f);
+    const float cap_scale = std::max(mean_scale * 16.0f, floor_scale);
+    for (float& scale : scales) {
+        if (!std::isfinite(scale) || scale <= 0.0f) {
+            scale = mean_scale;
+        }
+        scale = std::max(floor_scale, std::min(scale, cap_scale));
+    }
+    return scales;
+}
+
+float build_pressure_velocity_length_scale(
+    int vertex_count,
+    const Vec3* rest_positions,
+    const std::vector<float>& rest_scales,
+    float object_scale_factor
+) {
+    float mean_scale = 0.0f;
+    int mean_count = 0;
+    for (float scale : rest_scales) {
+        if (std::isfinite(scale) && scale > 0.0f) {
+            mean_scale += scale;
+            ++mean_count;
+        }
+    }
+    mean_scale = mean_count > 0 ? mean_scale / static_cast<float>(mean_count) : 1.0f;
+    if (vertex_count <= 0 || !rest_positions) {
+        return std::max(mean_scale, 1.0e-6f);
+    }
+
+    Vec3 min_corner = rest_positions[0];
+    Vec3 max_corner = rest_positions[0];
+    bool has_finite = false;
+    for (int i = 0; i < vertex_count; ++i) {
+        const Vec3 p = rest_positions[i];
+        if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) {
+            continue;
+        }
+        if (!has_finite) {
+            min_corner = p;
+            max_corner = p;
+            has_finite = true;
+        } else {
+            min_corner.x = std::min(min_corner.x, p.x);
+            min_corner.y = std::min(min_corner.y, p.y);
+            min_corner.z = std::min(min_corner.z, p.z);
+            max_corner.x = std::max(max_corner.x, p.x);
+            max_corner.y = std::max(max_corner.y, p.y);
+            max_corner.z = std::max(max_corner.z, p.z);
+        }
+    }
+    if (!has_finite) {
+        return std::max(mean_scale, 1.0e-6f);
+    }
+    const Vec3 span = sub(max_corner, min_corner);
+    const float diagonal = std::sqrt(std::max(dot(span, span), 0.0f));
+    if (!std::isfinite(diagonal) || diagonal <= 0.0f) {
+        return std::max(mean_scale, 1.0e-6f);
+    }
+    const float safe_object_scale_factor = std::isfinite(object_scale_factor) && object_scale_factor > 0.0f
+        ? object_scale_factor
+        : kAbi41PressureVelocityObjectScale;
+    return std::max(diagonal * safe_object_scale_factor, mean_scale * 4.0f);
+}
+
 bool update_pcg_diag_from_device_reductions(Abi41Solver* solver, const char* label) {
     if (!solver || !solver->pcg_reductions) {
         return true;
@@ -4487,6 +5643,274 @@ bool run_abi41_hard_stretch_pcg(Abi41Solver* solver, int v_blocks, int e_blocks)
     return true;
 }
 
+void launch_abi41_hard_stretch_normal_caps_sequence(
+    Abi41Solver* solver,
+    int e_blocks,
+    float sub_dt,
+    int passes,
+    cudaStream_t stream
+) {
+    for (int cap = 0; cap < passes; ++cap) {
+        if (solver->cfg.edge_color_count > 0 && solver->edge_color_offsets_host) {
+            for (int color = 0; color < solver->cfg.edge_color_count; ++color) {
+                const int start = solver->edge_color_offsets_host[color];
+                const int count = solver->edge_color_offsets_host[color + 1] - start;
+                if (count > 0) {
+                    abi41_hard_stretch_direct_cap_range_kernel<<<block_count(count), kThreads, 0, stream>>>(
+                        *solver,
+                        start,
+                        count,
+                        sub_dt
+                    );
+                }
+            }
+            for (int color = solver->cfg.edge_color_count - 1; color >= 0; --color) {
+                const int start = solver->edge_color_offsets_host[color];
+                const int count = solver->edge_color_offsets_host[color + 1] - start;
+                if (count > 0) {
+                    abi41_hard_stretch_direct_cap_range_kernel<<<block_count(count), kThreads, 0, stream>>>(
+                        *solver,
+                        start,
+                        count,
+                        sub_dt
+                    );
+                }
+            }
+        } else {
+            abi41_hard_stretch_direct_cap_range_kernel<<<e_blocks, kThreads, 0, stream>>>(
+                *solver,
+                0,
+                solver->cfg.edge_count,
+                sub_dt
+            );
+        }
+    }
+}
+
+bool run_abi41_hard_stretch_normal_caps(Abi41Solver* solver, int v_blocks, int e_blocks, float sub_dt, int passes) {
+    if (!solver
+        || passes <= 0
+        || solver->cfg.edge_count <= 0
+        || solver->cfg.stretch_optimization_strength < kAbi41HardStretchPolishStart
+        || !solver->springs
+        || !solver->pcg_rhs
+        || !solver->pcg_solution
+        || !solver->pcg_residual) {
+        return true;
+    }
+    launch_abi41_hard_stretch_normal_caps_sequence(solver, e_blocks, sub_dt, passes, 0);
+    if (!set_cuda_error(cudaGetLastError(), "launch hard stretch normal caps")) {
+        return false;
+    }
+    return true;
+}
+
+void launch_abi41_hard_stretch_polish_sequence(
+    Abi41Solver* solver,
+    int v_blocks,
+    int e_blocks,
+    float sub_dt,
+    int normal_cap_passes,
+    cudaStream_t stream
+) {
+    for (int polish = 0; polish < kAbi41HardStretchPolishPasses; ++polish) {
+        abi41_hard_stretch_polish_reset_kernel<<<v_blocks, kThreads, 0, stream>>>(*solver);
+        abi41_hard_stretch_polish_accumulate_kernel<<<e_blocks, kThreads, 0, stream>>>(*solver, sub_dt);
+        abi41_hard_stretch_polish_apply_kernel<<<v_blocks, kThreads, 0, stream>>>(*solver);
+        if (normal_cap_passes > 0) {
+            launch_abi41_hard_stretch_normal_caps_sequence(solver, e_blocks, sub_dt, normal_cap_passes, stream);
+        }
+        for (int tiny = 0; tiny < kAbi41TinyStretchPasses; ++tiny) {
+            abi41_hard_stretch_polish_reset_kernel<<<v_blocks, kThreads, 0, stream>>>(*solver);
+            abi41_tiny_stretch_accumulate_kernel<<<e_blocks, kThreads, 0, stream>>>(*solver, sub_dt);
+            abi41_tiny_stretch_apply_kernel<<<v_blocks, kThreads, 0, stream>>>(*solver);
+            for (int cap = 0; cap < kAbi41TinyStretchHardCapPasses; ++cap) {
+                if (solver->cfg.edge_color_count > 0 && solver->edge_color_offsets_host) {
+                    for (int color = 0; color < solver->cfg.edge_color_count; ++color) {
+                        const int start = solver->edge_color_offsets_host[color];
+                        const int count = solver->edge_color_offsets_host[color + 1] - start;
+                        if (count > 0) {
+                            abi41_tiny_stretch_hard_cap_range_kernel<<<block_count(count), kThreads, 0, stream>>>(*solver, start, count, sub_dt);
+                        }
+                    }
+                } else {
+                    abi41_tiny_stretch_hard_cap_range_kernel<<<e_blocks, kThreads, 0, stream>>>(*solver, 0, solver->cfg.edge_count, sub_dt);
+                }
+            }
+        }
+    }
+}
+
+void destroy_hard_polish_graph(Abi41Solver* solver) {
+    if (!solver) {
+        return;
+    }
+    if (solver->hard_polish_graph_exec) {
+        cudaGraphExecDestroy(solver->hard_polish_graph_exec);
+        solver->hard_polish_graph_exec = nullptr;
+    }
+    if (solver->hard_polish_graph) {
+        cudaGraphDestroy(solver->hard_polish_graph);
+        solver->hard_polish_graph = nullptr;
+    }
+    solver->hard_polish_graph_sub_dt = -1.0f;
+    solver->hard_polish_graph_normal_cap_passes = -1;
+}
+
+bool capture_hard_polish_graph(
+    Abi41Solver* solver,
+    int v_blocks,
+    int e_blocks,
+    float sub_dt,
+    int normal_cap_passes
+) {
+    destroy_hard_polish_graph(solver);
+    cudaStream_t capture_stream = nullptr;
+    cudaError_t err = cudaStreamCreateWithFlags(&capture_stream, cudaStreamNonBlocking);
+    if (err != cudaSuccess) {
+        return false;
+    }
+    err = cudaStreamBeginCapture(capture_stream, cudaStreamCaptureModeGlobal);
+    if (err != cudaSuccess) {
+        cudaStreamDestroy(capture_stream);
+        return false;
+    }
+    launch_abi41_hard_stretch_polish_sequence(
+        solver,
+        v_blocks,
+        e_blocks,
+        sub_dt,
+        normal_cap_passes,
+        capture_stream
+    );
+    cudaGraph_t graph = nullptr;
+    err = cudaStreamEndCapture(capture_stream, &graph);
+    cudaStreamDestroy(capture_stream);
+    if (err != cudaSuccess || !graph) {
+        if (graph) {
+            cudaGraphDestroy(graph);
+        }
+        return false;
+    }
+    cudaGraphExec_t exec = nullptr;
+    err = cudaGraphInstantiate(&exec, graph, 0);
+    if (err != cudaSuccess || !exec) {
+        cudaGraphDestroy(graph);
+        return false;
+    }
+    solver->hard_polish_graph = graph;
+    solver->hard_polish_graph_exec = exec;
+    solver->hard_polish_graph_sub_dt = sub_dt;
+    solver->hard_polish_graph_normal_cap_passes = normal_cap_passes;
+    return true;
+}
+
+bool run_abi41_hard_stretch_polish_graph(
+    Abi41Solver* solver,
+    int v_blocks,
+    int e_blocks,
+    float sub_dt,
+    int normal_cap_passes
+) {
+    if (!solver || !abi41_hard_stretch_graph_enabled()) {
+        return false;
+    }
+    const bool graph_matches = solver->hard_polish_graph_exec
+        && solver->hard_polish_graph_sub_dt == sub_dt
+        && solver->hard_polish_graph_normal_cap_passes == normal_cap_passes;
+    if (!graph_matches
+        && !capture_hard_polish_graph(solver, v_blocks, e_blocks, sub_dt, normal_cap_passes)) {
+        return false;
+    }
+    if (!set_cuda_error(
+            cudaGraphLaunch(solver->hard_polish_graph_exec, 0),
+            "launch hard stretch polish graph")) {
+        destroy_hard_polish_graph(solver);
+        return false;
+    }
+    if (!set_cuda_error(cudaGetLastError(), "launch hard stretch polish graph")) {
+        destroy_hard_polish_graph(solver);
+        return false;
+    }
+    return true;
+}
+
+bool run_abi41_hard_stretch_polish(
+    Abi41Solver* solver,
+    int v_blocks,
+    int e_blocks,
+    float sub_dt,
+    int normal_cap_passes
+) {
+    if (!solver
+        || solver->cfg.edge_count <= 0
+        || solver->cfg.stretch_optimization_strength < kAbi41HardStretchPolishStart
+        || !solver->pcg_rhs
+        || !solver->pcg_solution) {
+        return true;
+    }
+    if (run_abi41_hard_stretch_polish_graph(solver, v_blocks, e_blocks, sub_dt, normal_cap_passes)) {
+        return true;
+    }
+    launch_abi41_hard_stretch_polish_sequence(solver, v_blocks, e_blocks, sub_dt, normal_cap_passes, 0);
+    return set_cuda_error(cudaGetLastError(), "launch hard stretch polish");
+}
+
+bool run_abi41_extreme_stretch_caps(Abi41Solver* solver, int e_blocks, float sub_dt) {
+    if (!solver
+        || solver->cfg.edge_count <= 0
+        || solver->cfg.stretch_optimization_strength < kAbi41HardStretchPolishStart
+        || !solver->springs) {
+        return true;
+    }
+    for (int cap = 0; cap < kAbi41ExtremeStretchHardCapPasses; ++cap) {
+        if (solver->cfg.edge_color_count > 0 && solver->edge_color_offsets_host) {
+            for (int color = 0; color < solver->cfg.edge_color_count; ++color) {
+                const int start = solver->edge_color_offsets_host[color];
+                const int count = solver->edge_color_offsets_host[color + 1] - start;
+                if (count > 0) {
+                    abi41_extreme_stretch_hard_cap_range_kernel<<<block_count(count), kThreads>>>(*solver, start, count, sub_dt);
+                }
+            }
+        } else {
+            abi41_extreme_stretch_hard_cap_range_kernel<<<e_blocks, kThreads>>>(*solver, 0, solver->cfg.edge_count, sub_dt);
+        }
+    }
+    return set_cuda_error(cudaGetLastError(), "launch extreme stretch hard caps");
+}
+
+bool run_abi41_hard_stretch_final_caps(Abi41Solver* solver, int v_blocks, int e_blocks, float sub_dt) {
+    if (!solver
+        || solver->cfg.edge_count <= 0
+        || solver->cfg.stretch_optimization_strength < kAbi41HardStretchPolishStart
+        || !solver->springs) {
+        return true;
+    }
+    if (!run_abi41_hard_stretch_normal_caps(solver, v_blocks, e_blocks, sub_dt, kAbi41HardStretchFinalCapPasses)) {
+        return false;
+    }
+    if (!run_abi41_extreme_stretch_caps(solver, e_blocks, sub_dt)) {
+        return false;
+    }
+    for (int cap = 0; cap < kAbi41TinyStretchHardCapPasses; ++cap) {
+        if (solver->cfg.edge_color_count > 0 && solver->edge_color_offsets_host) {
+            for (int color = 0; color < solver->cfg.edge_color_count; ++color) {
+                const int start = solver->edge_color_offsets_host[color];
+                const int count = solver->edge_color_offsets_host[color + 1] - start;
+                if (count > 0) {
+                    abi41_tiny_stretch_hard_cap_range_kernel<<<block_count(count), kThreads>>>(*solver, start, count, sub_dt);
+                }
+            }
+        } else {
+            abi41_tiny_stretch_hard_cap_range_kernel<<<e_blocks, kThreads>>>(*solver, 0, solver->cfg.edge_count, sub_dt);
+        }
+    }
+    if (!set_cuda_error(cudaGetLastError(), "launch hard stretch final caps")) {
+        return false;
+    }
+    return true;
+}
+
 bool reset_abi41_counts(Abi41Solver* solver) {
     if (!solver->abi41_counts) {
         return true;
@@ -4578,16 +6002,21 @@ void free_solver(Abi41Solver* solver) {
     if (!solver) {
         return;
     }
+    destroy_hard_polish_graph(solver);
     destroy_pcg_texture(solver);
     cudaFree(solver->pos);
     cudaFree(solver->prev);
     cudaFree(solver->vel);
     cudaFree(solver->rest);
     cudaFree(solver->inv_mass);
+    cudaFree(solver->pressure_area_share);
+    cudaFree(solver->pressure_rest_scale);
     cudaFree(solver->state_flags);
     cudaFree(solver->springs);
+    delete[] solver->edge_color_offsets_host;
     cudaFree(solver->bends);
     cudaFree(solver->bend_rest);
+    delete[] solver->bend_color_offsets_host;
     cudaFree(solver->lra_edges);
     cudaFree(solver->lra_rest);
     cudaFree(solver->triangles);
@@ -4849,6 +6278,34 @@ extern "C" SSBL_API void* ssbl_create_solver(const SsblXpbdConfig* config, const
         solver->cfg.stretch_optimization_strength = 0.0f;
     }
     solver->cfg.stretch_optimization_strength = clamp01(solver->cfg.stretch_optimization_strength);
+    solver->pressure_accel_scale = std::max(
+        kAbi41PressureUiAccelerationScaleMin,
+        std::min(
+            abi41_env_float("SSBL_ABI41_PRESSURE_UI_ACCEL_SCALE", kAbi41PressureUiAccelerationScale),
+            kAbi41PressureUiAccelerationScaleMax
+        )
+    );
+    solver->pressure_impulse_rest_scale = std::max(
+        kAbi41PressureImpulseRestScaleMin,
+        std::min(
+            abi41_env_float("SSBL_ABI41_PRESSURE_IMPULSE_REST_SCALE", kAbi41PressureImpulseRestScale),
+            kAbi41PressureImpulseRestScaleMax
+        )
+    );
+    solver->pressure_velocity_rest_scale = std::max(
+        kAbi41PressureVelocityRestScaleMin,
+        std::min(
+            abi41_env_float("SSBL_ABI41_PRESSURE_VELOCITY_REST_SCALE", kAbi41PressureVelocityRestScale),
+            kAbi41PressureVelocityRestScaleMax
+        )
+    );
+    const float pressure_velocity_object_scale = std::max(
+        kAbi41PressureVelocityObjectScaleMin,
+        std::min(
+            abi41_env_float("SSBL_ABI41_PRESSURE_VELOCITY_OBJECT_SCALE", kAbi41PressureVelocityObjectScale),
+            kAbi41PressureVelocityObjectScaleMax
+        )
+    );
     solver->cfg.stretch_optimization_enabled = (
         solver->cfg.edge_count > 0
         && solver->cfg.stretch_optimization_enabled
@@ -4902,16 +6359,39 @@ extern "C" SSBL_API void* ssbl_create_solver(const SsblXpbdConfig* config, const
             static_cast<unsigned int>(std::max(k, 0))
         });
     }
+    const Vec3* rest_positions = reinterpret_cast<const Vec3*>(mesh->positions);
+    const std::vector<float> pressure_area_shares = build_pressure_area_shares(n, triangles, rest_positions);
+    const std::vector<float> pressure_rest_scales = build_pressure_rest_scales(n, springs, pressure_area_shares);
+    solver->pressure_velocity_length_scale = build_pressure_velocity_length_scale(
+        n,
+        rest_positions,
+        pressure_rest_scales,
+        pressure_velocity_object_scale
+    );
 
-    bool ok = alloc_and_copy(&solver->pos, reinterpret_cast<const Vec3*>(mesh->positions), n, "position allocation")
-        && alloc_and_copy(&solver->prev, reinterpret_cast<const Vec3*>(mesh->positions), n, "previous position allocation")
-        && alloc_and_copy(&solver->rest, reinterpret_cast<const Vec3*>(mesh->positions), n, "rest position allocation")
+    bool ok = alloc_and_copy(&solver->pos, rest_positions, n, "position allocation")
+        && alloc_and_copy(&solver->prev, rest_positions, n, "previous position allocation")
+        && alloc_and_copy(&solver->rest, rest_positions, n, "rest position allocation")
         && alloc_and_copy(&solver->vel, zero_vel.data(), n, "velocity allocation")
         && alloc_and_copy(&solver->inv_mass, mesh->inv_mass, n, "inverse mass allocation")
+        && alloc_and_copy(&solver->pressure_area_share, pressure_area_shares.data(), n, "pressure area share allocation")
+        && alloc_and_copy(&solver->pressure_rest_scale, pressure_rest_scales.data(), n, "pressure rest scale allocation")
         && alloc_and_copy(&solver->state_flags, flags.data(), n, "state flag allocation")
         && alloc_and_copy(&solver->springs, springs.data(), solver->cfg.edge_count, "spring allocation")
+        && (solver->cfg.edge_color_count <= 0 || copy_host_offsets(
+            &solver->edge_color_offsets_host,
+            mesh->edge_color_offsets,
+            solver->cfg.edge_color_count + 1,
+            "ABI40 recon edge color offsets are required"
+        ))
         && alloc_and_copy(&solver->bends, reinterpret_cast<const ReconPair*>(mesh->bends), solver->cfg.bend_count, "bend pair allocation")
         && alloc_and_copy(&solver->bend_rest, mesh->bend_rest_lengths, solver->cfg.bend_count, "bend rest allocation")
+        && (solver->cfg.bend_color_count <= 0 || copy_host_offsets(
+            &solver->bend_color_offsets_host,
+            mesh->bend_color_offsets,
+            solver->cfg.bend_color_count + 1,
+            "ABI40 recon bend color offsets are required"
+        ))
         && alloc_and_copy(&solver->lra_edges, reinterpret_cast<const ReconPair*>(mesh->lra_edges), solver->cfg.lra_count, "LRA pair allocation")
         && alloc_and_copy(&solver->lra_rest, mesh->lra_rest_lengths, solver->cfg.lra_count, "LRA rest allocation")
         && alloc_and_copy(&solver->triangles, triangles.data(), solver->cfg.triangle_count, "triangle allocation")
@@ -5126,7 +6606,9 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
             return 0;
         }
         for (int it = 0; it < iterations; ++it) {
+            const bool last_iteration = (it == iterations - 1);
             const bool run_stretch_pcg = stretch_pcg_enabled
+                && last_iteration
                 && (((s + 1) % kAbi41PcgSubstepCadence) == 0 || s == substeps - 1);
             if (solver->cfg.edge_count > 0 && !stretch_pcg_enabled) {
                 const auto direct_stretch_started = std::chrono::high_resolution_clock::now();
@@ -5137,13 +6619,37 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
                 if (!run_abi41_hard_stretch_pcg(solver, v_blocks, e_blocks)) {
                     return 0;
                 }
+                const int polish_normal_cap_passes = kAbi41HardStretchFinalCapPasses;
+                if (last_iteration
+                    && !run_abi41_hard_stretch_polish(
+                        solver,
+                        v_blocks,
+                        e_blocks,
+                        sub_dt,
+                        polish_normal_cap_passes
+                    )) {
+                    return 0;
+                }
+                if (last_iteration && !run_abi41_extreme_stretch_caps(solver, e_blocks, sub_dt)) {
+                    return 0;
+                }
             }
             const bool run_final_abi41_constraints = (s == substeps - 1 && it == iterations - 1);
             if (run_final_abi41_constraints && solver->cfg.lra_count > 0) {
                 abi41_lra_tack_project_kernel<<<lra_blocks, kThreads>>>(*solver, sub_dt);
             }
             if (run_final_abi41_constraints && solver->cfg.bend_count > 0) {
-                abi41_bend_project_kernel<<<b_blocks, kThreads>>>(*solver, sub_dt);
+                if (solver->cfg.bend_color_count > 0 && solver->bend_color_offsets_host) {
+                    for (int color = 0; color < solver->cfg.bend_color_count; ++color) {
+                        const int start = solver->bend_color_offsets_host[color];
+                        const int count = solver->bend_color_offsets_host[color + 1] - start;
+                        if (count > 0) {
+                            abi41_bend_project_range_kernel<<<block_count(count), kThreads>>>(*solver, sub_dt, start, count);
+                        }
+                    }
+                } else {
+                    abi41_bend_project_kernel<<<b_blocks, kThreads>>>(*solver, sub_dt);
+                }
             }
             if (solver->pin_count > 0) {
                 abi41_pin_project_kernel<<<p_blocks, kThreads>>>(*solver, pin_pass_exponent, sub_dt);
@@ -5187,10 +6693,7 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
                 && it == iterations - 1;
             const bool scheduled_self_collision = self_collision_iteration
                 && (((s + 1) % self_interval) == 0 || s == substeps - 1);
-            const float self_collision_width = std::max(
-                std::max(solver->cfg.cloth_thickness, solver->cfg.collision_margin),
-                0.0f
-            );
+            const float self_collision_width = abi41_self_contact_radius(solver->cfg);
             const bool run_self_collision = scheduled_self_collision
                 && solver->cfg.vertex_count > 0
                 && self_collision_width > 0.0f;
@@ -5245,6 +6748,11 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
                     abi41_averaging_position_kernel<<<v_blocks, kThreads>>>(*solver);
                     abi41_apply_self_averaged_delta_kernel<<<v_blocks, kThreads>>>(*solver);
                     solver->diag.self_solve_ms += elapsed_ms_since(self_solve_started);
+                }
+            }
+            if (run_stretch_pcg && run_final_abi41_constraints) {
+                if (!run_abi41_hard_stretch_final_caps(solver, v_blocks, e_blocks, sub_dt)) {
+                    return 0;
                 }
             }
             if (!set_cuda_error(cudaGetLastError(), "launch ABI40 recon constraints")) {

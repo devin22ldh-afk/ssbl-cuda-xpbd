@@ -46,6 +46,7 @@ def _make_options() -> SolverOptions:
         self_collision=True,
         self_collision_mode=SELF_COLLISION_FAST,
         cloth_thickness=0.10,
+        self_collision_distance=0.0,
         self_collision_interval=1,
         max_self_collision_neighbors=32,
         fast_self_collision_passes=4,

@@ -62,6 +62,7 @@ class SolverOptions:
     self_collision: bool
     self_collision_mode: int
     cloth_thickness: float
+    self_collision_distance: float
     self_collision_interval: int
     max_self_collision_neighbors: int
     fast_self_collision_passes: int
@@ -356,7 +357,7 @@ def _build_cloth_data_uncached(
         raise ValueError("当前活动对象必须是网格")
 
     derived = sync_hardness_settings(settings)
-    use_evaluated_mesh = bool(getattr(settings, "use_evaluated_mesh", True))
+    use_evaluated_mesh = bool(getattr(settings, "use_evaluated_mesh", False))
     local, triangles, matrix_world = mesh_input_data(
         obj,
         use_evaluated_mesh=use_evaluated_mesh,
@@ -423,7 +424,7 @@ def build_cloth_data(
         raise ValueError("A mesh object is required for cloth simulation.")
 
     derived = sync_hardness_settings(settings)
-    use_evaluated_mesh = bool(getattr(settings, "use_evaluated_mesh", True))
+    use_evaluated_mesh = bool(getattr(settings, "use_evaluated_mesh", False))
     if not use_evaluated_mesh:
         return _build_cloth_data_from_mesh(
             obj,
@@ -921,6 +922,7 @@ def settings_to_options(settings, runtime_mode_override: str | None = None) -> S
         self_collision=self_collision_enabled,
         self_collision_mode=mode_value,
         cloth_thickness=float(getattr(settings, "cloth_thickness", 0.02)),
+        self_collision_distance=max(float(getattr(settings, "self_collision_distance", 0.0)), 0.0),
         self_collision_interval=max(int(getattr(settings, "self_collision_interval", 2)), 1),
         max_self_collision_neighbors=max(int(getattr(settings, "max_self_collision_neighbors", 32)), 4),
         fast_self_collision_passes=min(max(int(getattr(settings, "fast_self_collision_passes", 4)), 1), 8),
