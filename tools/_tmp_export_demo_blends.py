@@ -131,6 +131,119 @@ def _create_overlay(scene, camera, title):
     return demo._create_overlay(scene, camera, title)
 
 
+def _group_vertex_indices(obj: bpy.types.Object, group_name: str) -> list[int]:
+    group = obj.vertex_groups.get(group_name)
+    if group is None:
+        return []
+    indices: list[int] = []
+    for vertex in obj.data.vertices:
+        for assignment in vertex.groups:
+            if assignment.group == group.index and assignment.weight > 0.0:
+                indices.append(int(vertex.index))
+                break
+    return indices
+
+
+def _tablecloth_pin_indices_by_side(cloth: bpy.types.Object) -> tuple[list[int], list[int]]:
+    positive: list[int] = []
+    negative: list[int] = []
+    for index in _group_vertex_indices(cloth, "ssbl_pin"):
+        vertex = cloth.data.vertices[index]
+        if float(vertex.co.y) >= 0.0:
+            positive.append(index)
+        else:
+            negative.append(index)
+    return positive, negative
+
+
+def _world_center_for_indices(obj: bpy.types.Object, indices: list[int]) -> tuple[float, float, float]:
+    if not indices:
+        return tuple(float(value) for value in obj.location)
+    total = [0.0, 0.0, 0.0]
+    for index in indices:
+        world = obj.matrix_world @ obj.data.vertices[index].co
+        total[0] += float(world.x)
+        total[1] += float(world.y)
+        total[2] += float(world.z)
+    inv_count = 1.0 / float(len(indices))
+    return (total[0] * inv_count, total[1] * inv_count, total[2] * inv_count)
+
+
+def _demo04_pull_progress(frame: int, frame_count: int) -> float:
+    source_frame = max(int(frame) - 1, 0)
+    if source_frame <= 14:
+        return 0.0
+    return (source_frame - 14) / max(int(frame_count) - 14, 1)
+
+
+def _demo04_handle_target(center: tuple[float, float, float], progress: float) -> tuple[float, float, float]:
+    eased = demo._ease_out_cubic(progress)
+    sign_y = 1.0 if float(center[1]) >= 0.0 else -1.0
+    return (
+        float(center[0]) + 1.35 * eased,
+        float(center[1]) + 0.10 * sign_y * eased,
+        float(center[2]) + 0.34 * eased,
+    )
+
+
+def _add_tablecloth_hook(cloth: bpy.types.Object, handle: bpy.types.Object, group_name: str) -> None:
+    modifier = cloth.modifiers.get(f"SSBL_Demo_{group_name}_Hook")
+    if modifier is None:
+        modifier = cloth.modifiers.new(f"SSBL_Demo_{group_name}_Hook", "HOOK")
+    modifier.object = handle
+    modifier.vertex_group = group_name
+    modifier.strength = 1.0
+    modifier.show_viewport = True
+    modifier.show_render = True
+
+
+def _set_linear_keyframes(obj: bpy.types.Object) -> None:
+    action = obj.animation_data.action if obj.animation_data and obj.animation_data.action else None
+    if action is None:
+        return
+    for curve in getattr(action, "fcurves", []) or []:
+        for keyframe in curve.keyframe_points:
+            keyframe.interpolation = "LINEAR"
+
+
+def _configure_demo04_handle_motion(
+    cloth: bpy.types.Object,
+    handle_a: bpy.types.Object,
+    handle_b: bpy.types.Object,
+    frame_count: int,
+) -> None:
+    for modifier in list(cloth.modifiers):
+        if modifier.type == "SUBSURF":
+            cloth.modifiers.remove(modifier)
+
+    positive_indices, negative_indices = _tablecloth_pin_indices_by_side(cloth)
+    if not positive_indices or not negative_indices:
+        raise RuntimeError("04 tablecloth needs two non-empty pinned handle groups.")
+
+    positive_group = cloth.vertex_groups.new(name="ssbl_handle_a")
+    positive_group.add(positive_indices, 1.0, "REPLACE")
+    negative_group = cloth.vertex_groups.new(name="ssbl_handle_b")
+    negative_group.add(negative_indices, 1.0, "REPLACE")
+
+    positive_center = _world_center_for_indices(cloth, positive_indices)
+    negative_center = _world_center_for_indices(cloth, negative_indices)
+    _add_tablecloth_hook(cloth, handle_a, "ssbl_handle_a")
+    _add_tablecloth_hook(cloth, handle_b, "ssbl_handle_b")
+
+    for frame in range(1, int(frame_count) + 2):
+        progress = _demo04_pull_progress(frame, frame_count)
+        handle_a.location = _demo04_handle_target(positive_center, progress)
+        handle_b.location = _demo04_handle_target(negative_center, progress)
+        handle_a.keyframe_insert(data_path="location", frame=frame)
+        handle_b.keyframe_insert(data_path="location", frame=frame)
+
+    _set_linear_keyframes(handle_a)
+    _set_linear_keyframes(handle_b)
+    bpy.context.scene.frame_set(1)
+    handle_a.location = _demo04_handle_target(positive_center, 0.0)
+    handle_b.location = _demo04_handle_target(negative_center, 0.0)
+
+
 def export_demo01() -> Path:
     name = "01_brand_flag_wind_realtime"
     title = "SSBL realtime flag - live wind control"
@@ -301,7 +414,7 @@ def export_demo04() -> Path:
         ortho_scale=4.35,
     )
     overlay = _create_overlay(scene, camera, title)
-    collider_collection, _handle_a, _handle_b = demo._make_table_scene_visual()
+    collider_collection, handle_a, handle_b = demo._make_table_scene_visual()
     cloth = demo._make_tablecloth(2.42, (0.94, 0.92, 0.86, 1.0))
     demo._configure_collision_settings(cloth.ssbl_cloth, frame_count=frame_count)
     cloth.ssbl_cloth.pin_vertex_group = "ssbl_pin"
@@ -310,6 +423,7 @@ def export_demo04() -> Path:
     cloth.ssbl_cloth.damping = 0.992
     cloth.ssbl_cloth.collision_margin = 0.028
     cloth.ssbl_cloth.cloth_thickness = 0.03
+    _configure_demo04_handle_motion(cloth, handle_a, handle_b, frame_count)
     return _finish_scene(name, title, frame_count, "Mobile scene inspiration adapted to a two-handle tablecloth pull", overlay, cloth)
 
 

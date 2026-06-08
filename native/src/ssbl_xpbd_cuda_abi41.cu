@@ -72,7 +72,8 @@ constexpr int kAbi41CountSelfFilterCacheHits = 29;
 constexpr int kAbi41CountSelfFilterCacheMisses = 30;
 constexpr int kAbi41CountSelfClusterCount = 31;
 constexpr int kAbi41CountSelfClusterOwnedContacts = 32;
-constexpr int kAbi41CountSlots = 33;
+constexpr int kAbi41CountExternalFrictionCorrections = 33;
+constexpr int kAbi41CountSlots = 34;
 constexpr float kAbi41SpringRelaxation = 0.18f;
 constexpr float kAbi41StretchStrengthScale = 2.5f;
 constexpr float kAbi41StretchPrevSyncScale = 0.08f;
@@ -768,6 +769,47 @@ __device__ float length(Vec3 value) {
 
 __device__ bool finite_vec(Vec3 value) {
     return isfinite(value.x) && isfinite(value.y) && isfinite(value.z);
+}
+
+__device__ bool abi41_apply_static_contact_velocity_response(
+    Abi41Solver solver,
+    Vec3 normal,
+    float normal_proxy,
+    Vec3* vel
+) {
+    if (!vel || !finite_vec(normal) || !finite_vec(*vel)) {
+        return false;
+    }
+
+    float vn = dot(*vel, normal);
+    if (vn < 0.0f) {
+        *vel = sub(*vel, mul(normal, vn));
+    }
+
+    bool tangent_corrected = false;
+    Vec3 tangent = sub(*vel, mul(normal, dot(*vel, normal)));
+    float tangent_len = length(tangent);
+    const float damping = clamp01(solver.cfg.contact_tangent_damping);
+    if (damping > 0.0f && tangent_len > 1.0e-6f) {
+        *vel = sub(*vel, mul(tangent, damping));
+        tangent_corrected = true;
+    }
+
+    tangent = sub(*vel, mul(normal, dot(*vel, normal)));
+    tangent_len = length(tangent);
+    const float friction = fmaxf(solver.cfg.contact_friction, 0.0f);
+    if (friction > 0.0f && normal_proxy > 0.0f && tangent_len > 1.0e-6f) {
+        const float drop = fminf(tangent_len, friction * normal_proxy);
+        if (drop > 1.0e-7f) {
+            *vel = sub(*vel, mul(tangent, drop / fmaxf(tangent_len, kEps)));
+            tangent_corrected = true;
+        }
+    }
+
+    if (tangent_corrected) {
+        abi41_count(solver, kAbi41CountExternalFrictionCorrections);
+    }
+    return tangent_corrected;
 }
 
 __device__ Vec3 limit_delta(Vec3 delta, float max_len) {
@@ -1572,22 +1614,8 @@ __global__ void abi41_static_sdf_collision_kernel(Abi41Solver solver, float dt) 
     Vec3 vel = solver.vel[i];
     const float vn = dot(vel, normal);
     const float inward_speed = fmaxf(-vn, 0.0f);
-    if (vn < 0.0f) {
-        vel = sub(vel, mul(normal, vn));
-    }
-    Vec3 tangent = sub(vel, mul(normal, dot(vel, normal)));
-    const float damping = clamp01(solver.cfg.contact_tangent_damping);
-    if (damping > 0.0f) {
-        vel = sub(vel, mul(tangent, damping));
-    }
-    tangent = sub(vel, mul(normal, dot(vel, normal)));
-    const float tangent_len = length(tangent);
-    const float friction = fmaxf(solver.cfg.contact_friction, 0.0f);
-    if (friction > 0.0f && tangent_len > 1.0e-6f) {
-        const float normal_proxy = inward_speed + penetration / fmaxf(dt, kEps);
-        const float drop = fminf(tangent_len, friction * normal_proxy);
-        vel = sub(vel, mul(tangent, drop / fmaxf(tangent_len, kEps)));
-    }
+    const float normal_proxy = inward_speed + penetration / fmaxf(dt, kEps);
+    abi41_apply_static_contact_velocity_response(solver, normal, normal_proxy, &vel);
     solver.pos[i] = corrected;
     solver.vel[i] = vel;
     solver.prev[i] = sub(corrected, mul(vel, fmaxf(dt, kEps)));
@@ -3236,18 +3264,28 @@ __global__ void abi41_pin_project_kernel(Abi41Solver solver, float pass_exponent
     solver.vel[i] = damped_velocity;
 }
 
-__global__ void abi41_analytic_collision_kernel(Abi41Solver solver) {
+__global__ void abi41_analytic_collision_kernel(Abi41Solver solver, float dt) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= solver.cfg.vertex_count || solver.inv_mass[i] <= 0.0f) {
         return;
     }
     Vec3 p = solver.pos[i];
+    Vec3 vel = solver.vel[i];
+    bool contacted = false;
     float margin = fmaxf(solver.cfg.collision_margin, 0.0f);
     if (solver.runtime_colliders.use_ground && p.z < solver.runtime_colliders.ground_height + margin) {
-        p.z = solver.runtime_colliders.ground_height + margin;
-        if (solver.vel[i].z < 0.0f) {
-            solver.vel[i].z = 0.0f;
-        }
+        const float target_z = solver.runtime_colliders.ground_height + margin;
+        const float penetration = target_z - p.z;
+        Vec3 normal = make_vec3(0.0f, 0.0f, 1.0f);
+        const float inward_speed = fmaxf(-dot(vel, normal), 0.0f);
+        p.z = target_z;
+        abi41_apply_static_contact_velocity_response(
+            solver,
+            normal,
+            inward_speed + penetration / fmaxf(dt, kEps),
+            &vel
+        );
+        contacted = true;
     }
     if (solver.runtime_colliders.use_sphere && solver.runtime_colliders.sphere_radius > 0.0f) {
         Vec3 center = make_vec3(
@@ -3260,12 +3298,17 @@ __global__ void abi41_analytic_collision_kernel(Abi41Solver solver) {
         float dist = sqrtf(dist_sq);
         float target = solver.runtime_colliders.sphere_radius + margin;
         if (dist < target) {
-            Vec3 n = mul(d, 1.0f / fmaxf(dist, kEps));
+            Vec3 n = dist > kEps ? mul(d, 1.0f / dist) : make_vec3(0.0f, 0.0f, 1.0f);
+            const float penetration = target - dist;
+            const float inward_speed = fmaxf(-dot(vel, n), 0.0f);
             p = add(center, mul(n, target));
-            float vn = dot(solver.vel[i], n);
-            if (vn < 0.0f) {
-                solver.vel[i] = sub(solver.vel[i], mul(n, vn));
-            }
+            abi41_apply_static_contact_velocity_response(
+                solver,
+                n,
+                inward_speed + penetration / fmaxf(dt, kEps),
+                &vel
+            );
+            contacted = true;
         }
     }
     if (solver.runtime_colliders.use_wall) {
@@ -3283,14 +3326,23 @@ __global__ void abi41_analytic_collision_kernel(Abi41Solver solver) {
         normal = mul(normal, 1.0f / n_len);
         float gap = dot(sub(p, origin), normal);
         if (gap < margin) {
+            const float penetration = margin - gap;
+            const float inward_speed = fmaxf(-dot(vel, normal), 0.0f);
             p = add(p, mul(normal, margin - gap));
-            float vn = dot(solver.vel[i], normal);
-            if (vn < 0.0f) {
-                solver.vel[i] = sub(solver.vel[i], mul(normal, vn));
-            }
+            abi41_apply_static_contact_velocity_response(
+                solver,
+                normal,
+                inward_speed + penetration / fmaxf(dt, kEps),
+                &vel
+            );
+            contacted = true;
         }
     }
     solver.pos[i] = p;
+    if (contacted) {
+        solver.vel[i] = vel;
+        solver.prev[i] = sub(p, mul(vel, fmaxf(dt, kEps)));
+    }
 }
 
 __global__ void abi41_build_dynamic_triangle_hash_kernel(Abi41Solver solver) {
@@ -6697,6 +6749,7 @@ bool fetch_abi41_counts(Abi41Solver* solver) {
     solver->diag.dynamic_particle_candidate_count = static_cast<long long>(counts[kAbi41CountDynamicParticleCandidates]);
     solver->diag.dynamic_particle_contacts = static_cast<long long>(counts[kAbi41CountDynamicParticleContacts]);
     solver->diag.dynamic_particle_overflow = 0;
+    solver->diag.external_friction_corrections = static_cast<long long>(counts[kAbi41CountExternalFrictionCorrections]);
     solver->diag.self_candidate_count = static_cast<long long>(counts[kAbi41CountSelfCandidates]);
     solver->diag.static_sdf_contact_count = static_cast<long long>(counts[kAbi41CountStaticSdfContacts]);
     solver->diag.candidate_count = static_cast<long long>(
@@ -7423,7 +7476,7 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
                 abi41_pin_project_kernel<<<p_blocks, kThreads>>>(*solver, pin_pass_exponent, sub_dt);
             }
             if (run_analytic_colliders) {
-                abi41_analytic_collision_kernel<<<v_blocks, kThreads>>>(*solver);
+                abi41_analytic_collision_kernel<<<v_blocks, kThreads>>>(*solver, sub_dt);
             }
             if (solver->static_sdf_ready != 0) {
                 const auto static_started = std::chrono::high_resolution_clock::now();

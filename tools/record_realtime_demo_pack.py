@@ -1371,6 +1371,8 @@ def _record_object_collision_suite() -> DemoResult:
     bpy.context.view_layer.objects.active = cloth
     session = ssbl.solver.start_preview(bpy.context, cloth)
     initial_center_a, initial_center_b = _pin_cluster_centers(np.asarray(session.slots[cloth.name].pin_targets_world, dtype=np.float32))
+    handle_a.location = Vector(tuple(initial_center_a))
+    handle_b.location = Vector(tuple(initial_center_b))
 
     step_ms_samples: list[float] = []
     frame_paths: list[str] = []

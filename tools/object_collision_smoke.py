@@ -17,6 +17,7 @@ from ssbl import collision
 
 MARGIN = 0.05
 TOLERANCE = 0.012
+FRICTION_STEPS = 28
 
 
 def _clear_scene():
@@ -40,6 +41,33 @@ def _make_grid(name, size=0.32, segments=8, location=(0.0, 0.0, 0.0)):
     for y in range(segments):
         for x in range(segments):
             a = y * stride + x
+            b = a + 1
+            c = a + stride + 1
+            d = a + stride
+            faces.append((a, b, c, d))
+
+    mesh = bpy.data.meshes.new(f"{name}_Mesh")
+    mesh.from_pydata(verts, [], faces)
+    mesh.update()
+    obj = bpy.data.objects.new(name, mesh)
+    obj.location = location
+    bpy.context.scene.collection.objects.link(obj)
+    return obj
+
+
+def _make_yz_grid(name, size=0.32, segments=8, location=(0.0, 0.0, 0.0)):
+    verts = []
+    faces = []
+    half = size * 0.5
+    for z in range(segments + 1):
+        fz = -half + size * (z / segments)
+        for y in range(segments + 1):
+            fy = -half + size * (y / segments)
+            verts.append((0.0, fy, fz))
+    stride = segments + 1
+    for z in range(segments):
+        for y in range(segments):
+            a = z * stride + y
             b = a + 1
             c = a + stride + 1
             d = a + stride
@@ -133,6 +161,11 @@ def _flat_mesh_coords(mesh):
     return [float(component) for vert in mesh.vertices for component in (vert.co.x, vert.co.y, vert.co.z)]
 
 
+def _center_axis(obj, axis):
+    positions = _world_positions(obj)
+    return sum(float(point[axis]) for point in positions) / max(len(positions), 1)
+
+
 def _all_finite(positions):
     return all(math.isfinite(float(component)) for point in positions for component in (point.x, point.y, point.z))
 
@@ -160,6 +193,16 @@ def _configure_common(settings):
     settings.static_sdf_voxel_size = 0.04
     settings.static_sdf_band_voxels = 3
     settings.static_sdf_max_resolution = 80
+
+
+def _configure_friction_common(settings, high_friction, gravity):
+    _configure_common(settings)
+    settings.frame_count = FRICTION_STEPS + 4
+    settings.substeps = 8
+    settings.iterations = 2
+    settings.gravity = gravity
+    settings.contact_friction = 4.0 if high_friction else 0.0
+    settings.contact_tangent_damping = 1.0 if high_friction else 0.0
 
 
 def _static_sdf_summary(obj):
@@ -339,6 +382,95 @@ def _static_plane_metric(obj, plane_z, enforce=True):
     return {"min_z": min_z, "limit": limit, "penetration": penetration}
 
 
+def _friction_ground_case(settings):
+    settings.use_ground = True
+    settings.ground_height = 0.0
+    return _make_grid("SSBL_Object_Collision_FrictionGroundCloth", size=0.24, location=(0.0, 0.0, MARGIN * 0.95))
+
+
+def _friction_wall_case(settings):
+    settings.use_wall = True
+    settings.wall_origin = (0.0, 0.0, 0.0)
+    settings.wall_normal = (1.0, 0.0, 0.0)
+    return _make_yz_grid("SSBL_Object_Collision_FrictionWallCloth", size=0.24, location=(MARGIN * 0.95, 0.0, 0.0))
+
+
+def _friction_sphere_case(settings):
+    bpy.ops.mesh.primitive_uv_sphere_add(segments=16, ring_count=8, radius=0.45, location=(0.0, 0.0, 0.0))
+    sphere = bpy.context.object
+    sphere.name = "SSBL_Object_Collision_FrictionSphere"
+    sphere.data.name = "SSBL_Object_Collision_FrictionSphereMesh"
+    settings.use_sphere = True
+    settings.sphere_object = sphere
+    return _make_grid(
+        "SSBL_Object_Collision_FrictionSphereCloth",
+        size=0.18,
+        location=(0.0, 0.0, 0.45 + MARGIN * 0.95),
+    )
+
+
+def _friction_static_mesh_case(settings):
+    settings.static_collider_collection = _make_static_plane_collection(0.0)
+    return _make_grid("SSBL_Object_Collision_FrictionStaticCloth", size=0.24, location=(0.0, 0.0, MARGIN * 0.95))
+
+
+def _run_friction_variant(label, build_scene, tangent_axis, high_friction, gravity):
+    _clear_scene()
+    scene = bpy.context.scene
+    scene.frame_set(1)
+    scene.frame_start = 1
+    scene.frame_end = FRICTION_STEPS + 4
+
+    settings = scene.ssbl_preview
+    _configure_friction_common(settings, high_friction, gravity)
+    cloth = build_scene(settings)
+    for obj in scene.objects:
+        obj.select_set(False)
+    bpy.context.view_layer.objects.active = cloth
+    cloth.select_set(True)
+    bpy.context.view_layer.update()
+
+    start_center = _center_axis(cloth, tangent_axis)
+    session = ssbl.solver.start_preview(bpy.context, cloth)
+    max_friction_corrections = 0
+    final_center = start_center
+    try:
+        for _index in range(FRICTION_STEPS):
+            ssbl.solver.step_preview(bpy.context, cloth.name)
+            positions = _world_positions(cloth)
+            if not _all_finite(positions):
+                raise RuntimeError(f"{label} produced non-finite vertex coordinates")
+            final_center = _center_axis(cloth, tangent_axis)
+            diag = ssbl.solver.session_diagnostics(cloth)
+            max_friction_corrections = max(
+                max_friction_corrections,
+                int(getattr(diag, "external_friction_corrections", 0)),
+            )
+    finally:
+        ssbl.solver.request_stop(cloth)
+
+    return {
+        "session_object": session.object_name,
+        "start_center": start_center,
+        "final_center": final_center,
+        "drift": abs(final_center - start_center),
+        "max_external_friction_corrections": max_friction_corrections,
+    }
+
+
+def _run_friction_case(label, build_scene, tangent_axis, gravity):
+    low = _run_friction_variant(f"{label}_low_friction", build_scene, tangent_axis, False, gravity)
+    high = _run_friction_variant(f"{label}_high_friction", build_scene, tangent_axis, True, gravity)
+    if low["drift"] <= 0.02:
+        raise RuntimeError(f"{label} low-friction variant did not slide enough: {low}")
+    if high["max_external_friction_corrections"] <= 0:
+        raise RuntimeError(f"{label} high-friction variant did not report friction corrections: {high}")
+    allowed = max(low["drift"] * 0.45, 0.012)
+    if high["drift"] > allowed:
+        raise RuntimeError(f"{label} high friction did not suppress sliding enough: low={low}, high={high}, allowed={allowed}")
+    return {"low": low, "high": high, "allowed_high_drift": allowed}
+
+
 def _run_moving_static_collider_case():
     label = "moving_static_mesh"
     _clear_scene()
@@ -488,6 +620,30 @@ def main():
                 _static_mesh_metric,
                 expect_static_sdf=True,
                 min_static_triangles=4097,
+            ),
+            "friction_ground": _run_friction_case(
+                "friction_ground",
+                _friction_ground_case,
+                0,
+                (6.0, 0.0, -6.0),
+            ),
+            "friction_wall": _run_friction_case(
+                "friction_wall",
+                _friction_wall_case,
+                1,
+                (-6.0, 6.0, 0.0),
+            ),
+            "friction_sphere": _run_friction_case(
+                "friction_sphere",
+                _friction_sphere_case,
+                0,
+                (6.0, 0.0, -6.0),
+            ),
+            "friction_static_mesh": _run_friction_case(
+                "friction_static_mesh",
+                _friction_static_mesh_case,
+                0,
+                (6.0, 0.0, -6.0),
             ),
             "unchanged_static_mesh": _run_static_sdf_unchanged_case(),
             "moving_static_mesh": _run_moving_static_collider_case(),

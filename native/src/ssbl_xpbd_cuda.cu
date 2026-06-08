@@ -133,6 +133,9 @@ constexpr float kExternalCollisionMinCorrection = 1.0e-4f;
 constexpr float kExternalCollisionInwardVelocityDamping = 1.0f;
 constexpr int kExternalContactKindStatic = 1;
 constexpr int kExternalContactKindDynamic = 2;
+constexpr int kExternalContactKindGround = 3;
+constexpr int kExternalContactKindWall = 4;
+constexpr int kExternalContactKindSphere = 5;
 constexpr int kExternalContactProbeLimit = 16;
 constexpr int kExternalContactMaxAge = 8;
 constexpr int kExternalContactCapacityMin = 4096;
@@ -1172,6 +1175,85 @@ __device__ void solve_external_cached_contact(
     }
 }
 
+__device__ void apply_external_recorded_contact_friction(
+    Solver solver,
+    int kind,
+    int vertex,
+    int triangle,
+    Vec3 normal,
+    Vec3 barycentric,
+    float normal_displacement,
+    Vec3* p,
+    Vec3* prev
+) {
+    if (!p || !prev || vertex < 0 || vertex >= solver.cfg.vertex_count || !finite_vec(normal)) {
+        return;
+    }
+    float inv_mass = solver.inv_mass[vertex];
+    if (inv_mass <= 0.0f) {
+        return;
+    }
+
+    unsigned long long key = external_contact_key(kind, vertex, triangle);
+    ExternalContact* contact = find_external_contact(solver, key);
+    bool cache_hit = contact && contact->key == key && contact->age <= kExternalContactMaxAge;
+    if (cache_hit) {
+        diag_note_external_contact_cache_hit(solver);
+    } else {
+        contact = reserve_external_contact(solver, key);
+        diag_note_external_contact_cache_miss(solver);
+        if (contact) {
+            contact->lambda_n = 0.0f;
+            contact->lambda_t = {0.0f, 0.0f, 0.0f};
+        }
+    }
+
+    float applied = fmaxf(normal_displacement, 0.0f);
+    if (contact) {
+        float old_lambda = fmaxf(contact->lambda_n, 0.0f);
+        float new_lambda = fmaxf(old_lambda, applied / fmaxf(inv_mass, kEps));
+        contact->normal = normal;
+        contact->barycentric = barycentric;
+        contact->lambda_n = new_lambda;
+        contact->active = 1;
+        contact->age = 0;
+        apply_external_contact_friction(solver, normal, contact->lambda_n * inv_mass, p, prev, &contact->lambda_t);
+    } else {
+        Vec3 unused_lambda_t{0.0f, 0.0f, 0.0f};
+        apply_external_contact_friction(solver, normal, applied, p, prev, &unused_lambda_t);
+    }
+}
+
+__device__ void solve_external_projected_contact(
+    Solver solver,
+    int kind,
+    int vertex,
+    int triangle,
+    Vec3 normal,
+    Vec3 barycentric,
+    Vec3 projected,
+    Vec3* p,
+    Vec3* prev
+) {
+    if (!p || !prev || !finite_vec(normal) || !finite_vec(projected)) {
+        return;
+    }
+    Vec3 correction = sub(projected, *p);
+    float applied_normal = fmaxf(dot(correction, normal), 0.0f);
+    apply_external_collision_response(p, prev, correction);
+    apply_external_recorded_contact_friction(
+        solver,
+        kind,
+        vertex,
+        triangle,
+        normal,
+        barycentric,
+        applied_normal,
+        p,
+        prev
+    );
+}
+
 __global__ void begin_external_contact_cache_step_kernel(Solver solver) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     if (!solver.external_contacts || index >= solver.external_contact_capacity) {
@@ -1386,34 +1468,6 @@ __device__ ExternalContact* reserve_external_contact(Solver solver, unsigned lon
     }
     diag_note_external_contact_cache_overflow(solver);
     return nullptr;
-}
-
-__device__ void store_external_contact_cache(
-    Solver solver,
-    int kind,
-    int vertex,
-    int triangle,
-    Vec3 normal,
-    Vec3 barycentric,
-    float lambda_n
-) {
-    unsigned long long key = external_contact_key(kind, vertex, triangle);
-    ExternalContact* contact = find_external_contact(solver, key);
-    if (contact && contact->age <= kExternalContactMaxAge) {
-        diag_note_external_contact_cache_hit(solver);
-    } else {
-        contact = reserve_external_contact(solver, key);
-        diag_note_external_contact_cache_miss(solver);
-    }
-    if (!contact) {
-        return;
-    }
-    contact->normal = normal;
-    contact->barycentric = barycentric;
-    contact->lambda_n = fmaxf(lambda_n, 0.0f);
-    contact->lambda_t = {0.0f, 0.0f, 0.0f};
-    contact->active = 1;
-    contact->age = 0;
 }
 
 __device__ Vec3 barycentric_on_triangle(Vec3 p, Vec3 a, Vec3 b, Vec3 c) {
@@ -2534,8 +2588,19 @@ __global__ void analytic_collision_kernel(Solver solver) {
         float target_z = solver.cfg.ground_height + margin;
         diag_note_candidate(solver, p.z - target_z);
         diag_note_resolved(solver);
-        Vec3 correction{0.0f, 0.0f, target_z - p.z};
-        apply_external_collision_response(&p, &prev, correction);
+        Vec3 normal{0.0f, 0.0f, 1.0f};
+        Vec3 projected{p.x, p.y, target_z};
+        solve_external_projected_contact(
+            solver,
+            kExternalContactKindGround,
+            i,
+            0,
+            normal,
+            {1.0f, 0.0f, 0.0f},
+            projected,
+            &p,
+            &prev
+        );
     }
     if (solver.cfg.use_wall) {
         Vec3 o{solver.cfg.wall_origin[0], solver.cfg.wall_origin[1], solver.cfg.wall_origin[2]};
@@ -2544,8 +2609,18 @@ __global__ void analytic_collision_kernel(Solver solver) {
         if (d < margin) {
             diag_note_candidate(solver, d - margin);
             diag_note_resolved(solver);
-            Vec3 correction = mul(n, margin - d);
-            apply_external_collision_response(&p, &prev, correction);
+            Vec3 projected = add(p, mul(n, margin - d));
+            solve_external_projected_contact(
+                solver,
+                kExternalContactKindWall,
+                i,
+                0,
+                n,
+                {1.0f, 0.0f, 0.0f},
+                projected,
+                &p,
+                &prev
+            );
         }
     }
     if (solver.cfg.use_sphere) {
@@ -2559,9 +2634,19 @@ __global__ void analytic_collision_kernel(Solver solver) {
         if (len < radius) {
             diag_note_candidate(solver, len - radius);
             diag_note_resolved(solver);
-            Vec3 projected = add(c, mul(delta, radius / len));
-            Vec3 correction = sub(projected, p);
-            apply_external_collision_response(&p, &prev, correction);
+            Vec3 normal = mul(delta, 1.0f / fmaxf(len, kEps));
+            Vec3 projected = add(c, mul(normal, radius));
+            solve_external_projected_contact(
+                solver,
+                kExternalContactKindSphere,
+                i,
+                0,
+                normal,
+                {1.0f, 0.0f, 0.0f},
+                projected,
+                &p,
+                &prev
+            );
         }
     }
     solver.pos[i] = p;
@@ -2759,16 +2844,16 @@ __global__ void static_collision_kernel(Solver solver) {
     if (found) {
         diag_note_resolved(solver);
         if (best_hard_contact) {
-            p = best_projected;
-            prev = p;
-            store_external_contact_cache(
+            solve_external_projected_contact(
                 solver,
                 kExternalContactKindStatic,
                 i,
                 best_triangle,
                 best_normal,
                 best_barycentric,
-                external_contact_distance(solver)
+                best_projected,
+                &p,
+                &prev
             );
         } else {
             solve_external_cached_contact(
@@ -2916,16 +3001,16 @@ __global__ void static_collision_hashed_kernel(Solver solver) {
     if (found) {
         diag_note_resolved(solver);
         if (best_hard_contact) {
-            p = best_projected;
-            prev = p;
-            store_external_contact_cache(
+            solve_external_projected_contact(
                 solver,
                 kExternalContactKindStatic,
                 i,
                 best_triangle,
                 best_normal,
                 best_barycentric,
-                external_contact_distance(solver)
+                best_projected,
+                &p,
+                &prev
             );
         } else {
             solve_external_cached_contact(
