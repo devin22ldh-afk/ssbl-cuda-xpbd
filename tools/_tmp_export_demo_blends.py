@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import math
+import os
 import sys
 from pathlib import Path
 
@@ -22,6 +23,7 @@ import ssbl
 
 TARGET_DIR = Path(r"C:\Users\Administrator\Desktop\演示视频")
 DESKTOP_DEMO01_BLEND = Path(r"C:\Users\Administrator\Desktop\SSBL_01_brand_flag_wind_realtime_edit.blend")
+USE_DESKTOP_DEMO01_BLEND = os.environ.get("SSBL_USE_DESKTOP_DEMO01_BLEND", "").strip().lower() in {"1", "true", "yes"}
 
 
 def _safe_register() -> None:
@@ -58,6 +60,45 @@ def _metadata(name: str, title: str, frame_count: int, source: str) -> None:
     )
 
 
+def _assert_exportable_initial_scene(name: str) -> None:
+    try:
+        ssbl.solver.cleanup_all_sessions()
+    except Exception as exc:
+        raise RuntimeError(f"{name}: could not restore SSBL preview sessions before export: {exc}") from exc
+
+    active_preview = [
+        obj.name
+        for obj in bpy.data.objects
+        if getattr(obj, "type", None) == "MESH" and ssbl.solver.has_session(obj)
+    ]
+    preview_mesh_objects = [
+        f"{obj.name}:{obj.data.name}"
+        for obj in bpy.data.objects
+        if getattr(obj, "type", None) == "MESH"
+        and getattr(getattr(obj, "data", None), "name", "").endswith("_SSBL_XPBD_Preview")
+    ]
+    cache_modifiers = [
+        f"{obj.name}:{modifier.name}"
+        for obj in bpy.data.objects
+        if getattr(obj, "type", None) == "MESH"
+        for modifier in obj.modifiers
+        if modifier.type == "MESH_CACHE" or modifier.name == "SSBL XPBD Cache"
+    ]
+    for mesh in list(bpy.data.meshes):
+        if mesh.name.endswith("_SSBL_XPBD_Preview") and int(mesh.users) == 0:
+            bpy.data.meshes.remove(mesh)
+
+    problems = []
+    if active_preview:
+        problems.append(f"active preview sessions: {', '.join(active_preview)}")
+    if preview_mesh_objects:
+        problems.append(f"objects using preview meshes: {', '.join(preview_mesh_objects)}")
+    if cache_modifiers:
+        problems.append(f"cache modifiers: {', '.join(cache_modifiers)}")
+    if problems:
+        raise RuntimeError(f"{name}: refusing to export solved/baked scene state ({'; '.join(problems)})")
+
+
 def _finish_scene(name: str, title: str, frame_count: int, source: str, overlay, active=None) -> Path:
     scene = bpy.context.scene
     scene.frame_start = 1
@@ -77,6 +118,8 @@ def _finish_scene(name: str, title: str, frame_count: int, source: str, overlay,
         else:
             active.select_set(True)
             bpy.context.view_layer.objects.active = active
+    _assert_exportable_initial_scene(name)
+    scene.frame_set(1)
     _metadata(name, title, frame_count + 1, source)
     path = TARGET_DIR / f"{name}.blend"
     bpy.ops.wm.save_as_mainfile(filepath=str(path), compress=True)
@@ -91,13 +134,19 @@ def _create_overlay(scene, camera, title):
 def export_demo01() -> Path:
     name = "01_brand_flag_wind_realtime"
     title = "SSBL realtime flag - live wind control"
-    if DESKTOP_DEMO01_BLEND.exists():
-        bpy.ops.wm.open_mainfile(filepath=str(DESKTOP_DEMO01_BLEND), load_ui=False)
-        _metadata(name, title, 113, f"Desktop blend: {DESKTOP_DEMO01_BLEND}")
-        path = TARGET_DIR / f"{name}.blend"
-        bpy.ops.wm.save_as_mainfile(filepath=str(path), compress=True)
-        print(f"SSBL_DEMO_BLEND_DONE {name} {path}")
-        return path
+    if USE_DESKTOP_DEMO01_BLEND and DESKTOP_DEMO01_BLEND.exists():
+        try:
+            bpy.ops.wm.open_mainfile(filepath=str(DESKTOP_DEMO01_BLEND), load_ui=False)
+        except Exception as exc:
+            print(f"SSBL_DEMO_BLEND_EXTERNAL_SKIPPED {DESKTOP_DEMO01_BLEND}: {exc}")
+        else:
+            _assert_exportable_initial_scene(name)
+            bpy.context.scene.frame_set(1)
+            _metadata(name, title, 113, f"Desktop blend: {DESKTOP_DEMO01_BLEND}")
+            path = TARGET_DIR / f"{name}.blend"
+            bpy.ops.wm.save_as_mainfile(filepath=str(path), compress=True)
+            print(f"SSBL_DEMO_BLEND_DONE {name} {path}")
+            return path
 
     frame_count = 112
     demo._clear_scene()

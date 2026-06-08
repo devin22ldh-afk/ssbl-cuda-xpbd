@@ -192,6 +192,14 @@ def _initialize_hardness_for_scenes(_dummy=None):
     return None
 
 
+@persistent
+def _restore_preview_source_before_save(_dummy=None):
+    try:
+        solver.cleanup_all_sessions()
+    except Exception:
+        pass
+
+
 class SSBL_PreviewSettings(PropertyGroup):
     enabled: BoolProperty(
         name="启用 SSBL 布料",
@@ -762,6 +770,8 @@ def register():
     _initialize_hardness_for_scenes()
     if _initialize_hardness_for_scenes not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(_initialize_hardness_for_scenes)
+    if _restore_preview_source_before_save not in bpy.app.handlers.save_pre:
+        bpy.app.handlers.save_pre.append(_restore_preview_source_before_save)
     operators.register_playback_handlers()
     bpy.types.Object.ssbl_force_field_weight = FloatProperty(
         name="SSBL Weight",
@@ -808,6 +818,8 @@ def unregister():
         del bpy.types.Object.ssbl_enable_cross_cloth_collision
     if _initialize_hardness_for_scenes in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(_initialize_hardness_for_scenes)
+    if _restore_preview_source_before_save in bpy.app.handlers.save_pre:
+        bpy.app.handlers.save_pre.remove(_restore_preview_source_before_save)
     operators.unregister_playback_handlers()
     for cls in reversed(CLASSES):
         try:
