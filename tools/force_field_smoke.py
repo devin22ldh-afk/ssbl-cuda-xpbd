@@ -34,6 +34,8 @@ EXPECTED_VISIBLE_WEIGHT_ORDER = (
 
 
 PARAMETER_EFFECT_EPSILON = 2.0e-4
+NOISE_SPATIAL_EPSILON = 2.0e-5
+TURBULENCE_PERF_WARNING_RATIO = 1.15
 
 
 def _clear_scene() -> None:
@@ -130,6 +132,45 @@ def _shape_signature(obj: bpy.types.Object) -> tuple[float, ...]:
     )
 
 
+def _displacement_metrics(
+    obj: bpy.types.Object,
+    initial_positions: list[tuple[float, float, float]],
+) -> dict[str, float]:
+    vertices = list(obj.data.vertices)
+    if not vertices or len(vertices) != len(initial_positions):
+        return {
+            "center_displacement": 0.0,
+            "local_displacement_rms": 0.0,
+        }
+    displacements = [
+        (
+            float(vertex.co.x) - start[0],
+            float(vertex.co.y) - start[1],
+            float(vertex.co.z) - start[2],
+        )
+        for vertex, start in zip(vertices, initial_positions)
+    ]
+    count = float(len(displacements))
+    mean = (
+        sum(delta[0] for delta in displacements) / count,
+        sum(delta[1] for delta in displacements) / count,
+        sum(delta[2] for delta in displacements) / count,
+    )
+    residual_rms = math.sqrt(
+        sum(
+            (delta[0] - mean[0]) ** 2
+            + (delta[1] - mean[1]) ** 2
+            + (delta[2] - mean[2]) ** 2
+            for delta in displacements
+        )
+        / count
+    )
+    return {
+        "center_displacement": math.sqrt(mean[0] * mean[0] + mean[1] * mean[1] + mean[2] * mean[2]),
+        "local_displacement_rms": residual_rms,
+    }
+
+
 def _signature_delta(left: dict[str, object], right: dict[str, object]) -> float:
     left_signature = tuple(left.get("signature", ()))
     right_signature = tuple(right.get("signature", ()))
@@ -143,6 +184,7 @@ def _run_preview(scene: bpy.types.Scene, obj: bpy.types.Object, steps: int = 5) 
     scene.frame_end = steps + 1
     scene.frame_current = 1
     bpy.context.view_layer.objects.active = obj
+    initial_positions = [(float(vertex.co.x), float(vertex.co.y), float(vertex.co.z)) for vertex in obj.data.vertices]
     session = ssbl.solver.start_timeline_preview(bpy.context, scene)
     for frame in range(2, steps + 2):
         scene.frame_current = frame
@@ -152,6 +194,7 @@ def _run_preview(scene: bpy.types.Scene, obj: bpy.types.Object, steps: int = 5) 
     avg_y = _average_axis(obj, "y")
     avg_z = _average_axis(obj, "z")
     signature = _shape_signature(obj)
+    displacement = _displacement_metrics(obj, initial_positions)
     finite = all(
         math.isfinite(float(component))
         for vertex in obj.data.vertices
@@ -164,9 +207,12 @@ def _run_preview(scene: bpy.types.Scene, obj: bpy.types.Object, steps: int = 5) 
         "avg_y": avg_y,
         "avg_z": avg_z,
         "signature": signature,
+        "center_displacement": displacement["center_displacement"],
+        "local_displacement_rms": displacement["local_displacement_rms"],
         "finite": bool(finite and diag.finite),
         "force_field_count": int(diag.force_field_count),
         "unsupported_force_field_count": int(diag.unsupported_force_field_count),
+        "step_ms": float(diag.step_ms),
     }
 
 
@@ -239,6 +285,8 @@ def _sample_dict(sample) -> dict[str, object]:
         "use_radial_min",
         "use_radial_max",
         "use_2d_force",
+        "use_global_coords",
+        "apply_to_location",
         "noise",
         "seed",
         "linear_drag",
@@ -267,6 +315,116 @@ def _read_pc2_average_axis(path: str, sample_index: int, axis: int) -> float:
 
 def _vector_list(values) -> list[float]:
     return [float(value) for value in values]
+
+
+BLENDER_NOISE_HASH = (
+    0xA2, 0xA0, 0x19, 0x3B, 0xF8, 0xEB, 0xAA, 0xEE, 0xF3, 0x1C, 0x67, 0x28, 0x1D, 0xED, 0x00, 0xDE,
+    0x95, 0x2E, 0xDC, 0x3F, 0x3A, 0x82, 0x35, 0x4D, 0x6C, 0xBA, 0x36, 0xD0, 0xF6, 0x0C, 0x79, 0x32,
+    0xD1, 0x59, 0xF4, 0x08, 0x8B, 0x63, 0x89, 0x2F, 0xB8, 0xB4, 0x97, 0x83, 0xF2, 0x8F, 0x18, 0xC7,
+    0x51, 0x14, 0x65, 0x87, 0x48, 0x20, 0x42, 0xA8, 0x80, 0xB5, 0x40, 0x13, 0xB2, 0x22, 0x7E, 0x57,
+    0xBC, 0x7F, 0x6B, 0x9D, 0x86, 0x4C, 0xC8, 0xDB, 0x7C, 0xD5, 0x25, 0x4E, 0x5A, 0x55, 0x74, 0x50,
+    0xCD, 0xB3, 0x7A, 0xBB, 0xC3, 0xCB, 0xB6, 0xE2, 0xE4, 0xEC, 0xFD, 0x98, 0x0B, 0x96, 0xD3, 0x9E,
+    0x5C, 0xA1, 0x64, 0xF1, 0x81, 0x61, 0xE1, 0xC4, 0x24, 0x72, 0x49, 0x8C, 0x90, 0x4B, 0x84, 0x34,
+    0x38, 0xAB, 0x78, 0xCA, 0x1F, 0x01, 0xD7, 0x93, 0x11, 0xC1, 0x58, 0xA9, 0x31, 0xF9, 0x44, 0x6D,
+    0xBF, 0x33, 0x9C, 0x5F, 0x09, 0x94, 0xA3, 0x85, 0x06, 0xC6, 0x9A, 0x1E, 0x7B, 0x46, 0x15, 0x30,
+    0x27, 0x2B, 0x1B, 0x71, 0x3C, 0x5B, 0xD6, 0x6F, 0x62, 0xAC, 0x4F, 0xC2, 0xC0, 0x0E, 0xB1, 0x23,
+    0xA7, 0xDF, 0x47, 0xB0, 0x77, 0x69, 0x05, 0xE9, 0xE6, 0xE7, 0x76, 0x73, 0x0F, 0xFE, 0x6E, 0x9B,
+    0x56, 0xEF, 0x12, 0xA5, 0x37, 0xFC, 0xAE, 0xD9, 0x03, 0x8E, 0xDD, 0x10, 0xB9, 0xCE, 0xC9, 0x8D,
+    0xDA, 0x2A, 0xBD, 0x68, 0x17, 0x9F, 0xBE, 0xD4, 0x0A, 0xCC, 0xD2, 0xE8, 0x43, 0x3D, 0x70, 0xB7,
+    0x02, 0x7D, 0x99, 0xD8, 0x0D, 0x60, 0x8A, 0x04, 0x2C, 0x3E, 0x92, 0xE5, 0xAF, 0x53, 0x07, 0xE0,
+    0x29, 0xA6, 0xC5, 0xE3, 0xF5, 0xF7, 0x4A, 0x41, 0x26, 0x6A, 0x16, 0x5E, 0x52, 0x2D, 0x21, 0xAD,
+    0xF0, 0x91, 0xFF, 0xEA, 0x54, 0xFA, 0x66, 0x1A, 0x45, 0x39, 0xCF, 0x75, 0xA4, 0x88, 0xFB, 0x5D,
+) * 2
+
+
+def _blender_noise_lerp(t: float, a: float, b: float) -> float:
+    return a + t * (b - a)
+
+
+def _blender_noise_fade(t: float) -> float:
+    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
+
+
+def _blender_noise_grad(hash_value: int, x: float, y: float, z: float) -> float:
+    h = hash_value & 15
+    u = x if h < 8 else y
+    v = y if h < 4 else (x if h == 12 or h == 14 else z)
+    return (u if (h & 1) == 0 else -u) + (v if (h & 2) == 0 else -v)
+
+
+def _blender_new_perlin(x: float, y: float, z: float) -> float:
+    floor_x = math.floor(x)
+    floor_y = math.floor(y)
+    floor_z = math.floor(z)
+    X = int(floor_x) & 255
+    Y = int(floor_y) & 255
+    Z = int(floor_z) & 255
+    x -= floor_x
+    y -= floor_y
+    z -= floor_z
+    u = _blender_noise_fade(x)
+    v = _blender_noise_fade(y)
+    w = _blender_noise_fade(z)
+    A = BLENDER_NOISE_HASH[X] + Y
+    AA = BLENDER_NOISE_HASH[A] + Z
+    AB = BLENDER_NOISE_HASH[A + 1] + Z
+    B = BLENDER_NOISE_HASH[X + 1] + Y
+    BA = BLENDER_NOISE_HASH[B] + Z
+    BB = BLENDER_NOISE_HASH[B + 1] + Z
+    return _blender_noise_lerp(
+        w,
+        _blender_noise_lerp(
+            v,
+            _blender_noise_lerp(
+                u,
+                _blender_noise_grad(BLENDER_NOISE_HASH[AA], x, y, z),
+                _blender_noise_grad(BLENDER_NOISE_HASH[BA], x - 1.0, y, z),
+            ),
+            _blender_noise_lerp(
+                u,
+                _blender_noise_grad(BLENDER_NOISE_HASH[AB], x, y - 1.0, z),
+                _blender_noise_grad(BLENDER_NOISE_HASH[BB], x - 1.0, y - 1.0, z),
+            ),
+        ),
+        _blender_noise_lerp(
+            v,
+            _blender_noise_lerp(
+                u,
+                _blender_noise_grad(BLENDER_NOISE_HASH[AA + 1], x, y, z - 1.0),
+                _blender_noise_grad(BLENDER_NOISE_HASH[BA + 1], x - 1.0, y, z - 1.0),
+            ),
+            _blender_noise_lerp(
+                u,
+                _blender_noise_grad(BLENDER_NOISE_HASH[AB + 1], x, y - 1.0, z - 1.0),
+                _blender_noise_grad(BLENDER_NOISE_HASH[BB + 1], x - 1.0, y - 1.0, z - 1.0),
+            ),
+        ),
+    )
+
+
+def _blender_generic_turbulence(noise_size: float, x: float, y: float, z: float) -> float:
+    if noise_size != 0.0 and math.isfinite(noise_size):
+        inv_size = 1.0 / noise_size
+        x *= inv_size
+        y *= inv_size
+        z *= inv_size
+    total = 0.0
+    amp = 1.0
+    fscale = 1.0
+    for _ in range(3):
+        total += (0.5 + 0.5 * _blender_new_perlin(fscale * x, fscale * y, fscale * z)) * amp
+        amp *= 0.5
+        fscale *= 2.0
+    return total * (4.0 / 7.0)
+
+
+def _blender_turbulence_vector(noise_size: float, co: tuple[float, float, float]) -> tuple[float, float, float]:
+    x, y, z = co
+    return (
+        -1.0 + 2.0 * _blender_generic_turbulence(noise_size, x, y, z),
+        -1.0 + 2.0 * _blender_generic_turbulence(noise_size, y, z, x),
+        -1.0 + 2.0 * _blender_generic_turbulence(noise_size, z, x, y),
+    )
 
 
 def _first_field_sample(scene: bpy.types.Scene, cloth: bpy.types.Object):
@@ -632,6 +790,94 @@ def main() -> None:
         )
         turbulence_flow_delta = _signature_delta(turbulence_flow_off, turbulence_flow_on)
 
+        turbulence_noise_low, turbulence_noise_low_sample = _run_single_field_case(
+            scene,
+            "TurbulenceNoiseLow",
+            "TURBULENCE",
+            24.0,
+            configure=lambda field: _apply_field_properties(field, {"noise": 0.0, "seed": 41, "size": 1.25, "flow": 0.0}),
+        )
+        turbulence_noise_high, turbulence_noise_high_sample = _run_single_field_case(
+            scene,
+            "TurbulenceNoiseHigh",
+            "TURBULENCE",
+            24.0,
+            configure=lambda field: _apply_field_properties(field, {"noise": 3.0, "seed": 41, "size": 1.25, "flow": 0.0}),
+        )
+        turbulence_noise_delta = _signature_delta(turbulence_noise_low, turbulence_noise_high)
+
+        turbulence_local_coords, turbulence_local_coords_sample = _run_single_field_case(
+            scene,
+            "TurbulenceLocalCoords",
+            "TURBULENCE",
+            24.0,
+            configure=lambda field: _apply_field_properties(field, {"noise": 0.0, "seed": 43, "size": 0.85, "flow": 0.0}),
+            field_location=(0.45, -0.25, 0.15),
+        )
+        turbulence_global_coords, turbulence_global_coords_sample = _run_single_field_case(
+            scene,
+            "TurbulenceGlobalCoords",
+            "TURBULENCE",
+            24.0,
+            configure=lambda field: _apply_field_properties(
+                field,
+                {"noise": 0.0, "seed": 43, "size": 0.85, "flow": 0.0, "use_global_coords": True},
+            ),
+            field_location=(0.45, -0.25, 0.15),
+        )
+        turbulence_coords_delta = _signature_delta(turbulence_local_coords, turbulence_global_coords)
+
+        turbulence_apply_off, turbulence_apply_off_sample = _run_single_field_case(
+            scene,
+            "TurbulenceApplyOff",
+            "TURBULENCE",
+            24.0,
+            configure=lambda field: _apply_field_properties(
+                field,
+                {"noise": 0.0, "seed": 47, "size": 0.65, "flow": 0.0, "apply_to_location": False},
+            ),
+        )
+        turbulence_apply_off_delta = _signature_delta(off, turbulence_apply_off)
+
+        turbulence_large_size, turbulence_large_size_sample = _run_single_field_case(
+            scene,
+            "TurbulenceLargeSize",
+            "TURBULENCE",
+            24.0,
+            configure=lambda field: _apply_field_properties(field, {"noise": 0.0, "seed": 53, "size": 4.0, "flow": 0.0}),
+            field_location=(0.75, -0.35, 0.20),
+        )
+        turbulence_small_size, turbulence_small_size_sample = _run_single_field_case(
+            scene,
+            "TurbulenceSmallSize",
+            "TURBULENCE",
+            24.0,
+            configure=lambda field: _apply_field_properties(field, {"noise": 0.0, "seed": 53, "size": 0.25, "flow": 0.0}),
+            field_location=(0.75, -0.35, 0.20),
+        )
+        turbulence_reference_vector = _blender_turbulence_vector(0.85, (0.30, -0.20, 1.10))
+
+        perf_wind, perf_wind_sample = _run_single_field_case(
+            scene,
+            "PerfWind",
+            "WIND",
+            24.0,
+            steps=10,
+        )
+        perf_turbulence, perf_turbulence_sample = _run_single_field_case(
+            scene,
+            "PerfTurbulence",
+            "TURBULENCE",
+            24.0,
+            configure=lambda field: _apply_field_properties(field, {"noise": 0.0, "seed": 59, "size": 1.0, "flow": 0.0}),
+            steps=10,
+        )
+        turbulence_perf_ratio = float(perf_turbulence["step_ms"]) / max(float(perf_wind["step_ms"]), 1.0e-6)
+        turbulence_perf_warning = (
+            turbulence_perf_ratio > TURBULENCE_PERF_WARNING_RATIO
+            and float(perf_turbulence["step_ms"]) - float(perf_wind["step_ms"]) > 0.05
+        )
+
         drag_low, drag_low_sample = _run_gravity_drag_case(
             scene,
             "DragLow",
@@ -716,6 +962,27 @@ def main() -> None:
             "turbulence_flow_delta": turbulence_flow_delta,
             "turbulence_flow_off_sample": _sample_dict(turbulence_flow_off_sample),
             "turbulence_flow_on_sample": _sample_dict(turbulence_flow_on_sample),
+            "turbulence_noise_delta": turbulence_noise_delta,
+            "turbulence_noise_low_sample": _sample_dict(turbulence_noise_low_sample),
+            "turbulence_noise_high_sample": _sample_dict(turbulence_noise_high_sample),
+            "turbulence_coords_delta": turbulence_coords_delta,
+            "turbulence_local_coords_sample": _sample_dict(turbulence_local_coords_sample),
+            "turbulence_global_coords_sample": _sample_dict(turbulence_global_coords_sample),
+            "turbulence_apply_off_delta": turbulence_apply_off_delta,
+            "turbulence_apply_off_sample": _sample_dict(turbulence_apply_off_sample),
+            "turbulence_large_size_center_displacement": float(turbulence_large_size["center_displacement"]),
+            "turbulence_large_size_local_displacement_rms": float(turbulence_large_size["local_displacement_rms"]),
+            "turbulence_small_size_center_displacement": float(turbulence_small_size["center_displacement"]),
+            "turbulence_small_size_local_displacement_rms": float(turbulence_small_size["local_displacement_rms"]),
+            "turbulence_large_size_sample": _sample_dict(turbulence_large_size_sample),
+            "turbulence_small_size_sample": _sample_dict(turbulence_small_size_sample),
+            "turbulence_reference_vector": turbulence_reference_vector,
+            "perf_wind_step_ms": float(perf_wind["step_ms"]),
+            "perf_turbulence_step_ms": float(perf_turbulence["step_ms"]),
+            "perf_turbulence_ratio": turbulence_perf_ratio,
+            "perf_turbulence_warning": bool(turbulence_perf_warning),
+            "perf_wind_sample": _sample_dict(perf_wind_sample),
+            "perf_turbulence_sample": _sample_dict(perf_turbulence_sample),
             "drag_parameter_delta": drag_parameter_delta,
             "drag_low_sample": _sample_dict(drag_low_sample),
             "drag_high_sample": _sample_dict(drag_high_sample),
@@ -803,6 +1070,22 @@ def main() -> None:
             and _has_parameter_effect(turbulence_flow_off, turbulence_flow_on)
             and turbulence_flow_on_sample is not None
             and abs(float(turbulence_flow_on_sample.flow) - 2.5) < 1.0e-4
+            and turbulence_noise_low["finite"]
+            and turbulence_noise_high["finite"]
+            and turbulence_noise_delta < NOISE_SPATIAL_EPSILON
+            and turbulence_noise_high_sample is not None
+            and abs(float(turbulence_noise_high_sample.noise) - 3.0) < 1.0e-4
+            and _has_parameter_effect(turbulence_local_coords, turbulence_global_coords)
+            and turbulence_global_coords_sample is not None
+            and int(turbulence_global_coords_sample.use_global_coords) == 1
+            and turbulence_apply_off["finite"]
+            and turbulence_apply_off["force_field_count"] == 1
+            and turbulence_apply_off_delta < NOISE_SPATIAL_EPSILON
+            and turbulence_apply_off_sample is not None
+            and int(turbulence_apply_off_sample.apply_to_location) == 0
+            and turbulence_large_size["center_displacement"] > 1.0e-5
+            and turbulence_small_size["local_displacement_rms"] > turbulence_large_size["local_displacement_rms"] + 1.0e-5
+            and all(math.isfinite(float(component)) and -1.0 <= float(component) <= 1.0 for component in turbulence_reference_vector)
             and _has_parameter_effect(drag_low, drag_high)
             and drag_high["avg_z"] > drag_low["avg_z"] + 0.005
             and drag_high_sample is not None

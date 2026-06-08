@@ -103,6 +103,7 @@ class GateThresholds:
     max_resolved_contacts: int = 120_000
     max_ccd_clamp_count: int = 2_500
     max_contact_pressure: int = 200_000
+    max_soft_contact_pressure: int = 3_010_000
     min_preview_frames: int = 3
     require_preview_frames: bool = False
     check_existing_frame_files: bool = True
@@ -173,6 +174,7 @@ def thresholds_from_env(prefixes: tuple[str, ...] = DEFAULT_ENV_PREFIXES) -> Gat
         max_resolved_contacts=_int_env(prefixes, "MAX_RESOLVED_CONTACTS", defaults.max_resolved_contacts),
         max_ccd_clamp_count=_int_env(prefixes, "MAX_CCD_CLAMP_COUNT", defaults.max_ccd_clamp_count),
         max_contact_pressure=_int_env(prefixes, "MAX_CONTACT_PRESSURE", defaults.max_contact_pressure),
+        max_soft_contact_pressure=_int_env(prefixes, "MAX_SOFT_CONTACT_PRESSURE", defaults.max_soft_contact_pressure),
         min_preview_frames=_int_env(prefixes, "MIN_PREVIEW_FRAMES", defaults.min_preview_frames),
         require_preview_frames=_bool_env(prefixes, "REQUIRE_PREVIEW_FRAMES", defaults.require_preview_frames),
         check_existing_frame_files=_bool_env(prefixes, "CHECK_FRAME_FILES", defaults.check_existing_frame_files),
@@ -192,6 +194,7 @@ def add_threshold_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-resolved-contacts", type=int, default=None)
     parser.add_argument("--max-ccd-clamp-count", type=int, default=None)
     parser.add_argument("--max-contact-pressure", type=int, default=None)
+    parser.add_argument("--max-soft-contact-pressure", type=int, default=None)
     parser.add_argument("--min-preview-frames", type=int, default=None)
     parser.add_argument("--require-preview-frames", action="store_true", default=None)
     parser.add_argument("--skip-frame-file-check", action="store_true", default=False)
@@ -215,6 +218,7 @@ def thresholds_from_args(
         "max_resolved_contacts",
         "max_ccd_clamp_count",
         "max_contact_pressure",
+        "max_soft_contact_pressure",
         "min_preview_frames",
         "require_preview_frames",
         "raw_intersection_lt",
@@ -485,6 +489,17 @@ def _check_diagnostics_pressure(
     soft_pressure, soft_pressure_field = _contact_pressure(source, SOFT_ABI41_PRESSURE_FIELDS)
     if soft_pressure_field is not None:
         _update_peak(observed, "max_soft_contact_pressure", soft_pressure)
+        if soft_pressure > thresholds.max_soft_contact_pressure:
+            failures.append(
+                _failure(
+                    CATEGORY_DIAGNOSTICS_PRESSURE,
+                    soft_pressure_field,
+                    soft_pressure,
+                    f"<= {thresholds.max_soft_contact_pressure}",
+                    scope,
+                    "soft self-collision candidate pressure exceeded the diagnostics-pressure gate",
+                )
+            )
 
     resolved = _as_int(source.get("native_resolved_contacts"))
     if resolved is None:

@@ -88,6 +88,8 @@ class ForceFieldSample:
     use_radial_min: int
     use_radial_max: int
     use_2d_force: int
+    use_global_coords: int
+    apply_to_location: int
     noise: float
     seed: int
     linear_drag: float
@@ -266,6 +268,8 @@ def collect_force_fields(
                 use_radial_min=1 if bool(getattr(field, "use_radial_min", False)) else 0,
                 use_radial_max=1 if bool(getattr(field, "use_radial_max", False)) else 0,
                 use_2d_force=1 if bool(getattr(field, "use_2d_force", False)) else 0,
+                use_global_coords=1 if bool(getattr(field, "use_global_coords", False)) else 0,
+                apply_to_location=1 if bool(getattr(field, "apply_to_location", True)) else 0,
                 noise=_non_negative_float(getattr(field, "noise", 0.0), 0.0),
                 seed=_finite_int(getattr(field, "seed", 0), 0),
                 linear_drag=_non_negative_float(getattr(field, "linear_drag", 0.0), 0.0),

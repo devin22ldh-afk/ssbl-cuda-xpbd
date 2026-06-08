@@ -370,6 +370,17 @@ def record_viewport_tag_ms(object_name: str, elapsed_ms: float) -> None:
         dynamic_collision_skipped_launches=diag.dynamic_collision_skipped_launches,
         self_collision_skipped_launches=diag.self_collision_skipped_launches,
         self_candidate_count=diag.self_candidate_count,
+        self_filter_seen=diag.self_filter_seen,
+        self_filter_accepted_vv=diag.self_filter_accepted_vv,
+        self_filter_accepted_vt=diag.self_filter_accepted_vt,
+        self_filter_accepted_ee=diag.self_filter_accepted_ee,
+        self_filter_rejected_rest=diag.self_filter_rejected_rest,
+        self_filter_rejected_duplicate=diag.self_filter_rejected_duplicate,
+        self_filter_rejected_ownership=diag.self_filter_rejected_ownership,
+        self_filter_cache_hits=diag.self_filter_cache_hits,
+        self_filter_cache_misses=diag.self_filter_cache_misses,
+        self_cluster_count=diag.self_cluster_count,
+        self_cluster_owned_contacts=diag.self_cluster_owned_contacts,
         frame_ms=diag.frame_ms,
         frame_set_ms=diag.frame_set_ms,
         input_refresh_ms=diag.input_refresh_ms,
@@ -612,6 +623,11 @@ def _auto_sphere_collider_for_preview(
     return candidates[0] if candidates else None
 
 
+def _has_simulatable_cloth_source_geometry(obj: bpy.types.Object | None) -> bool:
+    mesh = getattr(obj, "data", None) if obj is not None and obj.type == "MESH" else None
+    return bool(mesh is not None and len(mesh.vertices) > 0 and len(mesh.polygons) > 0)
+
+
 def _enabled_playback_cloth_objects(scene: bpy.types.Scene) -> list[bpy.types.Object]:
     objects: list[bpy.types.Object] = []
     collision_only_names = _collision_only_object_names_for_scene(scene)
@@ -622,6 +638,8 @@ def _enabled_playback_cloth_objects(scene: bpy.types.Scene) -> list[bpy.types.Ob
             continue
         settings = _object_cloth_settings(obj)
         if settings is None:
+            continue
+        if not _has_simulatable_cloth_source_geometry(obj):
             continue
         if _declared_input_type(obj) in _UNSUPPORTED_INPUT_TYPES:
             continue
@@ -1358,6 +1376,8 @@ def _preview_cloth_objects(context: bpy.types.Context, obj: bpy.types.Object, se
         if selected_obj.name in auto_sphere_names:
             continue
         if _object_cloth_settings(selected_obj) is None:
+            continue
+        if not _has_simulatable_cloth_source_geometry(selected_obj):
             continue
         if _declared_input_type(selected_obj) in _UNSUPPORTED_INPUT_TYPES:
             continue
@@ -2968,6 +2988,17 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
     dynamic_collision_skipped_launches = 0
     self_collision_skipped_launches = 0
     self_candidate_count = 0
+    self_filter_seen = 0
+    self_filter_accepted_vv = 0
+    self_filter_accepted_vt = 0
+    self_filter_accepted_ee = 0
+    self_filter_rejected_rest = 0
+    self_filter_rejected_duplicate = 0
+    self_filter_rejected_ownership = 0
+    self_filter_cache_hits = 0
+    self_filter_cache_misses = 0
+    self_cluster_count = 0
+    self_cluster_owned_contacts = 0
     finite = True
     writeback_performed = False
     diag_started = time.perf_counter()
@@ -3086,6 +3117,17 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
         dynamic_collision_skipped_launches += int(diag.dynamic_collision_skipped_launches)
         self_collision_skipped_launches += int(diag.self_collision_skipped_launches)
         self_candidate_count += int(diag.self_candidate_count)
+        self_filter_seen += int(diag.self_filter_seen)
+        self_filter_accepted_vv += int(diag.self_filter_accepted_vv)
+        self_filter_accepted_vt += int(diag.self_filter_accepted_vt)
+        self_filter_accepted_ee += int(diag.self_filter_accepted_ee)
+        self_filter_rejected_rest += int(diag.self_filter_rejected_rest)
+        self_filter_rejected_duplicate += int(diag.self_filter_rejected_duplicate)
+        self_filter_rejected_ownership += int(diag.self_filter_rejected_ownership)
+        self_filter_cache_hits += int(diag.self_filter_cache_hits)
+        self_filter_cache_misses += int(diag.self_filter_cache_misses)
+        self_cluster_count += int(diag.self_cluster_count)
+        self_cluster_owned_contacts += int(diag.self_cluster_owned_contacts)
         finite = finite and bool(diag.finite)
         writeback_performed = writeback_performed or bool(diag.writeback_performed)
         if diag.min_gap is not None:
@@ -3225,6 +3267,17 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
         dynamic_collision_skipped_launches=dynamic_collision_skipped_launches,
         self_collision_skipped_launches=self_collision_skipped_launches,
         self_candidate_count=self_candidate_count,
+        self_filter_seen=self_filter_seen,
+        self_filter_accepted_vv=self_filter_accepted_vv,
+        self_filter_accepted_vt=self_filter_accepted_vt,
+        self_filter_accepted_ee=self_filter_accepted_ee,
+        self_filter_rejected_rest=self_filter_rejected_rest,
+        self_filter_rejected_duplicate=self_filter_rejected_duplicate,
+        self_filter_rejected_ownership=self_filter_rejected_ownership,
+        self_filter_cache_hits=self_filter_cache_hits,
+        self_filter_cache_misses=self_filter_cache_misses,
+        self_cluster_count=self_cluster_count,
+        self_cluster_owned_contacts=self_cluster_owned_contacts,
         finite=finite,
         frame_ms=perf.frame_ms if perf is not None else 0.0,
         frame_set_ms=perf.frame_set_ms if perf is not None else 0.0,

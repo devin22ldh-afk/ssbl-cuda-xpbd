@@ -129,6 +129,8 @@ class _NativeForceField(ctypes.Structure):
         ("use_radial_min", ctypes.c_int),
         ("use_radial_max", ctypes.c_int),
         ("use_2d_force", ctypes.c_int),
+        ("use_global_coords", ctypes.c_int),
+        ("apply_to_location", ctypes.c_int),
     ]
 
 
@@ -277,6 +279,17 @@ class _NativeDiagnostics(ctypes.Structure):
         ("dynamic_collision_skipped_launches", ctypes.c_longlong),
         ("self_collision_skipped_launches", ctypes.c_longlong),
         ("self_candidate_count", ctypes.c_longlong),
+        ("self_filter_seen", ctypes.c_longlong),
+        ("self_filter_accepted_vv", ctypes.c_longlong),
+        ("self_filter_accepted_vt", ctypes.c_longlong),
+        ("self_filter_accepted_ee", ctypes.c_longlong),
+        ("self_filter_rejected_rest", ctypes.c_longlong),
+        ("self_filter_rejected_duplicate", ctypes.c_longlong),
+        ("self_filter_rejected_ownership", ctypes.c_longlong),
+        ("self_filter_cache_hits", ctypes.c_longlong),
+        ("self_filter_cache_misses", ctypes.c_longlong),
+        ("self_cluster_count", ctypes.c_longlong),
+        ("self_cluster_owned_contacts", ctypes.c_longlong),
     ]
 
 
@@ -403,6 +416,17 @@ class NativeStepDiagnostics:
     dynamic_collision_skipped_launches: int = 0
     self_collision_skipped_launches: int = 0
     self_candidate_count: int = 0
+    self_filter_seen: int = 0
+    self_filter_accepted_vv: int = 0
+    self_filter_accepted_vt: int = 0
+    self_filter_accepted_ee: int = 0
+    self_filter_rejected_rest: int = 0
+    self_filter_rejected_duplicate: int = 0
+    self_filter_rejected_ownership: int = 0
+    self_filter_cache_hits: int = 0
+    self_filter_cache_misses: int = 0
+    self_cluster_count: int = 0
+    self_cluster_owned_contacts: int = 0
     frame_ms: float = 0.0
     frame_set_ms: float = 0.0
     input_refresh_ms: float = 0.0
@@ -689,6 +713,8 @@ def _force_field_array(force_fields):
         item.use_radial_min = int(getattr(sample, "use_radial_min", 0))
         item.use_radial_max = int(getattr(sample, "use_radial_max", 0))
         item.use_2d_force = int(getattr(sample, "use_2d_force", 0))
+        item.use_global_coords = int(getattr(sample, "use_global_coords", 0))
+        item.apply_to_location = int(getattr(sample, "apply_to_location", 1))
     return array
 
 
@@ -1137,6 +1163,17 @@ class NativeXpbdSolver:
             dynamic_collision_skipped_launches=int(raw.dynamic_collision_skipped_launches),
             self_collision_skipped_launches=int(raw.self_collision_skipped_launches),
             self_candidate_count=int(raw.self_candidate_count),
+            self_filter_seen=int(raw.self_filter_seen),
+            self_filter_accepted_vv=int(raw.self_filter_accepted_vv),
+            self_filter_accepted_vt=int(raw.self_filter_accepted_vt),
+            self_filter_accepted_ee=int(raw.self_filter_accepted_ee),
+            self_filter_rejected_rest=int(raw.self_filter_rejected_rest),
+            self_filter_rejected_duplicate=int(raw.self_filter_rejected_duplicate),
+            self_filter_rejected_ownership=int(raw.self_filter_rejected_ownership),
+            self_filter_cache_hits=int(raw.self_filter_cache_hits),
+            self_filter_cache_misses=int(raw.self_filter_cache_misses),
+            self_cluster_count=int(raw.self_cluster_count),
+            self_cluster_owned_contacts=int(raw.self_cluster_owned_contacts),
         )
         self._last_diagnostics = diag
         return diag

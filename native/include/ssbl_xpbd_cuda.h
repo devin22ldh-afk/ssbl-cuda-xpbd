@@ -181,6 +181,17 @@ typedef struct SsblXpbdDiagnostics {
     long long dynamic_collision_skipped_launches;
     long long self_collision_skipped_launches;
     long long self_candidate_count;
+    long long self_filter_seen;
+    long long self_filter_accepted_vv;
+    long long self_filter_accepted_vt;
+    long long self_filter_accepted_ee;
+    long long self_filter_rejected_rest;
+    long long self_filter_rejected_duplicate;
+    long long self_filter_rejected_ownership;
+    long long self_filter_cache_hits;
+    long long self_filter_cache_misses;
+    long long self_cluster_count;
+    long long self_cluster_owned_contacts;
 } SsblXpbdDiagnostics;
 
 typedef struct SsblXpbdMesh {
@@ -236,6 +247,8 @@ typedef struct SsblXpbdForceField {
     int use_radial_min;
     int use_radial_max;
     int use_2d_force;
+    int use_global_coords;
+    int apply_to_location;
 } SsblXpbdForceField;
 
 typedef struct SsblXpbdFrameInputs {

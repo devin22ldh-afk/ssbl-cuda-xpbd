@@ -74,6 +74,40 @@ constexpr int kForceFieldMagnet = 8;
 constexpr int kForceFieldDrag = 9;
 constexpr int kForceFieldTexture = 10;
 constexpr float kMaxForceFieldAcceleration = 5000.0f;
+__device__ __constant__ unsigned char kBlenderNoiseHash[512] = {
+    0xA2, 0xA0, 0x19, 0x3B, 0xF8, 0xEB, 0xAA, 0xEE, 0xF3, 0x1C, 0x67, 0x28, 0x1D, 0xED, 0x0,  0xDE,
+    0x95, 0x2E, 0xDC, 0x3F, 0x3A, 0x82, 0x35, 0x4D, 0x6C, 0xBA, 0x36, 0xD0, 0xF6, 0xC,  0x79, 0x32,
+    0xD1, 0x59, 0xF4, 0x8,  0x8B, 0x63, 0x89, 0x2F, 0xB8, 0xB4, 0x97, 0x83, 0xF2, 0x8F, 0x18, 0xC7,
+    0x51, 0x14, 0x65, 0x87, 0x48, 0x20, 0x42, 0xA8, 0x80, 0xB5, 0x40, 0x13, 0xB2, 0x22, 0x7E, 0x57,
+    0xBC, 0x7F, 0x6B, 0x9D, 0x86, 0x4C, 0xC8, 0xDB, 0x7C, 0xD5, 0x25, 0x4E, 0x5A, 0x55, 0x74, 0x50,
+    0xCD, 0xB3, 0x7A, 0xBB, 0xC3, 0xCB, 0xB6, 0xE2, 0xE4, 0xEC, 0xFD, 0x98, 0xB,  0x96, 0xD3, 0x9E,
+    0x5C, 0xA1, 0x64, 0xF1, 0x81, 0x61, 0xE1, 0xC4, 0x24, 0x72, 0x49, 0x8C, 0x90, 0x4B, 0x84, 0x34,
+    0x38, 0xAB, 0x78, 0xCA, 0x1F, 0x1,  0xD7, 0x93, 0x11, 0xC1, 0x58, 0xA9, 0x31, 0xF9, 0x44, 0x6D,
+    0xBF, 0x33, 0x9C, 0x5F, 0x9,  0x94, 0xA3, 0x85, 0x6,  0xC6, 0x9A, 0x1E, 0x7B, 0x46, 0x15, 0x30,
+    0x27, 0x2B, 0x1B, 0x71, 0x3C, 0x5B, 0xD6, 0x6F, 0x62, 0xAC, 0x4F, 0xC2, 0xC0, 0xE,  0xB1, 0x23,
+    0xA7, 0xDF, 0x47, 0xB0, 0x77, 0x69, 0x5,  0xE9, 0xE6, 0xE7, 0x76, 0x73, 0xF,  0xFE, 0x6E, 0x9B,
+    0x56, 0xEF, 0x12, 0xA5, 0x37, 0xFC, 0xAE, 0xD9, 0x3,  0x8E, 0xDD, 0x10, 0xB9, 0xCE, 0xC9, 0x8D,
+    0xDA, 0x2A, 0xBD, 0x68, 0x17, 0x9F, 0xBE, 0xD4, 0xA,  0xCC, 0xD2, 0xE8, 0x43, 0x3D, 0x70, 0xB7,
+    0x2,  0x7D, 0x99, 0xD8, 0xD,  0x60, 0x8A, 0x4,  0x2C, 0x3E, 0x92, 0xE5, 0xAF, 0x53, 0x7,  0xE0,
+    0x29, 0xA6, 0xC5, 0xE3, 0xF5, 0xF7, 0x4A, 0x41, 0x26, 0x6A, 0x16, 0x5E, 0x52, 0x2D, 0x21, 0xAD,
+    0xF0, 0x91, 0xFF, 0xEA, 0x54, 0xFA, 0x66, 0x1A, 0x45, 0x39, 0xCF, 0x75, 0xA4, 0x88, 0xFB, 0x5D,
+    0xA2, 0xA0, 0x19, 0x3B, 0xF8, 0xEB, 0xAA, 0xEE, 0xF3, 0x1C, 0x67, 0x28, 0x1D, 0xED, 0x0,  0xDE,
+    0x95, 0x2E, 0xDC, 0x3F, 0x3A, 0x82, 0x35, 0x4D, 0x6C, 0xBA, 0x36, 0xD0, 0xF6, 0xC,  0x79, 0x32,
+    0xD1, 0x59, 0xF4, 0x8,  0x8B, 0x63, 0x89, 0x2F, 0xB8, 0xB4, 0x97, 0x83, 0xF2, 0x8F, 0x18, 0xC7,
+    0x51, 0x14, 0x65, 0x87, 0x48, 0x20, 0x42, 0xA8, 0x80, 0xB5, 0x40, 0x13, 0xB2, 0x22, 0x7E, 0x57,
+    0xBC, 0x7F, 0x6B, 0x9D, 0x86, 0x4C, 0xC8, 0xDB, 0x7C, 0xD5, 0x25, 0x4E, 0x5A, 0x55, 0x74, 0x50,
+    0xCD, 0xB3, 0x7A, 0xBB, 0xC3, 0xCB, 0xB6, 0xE2, 0xE4, 0xEC, 0xFD, 0x98, 0xB,  0x96, 0xD3, 0x9E,
+    0x5C, 0xA1, 0x64, 0xF1, 0x81, 0x61, 0xE1, 0xC4, 0x24, 0x72, 0x49, 0x8C, 0x90, 0x4B, 0x84, 0x34,
+    0x38, 0xAB, 0x78, 0xCA, 0x1F, 0x1,  0xD7, 0x93, 0x11, 0xC1, 0x58, 0xA9, 0x31, 0xF9, 0x44, 0x6D,
+    0xBF, 0x33, 0x9C, 0x5F, 0x9,  0x94, 0xA3, 0x85, 0x6,  0xC6, 0x9A, 0x1E, 0x7B, 0x46, 0x15, 0x30,
+    0x27, 0x2B, 0x1B, 0x71, 0x3C, 0x5B, 0xD6, 0x6F, 0x62, 0xAC, 0x4F, 0xC2, 0xC0, 0xE,  0xB1, 0x23,
+    0xA7, 0xDF, 0x47, 0xB0, 0x77, 0x69, 0x5,  0xE9, 0xE6, 0xE7, 0x76, 0x73, 0xF,  0xFE, 0x6E, 0x9B,
+    0x56, 0xEF, 0x12, 0xA5, 0x37, 0xFC, 0xAE, 0xD9, 0x3,  0x8E, 0xDD, 0x10, 0xB9, 0xCE, 0xC9, 0x8D,
+    0xDA, 0x2A, 0xBD, 0x68, 0x17, 0x9F, 0xBE, 0xD4, 0xA,  0xCC, 0xD2, 0xE8, 0x43, 0x3D, 0x70, 0xB7,
+    0x2,  0x7D, 0x99, 0xD8, 0xD,  0x60, 0x8A, 0x4,  0x2C, 0x3E, 0x92, 0xE5, 0xAF, 0x53, 0x7,  0xE0,
+    0x29, 0xA6, 0xC5, 0xE3, 0xF5, 0xF7, 0x4A, 0x41, 0x26, 0x6A, 0x16, 0x5E, 0x52, 0x2D, 0x21, 0xAD,
+    0xF0, 0x91, 0xFF, 0xEA, 0x54, 0xFA, 0x66, 0x1A, 0x45, 0x39, 0xCF, 0x75, 0xA4, 0x88, 0xFB, 0x5D,
+};
 constexpr int kMaxStaticTriangleHashCells = 256;
 constexpr int kMaxStaticVertexQueryCells = 256;
 constexpr int kMaxStaticVertexCandidates = 256;
@@ -668,6 +702,84 @@ __device__ float fract01(float value) {
     return value - floorf(value);
 }
 
+__device__ __forceinline__ float blender_noise_lerp(float t, float a, float b) {
+    return a + t * (b - a);
+}
+
+__device__ __forceinline__ float blender_noise_fade(float t) {
+    return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
+}
+
+__device__ __forceinline__ float blender_noise_grad(int hash_val, float x, float y, float z) {
+    const int h = hash_val & 15;
+    const float u = h < 8 ? x : y;
+    const float v = h < 4 ? y : (h == 12 || h == 14 ? x : z);
+    return ((h & 1) == 0 ? u : -u) + ((h & 2) == 0 ? v : -v);
+}
+
+__device__ __forceinline__ float blender_new_perlin(float x, float y, float z) {
+    const float floor_x = floorf(x);
+    const float floor_y = floorf(y);
+    const float floor_z = floorf(z);
+    const int X = static_cast<int>(floor_x) & 255;
+    const int Y = static_cast<int>(floor_y) & 255;
+    const int Z = static_cast<int>(floor_z) & 255;
+    x -= floor_x;
+    y -= floor_y;
+    z -= floor_z;
+    const float u = blender_noise_fade(x);
+    const float v = blender_noise_fade(y);
+    const float w = blender_noise_fade(z);
+    const int A = kBlenderNoiseHash[X] + Y;
+    const int AA = kBlenderNoiseHash[A] + Z;
+    const int AB = kBlenderNoiseHash[A + 1] + Z;
+    const int B = kBlenderNoiseHash[X + 1] + Y;
+    const int BA = kBlenderNoiseHash[B] + Z;
+    const int BB = kBlenderNoiseHash[B + 1] + Z;
+    return blender_noise_lerp(
+        w,
+        blender_noise_lerp(
+            v,
+            blender_noise_lerp(
+                u,
+                blender_noise_grad(kBlenderNoiseHash[AA], x, y, z),
+                blender_noise_grad(kBlenderNoiseHash[BA], x - 1.0f, y, z)),
+            blender_noise_lerp(
+                u,
+                blender_noise_grad(kBlenderNoiseHash[AB], x, y - 1.0f, z),
+                blender_noise_grad(kBlenderNoiseHash[BB], x - 1.0f, y - 1.0f, z))),
+        blender_noise_lerp(
+            v,
+            blender_noise_lerp(
+                u,
+                blender_noise_grad(kBlenderNoiseHash[AA + 1], x, y, z - 1.0f),
+                blender_noise_grad(kBlenderNoiseHash[BA + 1], x - 1.0f, y, z - 1.0f)),
+            blender_noise_lerp(
+                u,
+                blender_noise_grad(kBlenderNoiseHash[AB + 1], x, y - 1.0f, z - 1.0f),
+                blender_noise_grad(kBlenderNoiseHash[BB + 1], x - 1.0f, y - 1.0f, z - 1.0f))));
+}
+
+__device__ __forceinline__ float blender_new_perlin_unsigned(float x, float y, float z) {
+    return 0.5f + 0.5f * blender_new_perlin(x, y, z);
+}
+
+__device__ __forceinline__ float blender_generic_turbulence(float noise_size, float x, float y, float z) {
+    if (noise_size != 0.0f && isfinite(noise_size)) {
+        const float inv_size = 1.0f / noise_size;
+        x *= inv_size;
+        y *= inv_size;
+        z *= inv_size;
+    }
+    float sum = 0.0f;
+    float amp = 1.0f;
+    float fscale = 1.0f;
+    for (int i = 0; i <= 2; ++i, amp *= 0.5f, fscale *= 2.0f) {
+        sum += blender_new_perlin_unsigned(fscale * x, fscale * y, fscale * z) * amp;
+    }
+    return sum * (4.0f / 7.0f);
+}
+
 __device__ float force_field_noise(Vec3 p, int seed, float salt) {
     float value = sinf(
         p.x * 12.9898f
@@ -719,8 +831,23 @@ __device__ Vec3 limit_force_field_acceleration(Vec3 value) {
     return mul(value, kMaxForceFieldAcceleration / fmaxf(len, kEps));
 }
 
+__device__ Vec3 apply_force_field_flow(
+    const SsblXpbdForceField& field,
+    Vec3 force,
+    Vec3 velocity,
+    float falloff
+) {
+    if (field.type != kForceFieldHarmonic && field.type != kForceFieldDrag) {
+        const float flow = isfinite(field.flow) ? field.flow : 0.0f;
+        if (fabsf(flow) > 1.0e-6f && falloff != 0.0f) {
+            force = add(force, mul(velocity, -flow * falloff));
+        }
+    }
+    return limit_force_field_acceleration(force);
+}
+
 __device__ Vec3 evaluate_force_field(const SsblXpbdForceField& field, Vec3 p, Vec3 velocity) {
-    if (!isfinite(field.strength) || field.strength == 0.0f) {
+    if (!isfinite(field.strength) || field.strength == 0.0f || field.apply_to_location == 0) {
         return {0.0f, 0.0f, 0.0f};
     }
     Vec3 origin = array_vec3(field.origin);
@@ -729,13 +856,14 @@ __device__ Vec3 evaluate_force_field(const SsblXpbdForceField& field, Vec3 p, Ve
     Vec3 radial_delta = field.use_2d_force ? sub(delta, mul(axis, dot(delta, axis))) : delta;
     float distance = sqrtf(fmaxf(dot(delta, delta), 0.0f));
     float radial_distance = sqrtf(fmaxf(dot(radial_delta, radial_delta), 0.0f));
-    float strength = field.strength * force_field_falloff(field, distance, radial_distance);
+    float falloff = force_field_falloff(field, distance, radial_distance);
+    float strength = field.strength * falloff;
     if (strength == 0.0f || !isfinite(strength)) {
         return {0.0f, 0.0f, 0.0f};
     }
 
     if (field.type == kForceFieldWind) {
-        return mul(normalize(array_vec3(field.direction)), strength);
+        return apply_force_field_flow(field, mul(normalize(array_vec3(field.direction)), strength), velocity, falloff);
     }
     if (field.type == kForceFieldForce || field.type == kForceFieldCharge) {
         Vec3 source_delta = field.use_2d_force ? radial_delta : delta;
@@ -747,7 +875,7 @@ __device__ Vec3 evaluate_force_field(const SsblXpbdForceField& field, Vec3 p, Ve
         if (field.type == kForceFieldCharge) {
             scale /= fmaxf(source_distance * source_distance, 0.01f);
         }
-        return limit_force_field_acceleration(mul(source_delta, scale));
+        return apply_force_field_flow(field, mul(source_delta, scale), velocity, falloff);
     }
     if (field.type == kForceFieldVortex) {
         Vec3 radial = sub(delta, mul(axis, dot(delta, axis)));
@@ -755,7 +883,7 @@ __device__ Vec3 evaluate_force_field(const SsblXpbdForceField& field, Vec3 p, Ve
             return {0.0f, 0.0f, 0.0f};
         }
         Vec3 tangent = normalize(cross(axis, radial));
-        return mul(tangent, strength);
+        return apply_force_field_flow(field, mul(tangent, strength), velocity, falloff);
     }
     if (field.type == kForceFieldHarmonic) {
         float source_distance = field.use_2d_force ? radial_distance : distance;
@@ -767,7 +895,7 @@ __device__ Vec3 evaluate_force_field(const SsblXpbdForceField& field, Vec3 p, Ve
         float rest_length = fmaxf(field.rest_length, 0.0f);
         float spring = -strength * (source_distance - rest_length);
         float damping = -dot(velocity, direction) * fmaxf(field.harmonic_damping, 0.0f) * fabsf(strength);
-        return limit_force_field_acceleration(mul(direction, spring + damping));
+        return apply_force_field_flow(field, mul(direction, spring + damping), velocity, falloff);
     }
     if (field.type == kForceFieldLennardJ) {
         if (distance <= 1.0e-6f) {
@@ -779,11 +907,11 @@ __device__ Vec3 evaluate_force_field(const SsblXpbdForceField& field, Vec3 p, Ve
         float ratio2 = ratio * ratio;
         float ratio6 = ratio2 * ratio2 * ratio2;
         float magnitude = strength * (ratio6 * ratio6 - ratio6);
-        return limit_force_field_acceleration(mul(direction, magnitude));
+        return apply_force_field_flow(field, mul(direction, magnitude), velocity, falloff);
     }
     if (field.type == kForceFieldMagnet) {
         Vec3 magnetic_axis = normalize(array_vec3(field.direction));
-        return limit_force_field_acceleration(mul(cross(velocity, magnetic_axis), strength));
+        return apply_force_field_flow(field, mul(cross(velocity, magnetic_axis), strength), velocity, falloff);
     }
     if (field.type == kForceFieldDrag) {
         float speed = sqrtf(fmaxf(dot(velocity, velocity), 0.0f));
@@ -795,9 +923,18 @@ __device__ Vec3 evaluate_force_field(const SsblXpbdForceField& field, Vec3 p, Ve
         if (linear <= 0.0f && quadratic <= 0.0f) {
             linear = fabsf(strength);
         }
-        return limit_force_field_acceleration(mul(velocity, -(linear + quadratic * speed)));
+        return apply_force_field_flow(field, mul(velocity, -(linear + quadratic * speed)), velocity, falloff);
     }
-    if (field.type == kForceFieldTurbulence || field.type == kForceFieldTexture) {
+    if (field.type == kForceFieldTurbulence) {
+        Vec3 q = field.use_global_coords ? p : add(delta, axis);
+        Vec3 noise_vec{
+            -1.0f + 2.0f * blender_generic_turbulence(field.size, q.x, q.y, q.z),
+            -1.0f + 2.0f * blender_generic_turbulence(field.size, q.y, q.z, q.x),
+            -1.0f + 2.0f * blender_generic_turbulence(field.size, q.z, q.x, q.y),
+        };
+        return apply_force_field_flow(field, mul(noise_vec, strength), velocity, falloff);
+    }
+    if (field.type == kForceFieldTexture) {
         float frequency = fmaxf(fmaxf(field.noise, field.texture_nabla), 0.25f);
         if (field.size > 1.0e-6f) {
             frequency = fmaxf(frequency, 1.0f / field.size);
@@ -808,7 +945,7 @@ __device__ Vec3 evaluate_force_field(const SsblXpbdForceField& field, Vec3 p, Ve
             force_field_noise(q, field.seed, 7.0f),
             force_field_noise(q, field.seed, 13.0f),
         };
-        return limit_force_field_acceleration(mul(noise_vec, strength));
+        return apply_force_field_flow(field, mul(noise_vec, strength), velocity, falloff);
     }
     return {0.0f, 0.0f, 0.0f};
 }

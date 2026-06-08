@@ -48,7 +48,7 @@ class SSBL_PT_physics_panel(bpy.types.Panel):
             
             # Status Dashboard - Awesome Design: Boxed logical grouping
             col = layout.column(align=True)
-            col.label(text="运行状态", icon="PULSE")
+            col.label(text="运行状态", icon="STATUSBAR")
             status_box = col.box()
             box_col = status_box.column(align=True)
             
