@@ -1733,7 +1733,7 @@ def _step_session_slots(session: SceneSession, download_positions, perf: FramePe
                 perf.dynamic_collider_pack_ms += _elapsed_ms(pack_started)
                 perf.dynamic_triangle_count += int(len(dynamic_triangles))
                 perf.dynamic_particle_count += int(len(dynamic_particles.get("positions", ())))
-            slot.native.update_frame_inputs(
+            did_upload_dynamic = slot.native.update_frame_inputs(
                 pin_indices=None,
                 pin_positions=None,
                 pin_weights=None,
@@ -1749,7 +1749,7 @@ def _step_session_slots(session: SceneSession, download_positions, perf: FramePe
                 force_fields=None,
                 update_force_fields=False,
             )
-            if perf is not None:
+            if perf is not None and did_upload_dynamic:
                 elapsed = _elapsed_ms(started)
                 perf.dynamic_upload_ms += elapsed
                 perf.frame_input_upload_ms += elapsed

@@ -28,10 +28,13 @@ MAX_EDGE_RATIO_LIMIT = float(os.environ.get("SSBL_CS3_MAX_EDGE_RATIO", "1.25"))
 MEAN_RMS_STEP_LIMIT = float(os.environ.get("SSBL_CS3_MEAN_RMS_STEP", "0.015"))
 HARDNESS1_MAX_EDGE_RATIO_LIMIT = float(os.environ.get("SSBL_CS3_HARDNESS1_MAX_EDGE_RATIO", "1.35"))
 HARDNESS1_MEAN_RMS_STEP_LIMIT = float(os.environ.get("SSBL_CS3_HARDNESS1_MEAN_RMS_STEP", "0.025"))
+DAMPING1_MAX_EDGE_RATIO_LIMIT = float(os.environ.get("SSBL_CS3_DAMPING1_MAX_EDGE_RATIO", "1.45"))
+DAMPING1_SOFT_MAX_EDGE_RATIO_LIMIT = float(os.environ.get("SSBL_CS3_DAMPING1_SOFT_MAX_EDGE_RATIO", "1.85"))
 REVERSE_JITTER_FRACTION_LIMIT = float(os.environ.get("SSBL_CS3_REVERSE_JITTER_FRACTION", "0.015"))
 REVERSE_JITTER_PEAK_FRAME_FRACTION_LIMIT = float(
     os.environ.get("SSBL_CS3_REVERSE_JITTER_PEAK_FRAME_FRACTION", "0.06")
 )
+LATE_EDGE_RATIO_GROWTH_LIMIT = float(os.environ.get("SSBL_CS3_LATE_EDGE_RATIO_GROWTH", "1.05"))
 RESTORE_TOLERANCE = float(os.environ.get("SSBL_CS3_RESTORE_TOLERANCE", "1.0e-7"))
 SKIP_RENDER = os.environ.get("SSBL_CS3_SKIP_RENDER", "0").strip().lower() in {"1", "true", "yes", "on"}
 DEBUG_JITTER = os.environ.get("SSBL_CS3_DEBUG_JITTER", "0").strip().lower() in {"1", "true", "yes", "on"}
@@ -46,6 +49,12 @@ FORCE_PRESSURE_STRENGTH = (
     None
     if FORCE_PRESSURE_STRENGTH_RAW is None or FORCE_PRESSURE_STRENGTH_RAW.strip() == ""
     else float(FORCE_PRESSURE_STRENGTH_RAW)
+)
+FORCE_DAMPING_RAW = os.environ.get("SSBL_CS3_FORCE_DAMPING")
+FORCE_DAMPING = (
+    None
+    if FORCE_DAMPING_RAW is None or FORCE_DAMPING_RAW.strip() == ""
+    else float(FORCE_DAMPING_RAW)
 )
 
 
@@ -246,6 +255,7 @@ def _summary_failures(summary: dict) -> list[str]:
     reverse_jitter_peak_limit = float(
         limits.get("reverse_jitter_peak_frame_fraction", REVERSE_JITTER_PEAK_FRAME_FRACTION_LIMIT)
     )
+    late_edge_growth_limit = float(limits.get("late_edge_ratio_growth", LATE_EDGE_RATIO_GROWTH_LIMIT))
     if int(summary["frames_sampled"]) != int(FRAME_COUNT):
         failures.append(f"frames_sampled {summary['frames_sampled']} != {FRAME_COUNT}")
     if not bool(summary["finite"]):
@@ -264,6 +274,8 @@ def _summary_failures(summary: dict) -> list[str]:
         failures.append(
             f"reverse_jitter_peak_frame_fraction {summary['reverse_jitter_peak_frame_fraction']} > {reverse_jitter_peak_limit}"
         )
+    if float(summary["late_edge_ratio_growth"]) > late_edge_growth_limit:
+        failures.append(f"late_edge_ratio_growth {summary['late_edge_ratio_growth']} > {late_edge_growth_limit}")
     return failures
 
 
@@ -322,11 +334,27 @@ def main() -> None:
             settings.use_volume_pressure = FORCE_PRESSURE_STRENGTH > 0.0
         if hasattr(settings, "pressure_strength"):
             settings.pressure_strength = float(FORCE_PRESSURE_STRENGTH)
+    if FORCE_DAMPING is not None:
+        if hasattr(obj, "ssbl_cloth"):
+            settings = obj.ssbl_cloth
+            settings.enabled = True
+            settings_scope = "object"
+        if hasattr(settings, "damping"):
+            settings.damping = max(0.0, min(float(FORCE_DAMPING), 1.0))
     settings.frame_count = FRAME_COUNT
     settings.preview_writeback_interval = 1
     settings_snapshot = _settings_snapshot(settings, settings_scope)
     forced_hardness = FORCE_OBJECT_HARDNESS is not None
-    max_edge_ratio_limit = HARDNESS1_MAX_EDGE_RATIO_LIMIT if forced_hardness else MAX_EDGE_RATIO_LIMIT
+    forced_damping1 = FORCE_DAMPING is not None and float(FORCE_DAMPING) >= 0.999
+    forced_soft_hardness = forced_hardness and float(FORCE_OBJECT_HARDNESS) <= 0.05
+    if forced_damping1 and forced_soft_hardness:
+        max_edge_ratio_limit = DAMPING1_SOFT_MAX_EDGE_RATIO_LIMIT
+    elif forced_damping1:
+        max_edge_ratio_limit = DAMPING1_MAX_EDGE_RATIO_LIMIT
+    elif forced_hardness:
+        max_edge_ratio_limit = HARDNESS1_MAX_EDGE_RATIO_LIMIT
+    else:
+        max_edge_ratio_limit = MAX_EDGE_RATIO_LIMIT
     mean_rms_step_limit = HARDNESS1_MEAN_RMS_STEP_LIMIT if forced_hardness else MEAN_RMS_STEP_LIMIT
     scene.frame_start = 1
     scene.frame_end = max(int(scene.frame_end), FRAME_COUNT + 1)
@@ -365,6 +393,7 @@ def main() -> None:
     abi41_lra_tack_count = 0
     abi41_tack_jitter_guarded = 0
     max_edge_ratio = 1.0
+    edge_ratios: list[float] = []
     worst_edge_peak = {
         "frame": 0,
         "edge_index": -1,
@@ -417,6 +446,7 @@ def main() -> None:
         raw_rms_steps.append(float(np.sqrt(np.mean(raw_step_lengths * raw_step_lengths))))
         worst_edge = _slot_worst_edge(slot, frame)
         max_edge_ratio = max(max_edge_ratio, float(worst_edge["ratio"]))
+        edge_ratios.append(float(worst_edge["ratio"]))
         if float(worst_edge["ratio"]) > float(worst_edge_peak["ratio"]):
             worst_edge_peak = worst_edge
 
@@ -441,6 +471,15 @@ def main() -> None:
     restore_delta = _restore_delta(obj, source_mesh, source_before)
     video = "" if SKIP_RENDER else _encode_video(frames_dir, video_path, frames_sampled)
     elapsed_s = time.perf_counter() - started
+    late_window = min(100, len(edge_ratios))
+    if late_window > 1:
+        late_edge_ratio_start = float(edge_ratios[-late_window])
+        late_edge_ratio_end = float(edge_ratios[-1])
+        late_edge_ratio_growth = late_edge_ratio_end / max(late_edge_ratio_start, 1.0e-8)
+    else:
+        late_edge_ratio_start = float(edge_ratios[0]) if edge_ratios else 1.0
+        late_edge_ratio_end = late_edge_ratio_start
+        late_edge_ratio_growth = 1.0
 
     summary = {
         "blend_file": bpy.data.filepath,
@@ -457,6 +496,9 @@ def main() -> None:
         "stopped": bool(stopped),
         "restore_delta": float(restore_delta),
         "max_edge_ratio": float(max_edge_ratio),
+        "late_edge_ratio_start": float(late_edge_ratio_start),
+        "late_edge_ratio_end": float(late_edge_ratio_end),
+        "late_edge_ratio_growth": float(late_edge_ratio_growth),
         "worst_edge_peak": worst_edge_peak,
         "max_step": float(max_step),
         "mean_rms_step": float(np.mean(rms_steps)) if rms_steps else 0.0,
@@ -491,6 +533,7 @@ def main() -> None:
             "mean_rms_step": float(mean_rms_step_limit),
             "reverse_jitter_fraction": float(REVERSE_JITTER_FRACTION_LIMIT),
             "reverse_jitter_peak_frame_fraction": float(REVERSE_JITTER_PEAK_FRAME_FRACTION_LIMIT),
+            "late_edge_ratio_growth": float(LATE_EDGE_RATIO_GROWTH_LIMIT),
             "restore_delta": float(RESTORE_TOLERANCE),
         },
         "frame_paths": frame_paths,

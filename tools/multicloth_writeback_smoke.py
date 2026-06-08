@@ -127,6 +127,9 @@ def main() -> None:
         skipped_writeback_ms = float(skipped_diag.writeback_ms)
         skipped_download_ms = float(skipped_diag.download_ms)
         skipped_dynamic_triangles = int(skipped_diag.dynamic_triangle_count)
+        skipped_dynamic_particles = int(skipped_diag.dynamic_particle_count)
+        skipped_particle_overflow = int(skipped_diag.dynamic_particle_overflow)
+        skipped_contact_cache_overflow = int(skipped_diag.external_contact_cache_overflow)
 
         session.adaptive_writeback_interval = 8
         first.ssbl_cloth.gravity = (0.0, 0.0, -18.0)
@@ -152,6 +155,9 @@ def main() -> None:
             "skipped_writeback_ms": skipped_writeback_ms,
             "skipped_download_ms": skipped_download_ms,
             "skipped_dynamic_triangle_count": skipped_dynamic_triangles,
+            "skipped_dynamic_particle_count": skipped_dynamic_particles,
+            "skipped_dynamic_particle_overflow": skipped_particle_overflow,
+            "skipped_contact_cache_overflow": skipped_contact_cache_overflow,
             "tuning_writeback": tuning_writeback,
             "end_writeback": end_writeback,
             "finite": bool(finite),
@@ -168,6 +174,9 @@ def main() -> None:
             and result["skipped_writeback_ms"] == 0.0
             and result["skipped_download_ms"] > 0.0
             and result["skipped_dynamic_triangle_count"] > 0
+            and result["skipped_dynamic_particle_count"] > 0
+            and result["skipped_dynamic_particle_overflow"] == 0
+            and result["skipped_contact_cache_overflow"] == 0
             and result["tuning_writeback"]
             and result["end_writeback"]
             and result["finite"]

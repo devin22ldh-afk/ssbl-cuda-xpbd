@@ -55,7 +55,13 @@ constexpr int kAbi41CountLraTacks = 12;
 constexpr int kAbi41CountBendingWings = 13;
 constexpr int kAbi41CountTackGuards = 14;
 constexpr int kAbi41CountBendingGuards = 15;
-constexpr int kAbi41CountSlots = 16;
+constexpr int kAbi41CountFastOverlapIslandCandidates = 16;
+constexpr int kAbi41CountFastOverlapIslandClusters = 17;
+constexpr int kAbi41CountFastOverlapIslandVertexRefs = 18;
+constexpr int kAbi41CountFastOverlapIslandAppliedVertices = 19;
+constexpr int kAbi41CountFastOverlapIslandGuarded = 20;
+constexpr int kAbi41CountFastOverlapIslandMaxDeltaMicrounits = 21;
+constexpr int kAbi41CountSlots = 22;
 constexpr float kAbi41SpringRelaxation = 0.18f;
 constexpr float kAbi41StretchStrengthScale = 2.5f;
 constexpr float kAbi41StretchPrevSyncScale = 0.08f;
@@ -98,10 +104,19 @@ constexpr int kAbi41ExtremeStretchHardCapPasses = 3;
 constexpr float kAbi41LraPrevSyncScale = 0.32f;
 constexpr float kAbi41BendPrevSyncScale = 0.06f;
 constexpr float kAbi41SelfPrevSyncScale = 0.08f;
+constexpr float kAbi41ConstraintAdditiveVelocityFeedback = 0.9f;
+constexpr float kAbi41ConstraintVelocityMaxDeltaScale = 0.35f;
+constexpr float kAbi41ConstraintVelocityMaxDeltaFloor = 2.0e-4f;
 constexpr float kAbi41DynamicNeighborImpulseScale = 0.5f;
 constexpr float kAbi41BendRelaxation = 0.10f;
 constexpr float kAbi41TackRelaxation = 0.35f;
 constexpr float kAbi41SelfAveragingClampScale = 0.35f;
+constexpr int kSelfCollisionModeFast = 1;
+constexpr int kAbi41FastOverlapIslandMinContacts = 3;
+constexpr int kAbi41FastOverlapIslandMaxContacts = 48;
+constexpr float kAbi41FastOverlapIslandCorrectionScale = 0.50f;
+constexpr float kAbi41FastOverlapIslandMaxDeltaScale = 0.30f;
+constexpr float kAbi41FastOverlapIslandMinAvgDepthScale = 0.04f;
 constexpr float kPinHardWeightThreshold = 0.75f;
 constexpr int kAbi41PcgMaxIterations = 8;
 constexpr int kAbi41PcgReductionDAD = 0;
@@ -497,6 +512,25 @@ __device__ void abi41_count(Abi41Solver solver, int slot) {
             atomicAdd(&solver.abi41_counts[slot], static_cast<unsigned long long>(__popc(mask)));
         }
     }
+}
+
+__device__ void abi41_count_add(Abi41Solver solver, int slot, unsigned long long value) {
+    if (solver.abi41_counts && slot >= 0 && slot < kAbi41CountSlots && value > 0ull) {
+        atomicAdd(&solver.abi41_counts[slot], value);
+    }
+}
+
+__device__ void abi41_count_max_delta_microunits(Abi41Solver solver, int slot, float delta) {
+    if (!solver.abi41_counts
+        || slot < 0
+        || slot >= kAbi41CountSlots
+        || !isfinite(delta)
+        || delta <= 0.0f) {
+        return;
+    }
+    const float clamped = fminf(delta, 1024.0f);
+    const unsigned long long microunits = static_cast<unsigned long long>(clamped * 1000000.0f);
+    atomicMax(&solver.abi41_counts[slot], microunits);
 }
 
 __device__ void abi41_count_hard_cap_clamp(Abi41Solver solver) {
@@ -3883,6 +3917,221 @@ __global__ void abi41_soft_vertex_triangle_repulsion_kernel(Abi41Solver solver) 
     }
 }
 
+__global__ void abi41_fast_overlap_island_aggregate_kernel(Abi41Solver solver) {
+    const int vertex = blockIdx.x * blockDim.x + threadIdx.x;
+    if (solver.cfg.self_collision_mode != kSelfCollisionModeFast
+        || vertex >= solver.cfg.vertex_count
+        || !solver.triangles
+        || !solver.self_triangle_bucket_counts
+        || !solver.self_triangle_bucket_indices
+        || solver.self_triangle_hash_bucket_count <= 0) {
+        return;
+    }
+    if (solver.inv_mass[vertex] <= 0.0f
+        || (solver.state_flags[vertex] & ssbl_abi41::kPinnedOrKinematicFlag) != 0u) {
+        return;
+    }
+
+    const float target = abi41_self_contact_radius(solver.cfg);
+    if (target <= 0.0f) {
+        return;
+    }
+    const float onset = fmaxf(target * 1.8f, target + kEps);
+    Vec3 p = solver.pos[vertex];
+    Vec3 p_prev = solver.prev[vertex];
+    if (!finite_vec(p) || !finite_vec(p_prev)) {
+        abi41_count(solver, kAbi41CountFastOverlapIslandGuarded);
+        return;
+    }
+
+    int max_neighbors = solver.cfg.max_self_collision_neighbors;
+    if (max_neighbors < 1) {
+        max_neighbors = 1;
+    }
+    int max_contacts = max_neighbors * 2;
+    if (max_contacts > kAbi41FastOverlapIslandMaxContacts) {
+        max_contacts = kAbi41FastOverlapIslandMaxContacts;
+    }
+    if (max_contacts < kAbi41FastOverlapIslandMinContacts) {
+        max_contacts = kAbi41FastOverlapIslandMinContacts;
+    }
+    const int scan_limit = max_contacts * 10;
+    int accepted_triangles[kAbi41FastOverlapIslandMaxContacts];
+
+    const int cx = cell_coord(p.x, solver.self_triangle_hash_cell_size);
+    const int cy = cell_coord(p.y, solver.self_triangle_hash_cell_size);
+    const int cz = cell_coord(p.z, solver.self_triangle_hash_cell_size);
+    int scanned = 0;
+    int contact_count = 0;
+    float penetration_sum = 0.0f;
+    float sample_weight_sum = 0.0f;
+    float max_penetration = 0.0f;
+    Vec3 weighted_axis = make_vec3(0.0f, 0.0f, 0.0f);
+    Vec3 best_normal = make_vec3(0.0f, 0.0f, 1.0f);
+
+    for (int dz = -1; dz <= 1 && contact_count < max_contacts && scanned < scan_limit; ++dz) {
+        for (int dy = -1; dy <= 1 && contact_count < max_contacts && scanned < scan_limit; ++dy) {
+            for (int dx = -1; dx <= 1 && contact_count < max_contacts && scanned < scan_limit; ++dx) {
+                const unsigned int bucket = hash_cell(
+                    cx + dx,
+                    cy + dy,
+                    cz + dz,
+                    solver.self_triangle_hash_bucket_count
+                );
+                const int stored = solver.self_triangle_bucket_counts[bucket];
+                const int limit = stored < kAbi41SelfTriangleHashBucketSlots
+                    ? stored
+                    : kAbi41SelfTriangleHashBucketSlots;
+                for (int slot = 0; slot < limit && contact_count < max_contacts && scanned < scan_limit; ++slot) {
+                    ++scanned;
+                    const int triangle_index = solver.self_triangle_bucket_indices[
+                        static_cast<int>(bucket) * kAbi41SelfTriangleHashBucketSlots + slot
+                    ];
+                    bool duplicate = false;
+                    for (int seen = 0; seen < contact_count; ++seen) {
+                        if (accepted_triangles[seen] == triangle_index) {
+                            duplicate = true;
+                            break;
+                        }
+                    }
+                    if (duplicate) {
+                        continue;
+                    }
+                    if (triangle_index < 0 || triangle_index >= solver.cfg.triangle_count) {
+                        abi41_count(solver, kAbi41CountFastOverlapIslandGuarded);
+                        continue;
+                    }
+                    const ReconTriangle tri = solver.triangles[triangle_index];
+                    if (!abi41_triangle_indices_valid(solver, tri)
+                        || abi41_rest_vertex_triangle_neighbor(solver, vertex, tri, target, onset)) {
+                        continue;
+                    }
+                    const int ia = static_cast<int>(tri.v0);
+                    const int ib = static_cast<int>(tri.v1);
+                    const int ic = static_cast<int>(tri.v2);
+                    const Vec3 a = solver.pos[ia];
+                    const Vec3 b = solver.pos[ib];
+                    const Vec3 c = solver.pos[ic];
+                    const Vec3 a_prev = solver.prev[ia];
+                    const Vec3 b_prev = solver.prev[ib];
+                    const Vec3 c_prev = solver.prev[ic];
+                    if (!finite_vec(a) || !finite_vec(b) || !finite_vec(c)
+                        || !finite_vec(a_prev) || !finite_vec(b_prev) || !finite_vec(c_prev)) {
+                        abi41_count(solver, kAbi41CountFastOverlapIslandGuarded);
+                        continue;
+                    }
+
+                    const Vec3 q = closest_point_on_triangle(p, a, b, c);
+                    Vec3 delta = sub(p, q);
+                    const float dist_sq = dot(delta, delta);
+                    float dist = sqrtf(fmaxf(dist_sq, kEps));
+                    if (dist >= target) {
+                        continue;
+                    }
+
+                    Vec3 normal = make_vec3(0.0f, 0.0f, 1.0f);
+                    if (dist_sq > kEps) {
+                        normal = mul(delta, 1.0f / dist);
+                    } else {
+                        normal = cross(sub(b, a), sub(c, a));
+                        const float n_len_sq = dot(normal, normal);
+                        if (n_len_sq > kEps) {
+                            normal = mul(normal, rsqrtf(n_len_sq));
+                        } else {
+                            const Vec3 rest_delta = sub(solver.rest[vertex], closest_point_on_triangle(
+                                solver.rest[vertex],
+                                solver.rest[ia],
+                                solver.rest[ib],
+                                solver.rest[ic]
+                            ));
+                            const float rest_len_sq = dot(rest_delta, rest_delta);
+                            if (rest_len_sq > kEps) {
+                                normal = mul(rest_delta, rsqrtf(rest_len_sq));
+                            }
+                        }
+                        delta = mul(normal, dist);
+                        dist = 0.0f;
+                    }
+                    if (!finite_vec(normal)) {
+                        abi41_count(solver, kAbi41CountFastOverlapIslandGuarded);
+                        continue;
+                    }
+
+                    const Vec3 q_prev = closest_point_on_triangle(p_prev, a_prev, b_prev, c_prev);
+                    const Vec3 prev_delta = sub(p_prev, q_prev);
+                    if (dot(prev_delta, normal) > target * 0.25f && dot(delta, normal) > -target * 0.10f) {
+                        continue;
+                    }
+
+                    float wa = 1.0f / 3.0f;
+                    float wb = 1.0f / 3.0f;
+                    float wc = 1.0f / 3.0f;
+                    triangle_barycentric(q, a, b, c, &wa, &wb, &wc);
+                    const float penetration = target - dist;
+                    if (penetration <= 0.0f) {
+                        continue;
+                    }
+
+                    accepted_triangles[contact_count] = triangle_index;
+                    ++contact_count;
+                    penetration_sum += penetration;
+                    sample_weight_sum += solver.inv_mass[ia] * wa + solver.inv_mass[ib] * wb + solver.inv_mass[ic] * wc;
+                    weighted_axis = add(weighted_axis, mul(normal, penetration));
+                    if (penetration > max_penetration) {
+                        max_penetration = penetration;
+                        best_normal = normal;
+                    }
+                }
+            }
+        }
+    }
+
+    if (contact_count <= 0) {
+        return;
+    }
+    abi41_count_add(
+        solver,
+        kAbi41CountFastOverlapIslandCandidates,
+        static_cast<unsigned long long>(contact_count)
+    );
+    if (contact_count < kAbi41FastOverlapIslandMinContacts) {
+        abi41_count(solver, kAbi41CountFastOverlapIslandGuarded);
+        return;
+    }
+
+    const float avg_penetration = penetration_sum / static_cast<float>(contact_count);
+    if (avg_penetration < target * kAbi41FastOverlapIslandMinAvgDepthScale) {
+        abi41_count(solver, kAbi41CountFastOverlapIslandGuarded);
+        return;
+    }
+
+    const float axis_len = length(weighted_axis);
+    const Vec3 aggregate_normal = axis_len > kEps ? mul(weighted_axis, 1.0f / axis_len) : best_normal;
+    const float source_weight = solver.inv_mass[vertex];
+    const float sample_weight = sample_weight_sum / static_cast<float>(contact_count);
+    const float mass_share = source_weight / fmaxf(source_weight + sample_weight, kEps);
+    const float max_delta = fmaxf(target * kAbi41FastOverlapIslandMaxDeltaScale, 1.0e-5f);
+    const float delta_len = fminf(avg_penetration * kAbi41FastOverlapIslandCorrectionScale * mass_share, max_delta);
+    if (!finite_vec(aggregate_normal) || !isfinite(delta_len) || delta_len <= kEps) {
+        abi41_count(solver, kAbi41CountFastOverlapIslandGuarded);
+        return;
+    }
+
+    abi41_accumulate_self_delta(solver, vertex, mul(aggregate_normal, delta_len), 1.0f);
+    abi41_count(solver, kAbi41CountFastOverlapIslandClusters);
+    abi41_count_add(
+        solver,
+        kAbi41CountFastOverlapIslandVertexRefs,
+        static_cast<unsigned long long>(contact_count)
+    );
+    abi41_count(solver, kAbi41CountFastOverlapIslandAppliedVertices);
+    abi41_count_max_delta_microunits(
+        solver,
+        kAbi41CountFastOverlapIslandMaxDeltaMicrounits,
+        delta_len
+    );
+}
+
 __host__ __device__ float clamp01(float value) {
     return fminf(fmaxf(value, 0.0f), 1.0f);
 }
@@ -4223,7 +4472,35 @@ __global__ void abi41_update_velocity_kernel(Abi41Solver solver, float dt) {
         solver.vel[i] = make_vec3(0.0f, 0.0f, 0.0f);
         return;
     }
-    solver.vel[i] = mul(sub(solver.pos[i], solver.prev[i]), 1.0f / fmaxf(dt, kEps));
+    const float safe_dt = fmaxf(dt, kEps);
+    const Vec3 measured_velocity = mul(sub(solver.pos[i], solver.prev[i]), 1.0f / safe_dt);
+    const Vec3 base_velocity = solver.vel[i];
+    if (!finite_vec(measured_velocity) || !finite_vec(base_velocity)) {
+        solver.vel[i] = make_vec3(0.0f, 0.0f, 0.0f);
+        return;
+    }
+    Vec3 projection_velocity = sub(measured_velocity, base_velocity);
+    const float projection_dot_base = dot(projection_velocity, base_velocity);
+    const float feedback_scale = (isfinite(projection_dot_base) && projection_dot_base > 0.0f)
+        ? kAbi41ConstraintAdditiveVelocityFeedback
+        : 1.0f;
+    const float max_feedback_delta = fmaxf(
+        kAbi41ConstraintVelocityMaxDeltaFloor,
+        fmaxf(solver.cfg.cloth_thickness, 0.0f) * kAbi41ConstraintVelocityMaxDeltaScale
+    );
+    const float max_feedback_speed = max_feedback_delta / safe_dt;
+    Vec3 feedback_velocity = mul(projection_velocity, feedback_scale);
+    const float feedback_speed = length(feedback_velocity);
+    if (feedback_scale < 1.0f
+        && isfinite(feedback_speed)
+        && feedback_speed > max_feedback_speed
+        && feedback_speed > kEps) {
+        feedback_velocity = mul(feedback_velocity, max_feedback_speed / feedback_speed);
+    }
+    if (!finite_vec(feedback_velocity)) {
+        feedback_velocity = make_vec3(0.0f, 0.0f, 0.0f);
+    }
+    solver.vel[i] = add(base_velocity, feedback_velocity);
 }
 
 template <typename T>
@@ -5976,6 +6253,25 @@ bool fetch_abi41_counts(Abi41Solver* solver) {
     solver->diag.abi41_bending_texture_ready = solver->bending_texture_ready;
     solver->diag.abi41_tack_jitter_guarded = static_cast<long long>(counts[kAbi41CountTackGuards]);
     solver->diag.abi41_bending_guarded = static_cast<long long>(counts[kAbi41CountBendingGuards]);
+    solver->diag.fast_overlap_island_candidates =
+        static_cast<long long>(counts[kAbi41CountFastOverlapIslandCandidates]);
+    solver->diag.fast_overlap_island_clusters =
+        static_cast<long long>(counts[kAbi41CountFastOverlapIslandClusters]);
+    solver->diag.fast_overlap_island_vertex_refs =
+        static_cast<long long>(counts[kAbi41CountFastOverlapIslandVertexRefs]);
+    solver->diag.fast_overlap_island_applied_vertices =
+        static_cast<long long>(counts[kAbi41CountFastOverlapIslandAppliedVertices]);
+    solver->diag.fast_overlap_island_guarded =
+        static_cast<long long>(counts[kAbi41CountFastOverlapIslandGuarded]);
+    solver->diag.fast_overlap_island_max_delta =
+        static_cast<float>(counts[kAbi41CountFastOverlapIslandMaxDeltaMicrounits]) * 1.0e-6f;
+    solver->diag.fast_cc_overlap_components = 0;
+    solver->diag.fast_cc_overlap_seed_triangles = 0;
+    solver->diag.fast_cc_overlap_owned_vertices = 0;
+    solver->diag.fast_cc_overlap_union_edges = 0;
+    solver->diag.fast_cc_overlap_guarded = 0;
+    solver->diag.fast_cc_overlap_applied_vertices = 0;
+    solver->diag.fast_cc_overlap_max_delta = 0.0f;
     if (!update_pcg_diag_from_device_reductions(solver, "fetch final PCG reductions")) {
         return false;
     }
@@ -6726,6 +7022,7 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
                 }
                 const int self_passes = std::max(1, std::min(solver->cfg.fast_self_collision_passes, 8));
                 for (int self_pass = 0; self_pass < self_passes; ++self_pass) {
+                    const bool final_self_pass = self_pass == self_passes - 1;
                     const auto self_solve_started = std::chrono::high_resolution_clock::now();
                     if (!reset_self_accumulation(solver) || !build_self_neighbor_table(solver)) {
                         return 0;
@@ -6744,6 +7041,12 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
                         } else {
                             abi41_soft_edge_edge_repulsion_kernel<<<e_blocks, kThreads>>>(*solver);
                         }
+                    }
+                    if (final_self_pass
+                        && solver->cfg.self_collision_mode == kSelfCollisionModeFast
+                        && solver->cfg.triangle_count > 0
+                        && solver->self_triangle_hash_ready != 0) {
+                        abi41_fast_overlap_island_aggregate_kernel<<<v_blocks, kThreads>>>(*solver);
                     }
                     abi41_averaging_position_kernel<<<v_blocks, kThreads>>>(*solver);
                     abi41_apply_self_averaged_delta_kernel<<<v_blocks, kThreads>>>(*solver);

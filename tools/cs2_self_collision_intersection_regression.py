@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import argparse
+from dataclasses import replace
+import importlib.util
 import json
 import math
 import os
+from pathlib import Path
 import sys
 import time
 
@@ -47,14 +51,63 @@ def _float_env(name: str, default: float) -> float:
         return float(default)
 
 
-def _find_target() -> bpy.types.Object:
-    obj = bpy.data.objects.get(TARGET_OBJECT)
+def _script_argv() -> list[str]:
+    return sys.argv[sys.argv.index("--") + 1 :] if "--" in sys.argv else []
+
+
+def _load_quality_gate_module():
+    path = Path(__file__).with_name("cs2_fast_quality_gate.py")
+    spec = importlib.util.spec_from_file_location("ssbl_cs2_fast_quality_gate", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not load quality gate module from {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _parse_args() -> argparse.Namespace:
+    gate_module = _load_quality_gate_module()
+    gate_default = _bool_env("SSBL_CS2_QUALITY_GATE", _bool_env("SSBL_CS2_FAIL_ON_INTERSECTION", True))
+    parser = argparse.ArgumentParser(description="Run CS2 self-collision intersection diagnostics and quality gate.")
+    parser.add_argument("--blend", default=BLEND_PATH)
+    parser.add_argument("--target", default=TARGET_OBJECT)
+    parser.add_argument("--steps", type=int, default=_int_env("SSBL_CS2_STEPS", 60))
+    parser.add_argument("--max-report", type=int, default=_int_env("SSBL_CS2_MAX_REPORT", 1000))
+    parser.add_argument("--quality-gate", dest="quality_gate", action="store_true", default=gate_default)
+    parser.add_argument("--no-quality-gate", dest="quality_gate", action="store_false")
+    parser.add_argument(
+        "--fail-on-raw-intersection",
+        action="store_true",
+        default=_bool_env("SSBL_CS2_FAIL_ON_RAW_INTERSECTION", False),
+        help="Compatibility flag; fails when raw intersection_count_capped is not strictly below 1.",
+    )
+    parser.add_argument(
+        "--preview-summary",
+        type=Path,
+        default=None,
+        help="Optional record_scene_monkey_preview.py summary.json for visual-stability classification.",
+    )
+    gate_module.add_threshold_arguments(parser)
+    return parser.parse_args(_script_argv())
+
+
+def _thresholds_from_args(args: argparse.Namespace):
+    gate_module = _load_quality_gate_module()
+    thresholds = gate_module.thresholds_from_args(args, gate_module.thresholds_from_env(("SSBL_CS2_GATE",)))
+    if args.fail_on_raw_intersection and thresholds.raw_intersection_lt is None:
+        thresholds = replace(thresholds, raw_intersection_lt=1)
+    return thresholds
+
+
+def _find_target(target_name: str) -> bpy.types.Object:
+    obj = bpy.data.objects.get(target_name)
     if obj is not None and obj.type == "MESH":
         return obj
     active = bpy.context.view_layer.objects.active
     if active is not None and active.type == "MESH":
         return active
-    raise RuntimeError(f"Target mesh object not found: {TARGET_OBJECT}")
+    raise RuntimeError(f"Target mesh object not found: {target_name}")
 
 
 def _select_only(obj: bpy.types.Object) -> None:
@@ -236,8 +289,9 @@ def _apply_object_overrides(settings, steps: int) -> None:
 
 
 def main() -> None:
-    if BLEND_PATH:
-        bpy.ops.wm.open_mainfile(filepath=BLEND_PATH, load_ui=False)
+    args = _parse_args()
+    if args.blend:
+        bpy.ops.wm.open_mainfile(filepath=str(args.blend), load_ui=False)
 
     import ssbl
     from ssbl import xpbd_core
@@ -248,13 +302,13 @@ def main() -> None:
         pass
     ssbl.register()
 
-    obj = _find_target()
+    obj = _find_target(str(args.target))
     _select_only(obj)
     if not hasattr(obj, "ssbl_cloth"):
         raise RuntimeError(f"{obj.name} has no ssbl_cloth settings")
     settings = obj.ssbl_cloth
-    steps = _int_env("SSBL_CS2_STEPS", 60)
-    max_report = _int_env("SSBL_CS2_MAX_REPORT", 1000)
+    steps = max(1, int(args.steps))
+    max_report = max(1, int(args.max_report))
     _apply_object_overrides(settings, steps)
     pin_count = _ensure_pin_group(obj, settings)
 
@@ -336,6 +390,7 @@ def main() -> None:
         "native_max_penetration": float(max(0.0, -float(getattr(diag, "min_gap", 0.0) or 0.0))),
         "native_resolved_contacts": int(getattr(diag, "resolved_contacts", 0)),
         "native_candidate_count": int(getattr(diag, "candidate_count", 0)),
+        "native_ccd_clamp_count": int(getattr(diag, "ccd_clamp_count", 0)),
         "native_recovery_passes": int(getattr(diag, "recovery_passes", 0)),
         "native_local_retry_count": int(getattr(diag, "local_retry_count", 0)),
         "native_fast_exact_vt_candidates": int(getattr(diag, "fast_exact_vt_candidates", 0)),
@@ -377,24 +432,20 @@ def main() -> None:
         "initial": initial_collision,
         **collision,
     }
+    gate_module = _load_quality_gate_module()
+    preview_summary = gate_module.load_summary(args.preview_summary) if args.preview_summary else None
+    gate_result = gate_module.evaluate_summary(
+        summary,
+        preview_summary=preview_summary,
+        thresholds=_thresholds_from_args(args),
+    )
+    summary["quality_gate"] = gate_result
     print("SSBL_CS2_SELF_INTERSECTION_REGRESSION " + json.dumps(summary, ensure_ascii=False, sort_keys=True))
+    print("SSBL_CS2_FAST_QUALITY_GATE " + json.dumps(gate_result, ensure_ascii=False, sort_keys=True))
 
-    should_fail = _bool_env("SSBL_CS2_FAIL_ON_INTERSECTION", True)
-    if should_fail:
-        if not bool(summary["finite"]):
-            raise RuntimeError("CS2 self-collision regression failed: non-finite vertices")
-        if float(summary["restore_delta"]) > 1.0e-7:
-            raise RuntimeError(f"CS2 self-collision regression failed: restore_delta={summary['restore_delta']}")
-        fail_on_raw = _bool_env("SSBL_CS2_FAIL_ON_RAW_INTERSECTION", False)
-        intersection_key = (
-            "intersection_count_capped"
-            if fail_on_raw
-            else "solver_relevant_intersection_count_capped"
-        )
-        if int(summary[intersection_key]) > 0:
-            raise RuntimeError(
-                f"CS2 self-collision regression failed: {intersection_key}={summary[intersection_key]}"
-            )
+    if args.quality_gate and not bool(gate_result["passed"]):
+        categories = ", ".join(gate_result["failure_categories"])
+        raise RuntimeError(f"CS2 fast quality gate failed: {categories}")
 
 
 if __name__ == "__main__":

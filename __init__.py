@@ -345,7 +345,7 @@ class SSBL_PreviewSettings(PropertyGroup):
     )
     damping: FloatProperty(
         name="速度阻尼",
-        default=0.999,
+        default=1.0,
         min=0.0,
         max=1.0,
         description="每个子步施加的速度阻尼",

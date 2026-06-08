@@ -170,6 +170,15 @@ def _run_case(label: str, mode: str) -> dict[str, object]:
         "hash_build_ms": round(float(diagnostics.hash_build_ms), 3),
         "dynamic_triangle_count": int(diagnostics.dynamic_triangle_count),
         "static_triangle_count": int(diagnostics.static_triangle_count),
+        "static_sdf_rebuild_count": int(diagnostics.static_sdf_rebuild_count),
+        "static_sdf_voxel_count": int(diagnostics.static_sdf_voxel_count),
+        "static_sdf_grid": [
+            int(diagnostics.static_sdf_grid_x),
+            int(diagnostics.static_sdf_grid_y),
+            int(diagnostics.static_sdf_grid_z),
+        ],
+        "static_sdf_contact_count": int(diagnostics.static_sdf_contact_count),
+        "static_sdf_unsigned_fallback_count": int(diagnostics.static_sdf_unsigned_fallback_count),
         "candidate_count": int(diagnostics.candidate_count),
         "resolved_contacts": int(diagnostics.resolved_contacts),
     }
@@ -207,14 +216,19 @@ def main() -> None:
             and analytic["slots"] == 1
             and analytic["analytic_collision_ms"] >= 0.0
             and analytic["dynamic_triangle_count"] == 0
+            and analytic["static_sdf_rebuild_count"] == 0
             and float(analytic["avg_frame_ms"]) < analytic_threshold
             and static_mesh["slots"] == 1
             and static_mesh["static_triangle_count"] > 0
             and static_mesh["dynamic_triangle_count"] == 0
+            and static_mesh["static_sdf_rebuild_count"] > 0
+            and static_mesh["static_sdf_voxel_count"] > 0
+            and all(value > 1 for value in static_mesh["static_sdf_grid"])
             and cloth_enabled["slots"] == 1
             and cloth_enabled["cross_mode"] == "off"
             and cloth_enabled["dynamic_triangle_count"] == 0
             and cloth_enabled["analytic_collision_ms"] >= 0.0
+            and cloth_enabled["static_sdf_rebuild_count"] == 0
         ):
             raise RuntimeError(f"Sphere collision perf A/B failed: {result}")
     finally:

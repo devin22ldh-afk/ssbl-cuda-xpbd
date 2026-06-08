@@ -12,6 +12,7 @@ if ADDONS_ROOT not in sys.path:
     sys.path.insert(0, ADDONS_ROOT)
 
 import ssbl
+from ssbl import collision
 
 
 MARGIN = 0.05
@@ -180,7 +181,7 @@ def _static_sdf_summary(obj):
     }
 
 
-def _assert_static_sdf_diagnostics(label, diag, min_triangles=1):
+def _assert_static_sdf_diagnostics(label, diag, min_triangles=1, require_contacts=True):
     if not diag["finite"]:
         raise RuntimeError(f"{label} native diagnostics reported non-finite output")
     if diag["static_triangle_count"] < min_triangles:
@@ -189,7 +190,7 @@ def _assert_static_sdf_diagnostics(label, diag, min_triangles=1):
         raise RuntimeError(f"{label} did not report a built static SDF: {diag}")
     if any(value <= 1 for value in diag["static_sdf_grid"]):
         raise RuntimeError(f"{label} reported invalid static SDF grid: {diag}")
-    if diag["static_sdf_contact_count"] <= 0:
+    if require_contacts and diag["static_sdf_contact_count"] <= 0:
         raise RuntimeError(f"{label} did not report SDF contacts: {diag}")
 
 
@@ -395,6 +396,70 @@ def _run_moving_static_collider_case():
     }
 
 
+def _run_static_sdf_unchanged_case():
+    label = "unchanged_static_mesh"
+    _clear_scene()
+    collision.clear_static_collision_cache()
+    scene = bpy.context.scene
+    scene.frame_set(1)
+    scene.frame_start = 1
+    scene.frame_end = 120
+
+    settings = scene.ssbl_preview
+    _configure_common(settings)
+    settings.static_collider_collection = _make_static_plane_collection(0.0)
+    collider = bpy.data.objects["SSBL_Object_Collision_StaticPlane"]
+    cloth = _make_grid("SSBL_Object_Collision_UnchangedStaticCloth", location=(0.0, 0.0, MARGIN * 0.5))
+    bpy.context.view_layer.objects.active = cloth
+    cloth.select_set(True)
+    bpy.context.view_layer.update()
+
+    original_mesh = cloth.data
+    original_before = _flat_mesh_coords(original_mesh)
+    cache_before = collision.static_collision_cache_stats()
+    session = ssbl.solver.start_preview(bpy.context, cloth)
+    try:
+        ssbl.solver.step_preview(bpy.context, cloth.name)
+        first_metric = _static_plane_metric(cloth, collider.location.z, enforce=True)
+        first_diag = _static_sdf_summary(cloth)
+        _assert_static_sdf_diagnostics(label, first_diag, require_contacts=False)
+        cache_after_first = collision.static_collision_cache_stats()
+
+        ssbl.solver.step_preview(bpy.context, cloth.name)
+        second_metric = _static_plane_metric(cloth, collider.location.z, enforce=True)
+        second_diag = _static_sdf_summary(cloth)
+        _assert_static_sdf_diagnostics(label, second_diag, require_contacts=False)
+        cache_after_second = collision.static_collision_cache_stats()
+    finally:
+        ssbl.solver.request_stop(cloth)
+
+    original_after = _flat_mesh_coords(original_mesh)
+    original_delta = max(
+        (abs(after - before) for before, after in zip(original_before, original_after)),
+        default=0.0,
+    )
+    if original_delta > 1e-7:
+        raise RuntimeError(f"{label} polluted the source mesh: max delta {original_delta}")
+    if first_diag["static_sdf_rebuild_count"] != second_diag["static_sdf_rebuild_count"]:
+        raise RuntimeError(f"{label} rebuilt SDF without collider changes: {first_diag} -> {second_diag}")
+    if int(cache_after_first["misses"]) <= int(cache_before["misses"]):
+        raise RuntimeError(f"{label} did not populate the static collision cache: {cache_before} -> {cache_after_first}")
+    if int(cache_after_second["misses"]) != int(cache_after_first["misses"]):
+        raise RuntimeError(f"{label} had an unexpected static cache miss while unchanged: {cache_after_first} -> {cache_after_second}")
+
+    return {
+        "session_object": session.object_name,
+        "first": first_metric,
+        "second": second_metric,
+        "first_static_sdf": first_diag,
+        "second_static_sdf": second_diag,
+        "cache_before": cache_before,
+        "cache_after_first": cache_after_first,
+        "cache_after_second": cache_after_second,
+        "original_mesh_max_abs_delta": original_delta,
+    }
+
+
 def main():
     try:
         ssbl.unregister()
@@ -424,6 +489,7 @@ def main():
                 expect_static_sdf=True,
                 min_static_triangles=4097,
             ),
+            "unchanged_static_mesh": _run_static_sdf_unchanged_case(),
             "moving_static_mesh": _run_moving_static_collider_case(),
         }
         print("SSBL_OBJECT_COLLISION_SMOKE", json.dumps(results, ensure_ascii=False))

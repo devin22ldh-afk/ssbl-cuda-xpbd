@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import ctypes
+import hashlib
 import os
 from dataclasses import dataclass
 
@@ -542,6 +543,38 @@ def _as_int_ptr(arr: np.ndarray):
     return arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int))
 
 
+def _array_content_signature(arr: np.ndarray) -> tuple:
+    arr = np.ascontiguousarray(arr)
+    digest = hashlib.blake2b(digest_size=16)
+    digest.update(arr.dtype.str.encode("ascii", errors="ignore"))
+    digest.update(np.asarray(arr.shape, dtype=np.int64).tobytes())
+    if arr.size > 0:
+        digest.update(arr.tobytes())
+    return (arr.dtype.str, tuple(int(value) for value in arr.shape), digest.digest())
+
+
+def _dynamic_triangle_signature(dynamic_arr: np.ndarray, triangle_count: int) -> tuple:
+    return (int(triangle_count), _array_content_signature(dynamic_arr))
+
+
+def _dynamic_particle_signature(
+    particle_positions: np.ndarray,
+    particle_radii: np.ndarray,
+    particle_inv_mass: np.ndarray,
+    particle_slot_ids: np.ndarray,
+    particle_phases: np.ndarray,
+    particle_count: int,
+) -> tuple:
+    return (
+        int(particle_count),
+        _array_content_signature(particle_positions),
+        _array_content_signature(particle_radii),
+        _array_content_signature(particle_inv_mass),
+        _array_content_signature(particle_slot_ids),
+        _array_content_signature(particle_phases),
+    )
+
+
 def _last_error(lib) -> str:
     raw = lib.ssbl_last_error()
     if not raw:
@@ -684,6 +717,8 @@ class NativeXpbdSolver:
         self._positions_out = np.empty((self._vertex_count, 3), dtype=np.float32)
         self._static_triangle_count = int(len(static_triangles))
         self._dynamic_triangle_count: int | None = None
+        self._dynamic_triangle_signature: tuple | None = None
+        self._dynamic_particle_signature: tuple | None = None
         self._last_diagnostics = NativeStepDiagnostics()
         static_flat = np.ascontiguousarray(static_triangles.reshape((-1, 3)), dtype=np.float32)
         cfg = _config_from_options(cloth, options, static_triangles)
@@ -770,9 +805,12 @@ class NativeXpbdSolver:
             raise NativeSolverError(_last_error(self._lib))
         self._static_triangle_count = triangle_count
 
-    def update_dynamic_triangles(self, dynamic_triangles: np.ndarray) -> None:
+    def update_dynamic_triangles(self, dynamic_triangles: np.ndarray) -> bool:
         triangle_count = int(len(dynamic_triangles))
         dynamic_triangles = np.ascontiguousarray(dynamic_triangles.reshape((-1, 3)), dtype=np.float32)
+        signature = _dynamic_triangle_signature(dynamic_triangles, triangle_count)
+        if self._dynamic_triangle_signature == signature:
+            return False
         if not self._lib.ssbl_update_dynamic_triangles(
             self._handle,
             _as_float_ptr(dynamic_triangles),
@@ -780,6 +818,8 @@ class NativeXpbdSolver:
         ):
             raise NativeSolverError(_last_error(self._lib))
         self._dynamic_triangle_count = triangle_count
+        self._dynamic_triangle_signature = signature
+        return True
 
     def update_frame_inputs(
         self,
@@ -798,25 +838,7 @@ class NativeXpbdSolver:
         update_dynamic_particles: bool = False,
         force_fields=None,
         update_force_fields: bool = False,
-    ) -> None:
-        if not hasattr(self._lib, "ssbl_update_frame_inputs"):
-            if update_force_fields and force_fields is not None and len(getattr(force_fields, "fields", ()) or ()) > 0:
-                raise NativeSolverError("Loaded CUDA solver DLL does not support Blender force fields.")
-            if update_pin:
-                self.update_pin_targets(
-                    np.asarray(pin_indices if pin_indices is not None else [], dtype=np.int32),
-                    np.asarray(pin_positions if pin_positions is not None else np.empty((0, 3), dtype=np.float32), dtype=np.float32),
-                    None if pin_weights is None else np.asarray(pin_weights, dtype=np.float32),
-                )
-            if update_runtime and options is not None:
-                self.update_runtime_colliders(options)
-            if update_static and static_triangles is not None:
-                self.update_static_triangles(static_triangles)
-            if update_dynamic:
-                dyn = dynamic_triangles if dynamic_triangles is not None else np.empty((0, 3, 3), dtype=np.float32)
-                self.update_dynamic_triangles(dyn)
-            return
-
+    ) -> bool:
         pin_indices_arr = np.ascontiguousarray(pin_indices if pin_indices is not None else np.empty(0, dtype=np.int32), dtype=np.int32)
         pin_positions_arr = np.ascontiguousarray(
             pin_positions if pin_positions is not None else np.empty((0, 3), dtype=np.float32),
@@ -877,6 +899,48 @@ class NativeXpbdSolver:
             and (not needs_particle_extras or len(particle_phases) == dynamic_particle_count)
         ):
             raise NativeSolverError("Dynamic particle arrays must have matching lengths.")
+        dynamic_signature = _dynamic_triangle_signature(dynamic_arr, dynamic_triangle_count) if update_dynamic else None
+        if update_dynamic and self._dynamic_triangle_signature == dynamic_signature:
+            update_dynamic = False
+        particle_signature = (
+            _dynamic_particle_signature(
+                particle_positions,
+                particle_radii,
+                particle_inv_mass,
+                particle_slot_ids,
+                particle_phases,
+                dynamic_particle_count,
+            )
+            if update_dynamic_particles
+            else None
+        )
+        if update_dynamic_particles and self._dynamic_particle_signature == particle_signature:
+            update_dynamic_particles = False
+        if not hasattr(self._lib, "ssbl_update_frame_inputs"):
+            if update_force_fields and force_fields is not None and len(getattr(force_fields, "fields", ()) or ()) > 0:
+                raise NativeSolverError("Loaded CUDA solver DLL does not support Blender force fields.")
+            did_update = False
+            if update_pin:
+                self.update_pin_targets(pin_indices_arr, pin_positions_arr, pin_weights_arr)
+                did_update = True
+            if update_runtime and options is not None:
+                self.update_runtime_colliders(options)
+                did_update = True
+            if update_static and static_triangles is not None:
+                self.update_static_triangles(static_triangles)
+                did_update = True
+            if update_dynamic:
+                did_update = self.update_dynamic_triangles(dynamic_triangles if dynamic_triangles is not None else np.empty((0, 3, 3), dtype=np.float32)) or did_update
+            return did_update
+        if not (
+            update_pin
+            or update_runtime
+            or update_static
+            or update_dynamic
+            or update_dynamic_particles
+            or update_force_fields
+        ):
+            return False
         force_field_arr = _force_field_array(force_fields)
         force_field_count = int(len(force_field_arr))
         unsupported_force_field_count = int(getattr(force_fields, "unsupported_count", 0) if force_fields is not None else 0)
@@ -916,6 +980,10 @@ class NativeXpbdSolver:
             self._static_triangle_count = static_triangle_count
         if update_dynamic:
             self._dynamic_triangle_count = dynamic_triangle_count
+            self._dynamic_triangle_signature = dynamic_signature
+        if update_dynamic_particles:
+            self._dynamic_particle_signature = particle_signature
+        return True
 
     def step(self, substeps: int, iterations: int, diagnostics: bool = True, synchronize: bool = True) -> None:
         fetch_diagnostics = 1 if diagnostics else 0

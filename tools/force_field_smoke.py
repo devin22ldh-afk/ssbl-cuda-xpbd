@@ -14,7 +14,7 @@ if ADDONS_ROOT not in sys.path:
     sys.path.insert(0, ADDONS_ROOT)
 
 import ssbl
-from ssbl.force_fields import collect_force_fields, visible_force_field_weight_properties
+from ssbl.force_fields import MAX_FORCE_FIELDS, collect_force_fields, visible_force_field_weight_properties
 
 
 EXPECTED_VISIBLE_WEIGHT_ORDER = (
@@ -265,6 +265,154 @@ def _read_pc2_average_axis(path: str, sample_index: int, axis: int) -> float:
     return sum(samples) / max(len(samples), 1)
 
 
+def _vector_list(values) -> list[float]:
+    return [float(value) for value in values]
+
+
+def _first_field_sample(scene: bpy.types.Scene, cloth: bpy.types.Object):
+    batch = collect_force_fields(scene, bpy.context.evaluated_depsgraph_get(), cloth.ssbl_cloth)
+    return batch.fields[0] if batch.fields else None
+
+
+def _run_animated_transform_collect_case(scene: bpy.types.Scene) -> dict[str, object]:
+    _clear_scene()
+    cloth = _make_cloth("SSBL_Force_AnimatedTransform")
+    wind = _add_wind("SSBL_Wind_AnimatedTransform", 2.0)
+    scene.frame_set(1)
+    wind.rotation_euler = (0.0, 0.0, 0.0)
+    wind.keyframe_insert("rotation_euler", frame=1)
+    scene.frame_set(10)
+    wind.rotation_euler = (0.0, math.pi / 2.0, 0.0)
+    wind.keyframe_insert("rotation_euler", frame=10)
+
+    samples: dict[int, object] = {}
+    for frame in (1, 10):
+        scene.frame_set(frame)
+        bpy.context.view_layer.update()
+        samples[frame] = _first_field_sample(scene, cloth)
+
+    frame_1 = samples[1]
+    frame_10 = samples[10]
+    return {
+        "frame_1_direction": _vector_list(frame_1.direction) if frame_1 is not None else [],
+        "frame_10_direction": _vector_list(frame_10.direction) if frame_10 is not None else [],
+        "frame_1_count": 1 if frame_1 is not None else 0,
+        "frame_10_count": 1 if frame_10 is not None else 0,
+    }
+
+
+def _run_collection_filter_edge_cases(scene: bpy.types.Scene) -> dict[str, object]:
+    _clear_scene()
+    empty_cloth = _make_cloth("SSBL_Force_EmptyCollection")
+    empty_collection = bpy.data.collections.new("SSBL_Force_EmptyCollection_Filter")
+    scene.collection.children.link(empty_collection)
+    _add_wind("SSBL_Wind_OutsideEmptyCollection", 5.0)
+    empty_cloth.ssbl_cloth.force_field_collection = empty_collection
+    empty_batch = collect_force_fields(scene, bpy.context.evaluated_depsgraph_get(), empty_cloth.ssbl_cloth)
+
+    _clear_scene()
+    nested_cloth = _make_cloth("SSBL_Force_NestedCollection")
+    parent = bpy.data.collections.new("SSBL_Force_NestedParent")
+    child = bpy.data.collections.new("SSBL_Force_NestedChild")
+    scene.collection.children.link(parent)
+    parent.children.link(child)
+    included = _add_wind("SSBL_Wind_NestedIncluded", 6.0)
+    _add_wind("SSBL_Wind_NestedExcluded", 11.0)
+    child.objects.link(included)
+    nested_cloth.ssbl_cloth.force_field_collection = parent
+    nested_batch = collect_force_fields(scene, bpy.context.evaluated_depsgraph_get(), nested_cloth.ssbl_cloth)
+
+    return {
+        "empty_count": len(empty_batch.fields),
+        "empty_unsupported_count": int(empty_batch.unsupported_count),
+        "nested_count": len(nested_batch.fields),
+        "nested_strength": float(nested_batch.fields[0].strength) if nested_batch.fields else 0.0,
+        "nested_unsupported_count": int(nested_batch.unsupported_count),
+    }
+
+
+def _run_collection_membership_live_case(scene: bpy.types.Scene) -> dict[str, object]:
+    _clear_scene()
+    scene.frame_start = 1
+    scene.frame_end = 6
+    scene.frame_set(1)
+    collection = bpy.data.collections.new("SSBL_Force_LiveCollection_Filter")
+    scene.collection.children.link(collection)
+    cloth = _make_cloth("SSBL_Force_LiveCollection")
+    cloth.ssbl_cloth.force_field_collection = collection
+    wind = _add_wind("SSBL_Wind_LiveCollection", 30.0)
+    bpy.context.view_layer.objects.active = cloth
+
+    session = ssbl.solver.start_timeline_preview(bpy.context, scene)
+    if session is None:
+        raise RuntimeError("Live collection force-field case did not start a timeline session")
+    try:
+        scene.frame_set(2)
+        ssbl.solver.step_timeline_preview(bpy.context, scene)
+        before = ssbl.solver.session_diagnostics(cloth)
+
+        collection.objects.link(wind)
+        scene.frame_set(3)
+        ssbl.solver.step_timeline_preview(bpy.context, scene)
+        linked = ssbl.solver.session_diagnostics(cloth)
+
+        collection.objects.unlink(wind)
+        scene.frame_set(4)
+        ssbl.solver.step_timeline_preview(bpy.context, scene)
+        unlinked = ssbl.solver.session_diagnostics(cloth)
+    finally:
+        ssbl.solver.reset_preview_object(cloth)
+
+    return {
+        "before_count": int(before.force_field_count),
+        "linked_count": int(linked.force_field_count),
+        "unlinked_count": int(unlinked.force_field_count),
+        "before_finite": bool(before.finite),
+        "linked_finite": bool(linked.finite),
+        "unlinked_finite": bool(unlinked.finite),
+    }
+
+
+def _run_nonfinite_strength_guard_case(scene: bpy.types.Scene) -> dict[str, object]:
+    _clear_scene()
+    cloth = _make_cloth("SSBL_Force_NonFiniteStrength")
+    field_obj = _add_wind("SSBL_Wind_NonFiniteStrength", 1.0)
+    assigned_nonfinite = True
+    try:
+        field_obj.field.strength = float("nan")
+    except Exception:
+        assigned_nonfinite = False
+        field_obj.field.strength = 0.0
+    batch = collect_force_fields(scene, bpy.context.evaluated_depsgraph_get(), cloth.ssbl_cloth)
+    strength = float(batch.fields[0].strength) if batch.fields else 0.0
+    return {
+        "assigned_nonfinite": bool(assigned_nonfinite),
+        "count": len(batch.fields),
+        "strength": strength,
+        "finite_strength": math.isfinite(strength),
+    }
+
+
+def _run_force_field_limit_case(scene: bpy.types.Scene) -> dict[str, object]:
+    _clear_scene()
+    cloth = _make_cloth("SSBL_Force_MaxFields")
+    for index in range(MAX_FORCE_FIELDS + 1):
+        _add_wind(f"SSBL_Wind_MaxFields_{index:02d}", 1.0)
+    try:
+        collect_force_fields(scene, bpy.context.evaluated_depsgraph_get(), cloth.ssbl_cloth)
+    except ValueError as exc:
+        return {
+            "raised": True,
+            "limit": int(MAX_FORCE_FIELDS),
+            "message": str(exc),
+        }
+    return {
+        "raised": False,
+        "limit": int(MAX_FORCE_FIELDS),
+        "message": "",
+    }
+
+
 def main() -> None:
     try:
         ssbl.unregister()
@@ -391,6 +539,12 @@ def main() -> None:
         _add_wind("SSBL_Wind_StrengthScale", 4.0)
         scale_batch = collect_force_fields(scene, bpy.context.evaluated_depsgraph_get(), scale_cloth.ssbl_cloth)
         scaled_strength = scale_batch.fields[0].strength if scale_batch.fields else 0.0
+
+        animated_transform = _run_animated_transform_collect_case(scene)
+        collection_edges = _run_collection_filter_edge_cases(scene)
+        collection_membership = _run_collection_membership_live_case(scene)
+        nonfinite_strength_guard = _run_nonfinite_strength_guard_case(scene)
+        max_field_guard = _run_force_field_limit_case(scene)
 
         wind_plain, wind_plain_sample = _run_single_field_case(scene, "WindPlain", "WIND", 30.0)
         wind_noisy, wind_noisy_sample = _run_single_field_case(
@@ -540,6 +694,11 @@ def main() -> None:
             "supported_field_count": len(supported_batch.fields),
             "unsupported_field_count": int(supported_batch.unsupported_count),
             "scaled_strength": scaled_strength,
+            "animated_transform": animated_transform,
+            "collection_edges": collection_edges,
+            "collection_membership": collection_membership,
+            "nonfinite_strength_guard": nonfinite_strength_guard,
+            "max_field_guard": max_field_guard,
             "wind_noise_delta": wind_noise_delta,
             "wind_plain_sample": _sample_dict(wind_plain_sample),
             "wind_noisy_sample": _sample_dict(wind_noisy_sample),
@@ -599,6 +758,25 @@ def main() -> None:
             and result["supported_field_count"] == created_supported
             and result["unsupported_field_count"] == created_unsupported
             and abs(result["scaled_strength"] - 2.0) < 1.0e-4
+            and animated_transform["frame_1_count"] == 1
+            and animated_transform["frame_10_count"] == 1
+            and animated_transform["frame_1_direction"][2] > 0.85
+            and animated_transform["frame_10_direction"][0] > 0.85
+            and collection_edges["empty_count"] == 0
+            and collection_edges["empty_unsupported_count"] == 0
+            and collection_edges["nested_count"] == 1
+            and abs(collection_edges["nested_strength"] - 6.0) < 1.0e-4
+            and collection_edges["nested_unsupported_count"] == 0
+            and collection_membership["before_finite"]
+            and collection_membership["linked_finite"]
+            and collection_membership["unlinked_finite"]
+            and collection_membership["before_count"] == 0
+            and collection_membership["linked_count"] == 1
+            and collection_membership["unlinked_count"] == 0
+            and nonfinite_strength_guard["count"] == 1
+            and nonfinite_strength_guard["finite_strength"]
+            and abs(nonfinite_strength_guard["strength"]) < 1.0e-6
+            and max_field_guard["raised"]
             and _has_parameter_effect(wind_plain, wind_noisy)
             and wind_noisy_sample is not None
             and abs(float(wind_noisy_sample.noise) - 1.1) < 1.0e-4

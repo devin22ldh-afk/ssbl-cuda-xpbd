@@ -39,6 +39,11 @@ constexpr float kSelfApproachEps = 1.0e-5f;
 constexpr float kSelfContactDistanceEdgeP10Scale = 0.60f;
 constexpr int kFastSelfCollisionPasses = 4;
 constexpr int kFastSelfTriangleCleanupRuns = 0;
+constexpr int kFastOverlapIslandMinContacts = 3;
+constexpr int kFastOverlapIslandMaxContacts = 48;
+constexpr float kFastOverlapIslandCorrectionScale = 0.50f;
+constexpr float kFastOverlapIslandMaxDeltaScale = 0.30f;
+constexpr float kFastOverlapIslandMinAvgDepthScale = 0.04f;
 constexpr int kSelfSourceFull = 0;
 constexpr int kSelfCollisionModeFast = 1;
 constexpr int kSelfCollisionModeStrict = 2;
@@ -99,7 +104,7 @@ constexpr int kExternalContactMaxAge = 8;
 constexpr int kExternalContactCapacityMin = 4096;
 constexpr int kExternalContactCapacityMax = 1048576;
 constexpr float kExternalContactWarmStartScale = 0.35f;
-constexpr int kDiagCountSlots = 15;
+constexpr int kDiagCountSlots = 21;
 constexpr int kDiagCandidateCount = 0;
 constexpr int kDiagResolvedContacts = 1;
 constexpr int kDiagCcdClampCount = 2;
@@ -112,6 +117,12 @@ constexpr int kDiagExternalContactCacheCount = 11;
 constexpr int kDiagDynamicParticleCandidates = 12;
 constexpr int kDiagDynamicParticleContacts = 13;
 constexpr int kDiagDynamicParticleOverflow = 14;
+constexpr int kDiagFastOverlapIslandCandidates = 15;
+constexpr int kDiagFastOverlapIslandClusters = 16;
+constexpr int kDiagFastOverlapIslandVertexRefs = 17;
+constexpr int kDiagFastOverlapIslandAppliedVertices = 18;
+constexpr int kDiagFastOverlapIslandGuarded = 19;
+constexpr int kDiagFastOverlapIslandMaxDeltaMicrounits = 20;
 
 struct Vec3 {
     float x;
@@ -1148,6 +1159,45 @@ __device__ void diag_note_dynamic_particle_overflow(Solver solver) {
     if (solver.diag_counts) {
         atomicAdd(&solver.diag_counts[kDiagDynamicParticleOverflow], 1ull);
     }
+}
+
+__device__ void diag_note_fast_overlap_island_candidates(Solver solver, unsigned long long count) {
+    if (solver.diag_counts && count > 0ull) {
+        atomicAdd(&solver.diag_counts[kDiagFastOverlapIslandCandidates], count);
+    }
+}
+
+__device__ void diag_note_fast_overlap_island_cluster(Solver solver) {
+    if (solver.diag_counts) {
+        atomicAdd(&solver.diag_counts[kDiagFastOverlapIslandClusters], 1ull);
+    }
+}
+
+__device__ void diag_note_fast_overlap_island_vertex_refs(Solver solver, unsigned long long count) {
+    if (solver.diag_counts && count > 0ull) {
+        atomicAdd(&solver.diag_counts[kDiagFastOverlapIslandVertexRefs], count);
+    }
+}
+
+__device__ void diag_note_fast_overlap_island_applied_vertex(Solver solver) {
+    if (solver.diag_counts) {
+        atomicAdd(&solver.diag_counts[kDiagFastOverlapIslandAppliedVertices], 1ull);
+    }
+}
+
+__device__ void diag_note_fast_overlap_island_guarded(Solver solver) {
+    if (solver.diag_counts) {
+        atomicAdd(&solver.diag_counts[kDiagFastOverlapIslandGuarded], 1ull);
+    }
+}
+
+__device__ void diag_note_fast_overlap_island_max_delta(Solver solver, float delta) {
+    if (!solver.diag_counts || !isfinite(delta) || delta <= 0.0f) {
+        return;
+    }
+    float clamped = fminf(delta, 1024.0f);
+    unsigned long long microunits = static_cast<unsigned long long>(clamped * 1000000.0f);
+    atomicMax(&solver.diag_counts[kDiagFastOverlapIslandMaxDeltaMicrounits], microunits);
 }
 
 __device__ unsigned long long external_contact_key(int kind, int vertex, int triangle) {
@@ -4055,6 +4105,181 @@ __global__ void self_surface_sample_collision_kernel(Solver solver) {
     }
 }
 
+__global__ void fast_overlap_island_aggregate_kernel(Solver solver) {
+    int ordinal = blockIdx.x * blockDim.x + threadIdx.x;
+    if (!self_fast_mode(solver)
+        || solver.self_recovery_mode
+        || ordinal >= self_vertex_source_count(solver)
+        || !solver.self_sample_heads
+        || !solver.self_sample_next
+        || solver.self_sample_hash_table_size <= 0
+        || solver.self_sample_count <= 0) {
+        return;
+    }
+
+    int i = self_vertex_source_index(solver, ordinal);
+    if (i < 0 || i >= solver.cfg.vertex_count || solver.inv_mass[i] <= 0.0f) {
+        return;
+    }
+    Vec3 p = solver.pos[i];
+    Vec3 prev = solver.prev[i];
+    if (!finite_vec(p) || !finite_vec(prev)) {
+        diag_note_nonfinite(solver);
+        diag_note_fast_overlap_island_guarded(solver);
+        return;
+    }
+
+    float thickness = self_contact_distance(solver);
+    float cell_size = self_cell_size(solver);
+    int max_neighbors = solver.cfg.max_self_collision_neighbors > 1 ? solver.cfg.max_self_collision_neighbors : 1;
+    int max_contacts = min(max_neighbors * 2, kFastOverlapIslandMaxContacts);
+    int scan_limit = max(max_contacts * 10, max_contacts);
+    int base_x = cell_coord(p.x, cell_size);
+    int base_y = cell_coord(p.y, cell_size);
+    int base_z = cell_coord(p.z, cell_size);
+
+    int scanned = 0;
+    int contact_count = 0;
+    float penetration_sum = 0.0f;
+    float sample_weight_sum = 0.0f;
+    float max_penetration = 0.0f;
+    Vec3 weighted_axis{0.0f, 0.0f, 0.0f};
+    Vec3 best_normal{0.0f, 0.0f, 1.0f};
+
+    for (int dz = -1; dz <= 1 && contact_count < max_contacts && scanned < scan_limit; ++dz) {
+        for (int dy = -1; dy <= 1 && contact_count < max_contacts && scanned < scan_limit; ++dy) {
+            for (int dx = -1; dx <= 1 && contact_count < max_contacts && scanned < scan_limit; ++dx) {
+                int hash = hash_cell(base_x + dx, base_y + dy, base_z + dz, solver.self_sample_hash_table_size);
+                int sample = solver.self_sample_heads[hash];
+                while (sample >= 0 && contact_count < max_contacts && scanned < scan_limit) {
+                    ++scanned;
+                    int tri_index = self_sample_triangle_index(solver, sample);
+                    int kind = self_sample_kind(solver, sample, tri_index);
+                    if (tri_index < 0 || tri_index >= solver.cfg.triangle_count) {
+                        diag_note_fast_overlap_island_guarded(solver);
+                        sample = solver.self_sample_next[sample];
+                        continue;
+                    }
+                    Int3 tri = solver.triangles[tri_index];
+                    if (tri.x < 0 || tri.x >= solver.cfg.vertex_count
+                        || tri.y < 0 || tri.y >= solver.cfg.vertex_count
+                        || tri.z < 0 || tri.z >= solver.cfg.vertex_count) {
+                        diag_note_fast_overlap_island_guarded(solver);
+                        sample = solver.self_sample_next[sample];
+                        continue;
+                    }
+                    float wa;
+                    float wb;
+                    float wc;
+                    self_surface_sample_weights(kind, &wa, &wb, &wc);
+                    if (rest_surface_neighbor(solver, i, tri, wa, wb, wc)) {
+                        sample = solver.self_sample_next[sample];
+                        continue;
+                    }
+                    Vec3 a = solver.pos[tri.x];
+                    Vec3 b = solver.pos[tri.y];
+                    Vec3 c = solver.pos[tri.z];
+                    if (!finite_vec(a) || !finite_vec(b) || !finite_vec(c)) {
+                        diag_note_nonfinite(solver);
+                        diag_note_fast_overlap_island_guarded(solver);
+                        sample = solver.self_sample_next[sample];
+                        continue;
+                    }
+                    Vec3 sample_pos = weighted_triangle_point(a, b, c, wa, wb, wc);
+                    Vec3 delta = sub(p, sample_pos);
+                    float linear_distance = sqrtf(fmaxf(dot(delta, delta), 0.0f));
+                    if (!self_coarse_distance_ok(linear_distance, thickness)) {
+                        sample = solver.self_sample_next[sample];
+                        continue;
+                    }
+                    Vec3 surface_normal = stable_triangle_normal(
+                        a,
+                        b,
+                        c,
+                        solver.rest[tri.x],
+                        solver.rest[tri.y],
+                        solver.rest[tri.z]
+                    );
+                    Vec3 prev_sample = weighted_triangle_point(
+                        solver.prev[tri.x],
+                        solver.prev[tri.y],
+                        solver.prev[tri.z],
+                        wa,
+                        wb,
+                        wc
+                    );
+                    Vec3 previous_delta = sub(prev, prev_sample);
+                    float contact_distance = 0.0f;
+                    Vec3 normal = self_collision_normal(
+                        delta,
+                        surface_normal,
+                        previous_delta,
+                        thickness,
+                        &contact_distance
+                    );
+                    float penetration = thickness - contact_distance;
+                    if (penetration <= 0.0f) {
+                        sample = solver.self_sample_next[sample];
+                        continue;
+                    }
+                    diag_note_gap(solver, -penetration);
+                    if (!self_should_project_contact(-penetration, delta, previous_delta, normal)) {
+                        sample = solver.self_sample_next[sample];
+                        continue;
+                    }
+
+                    ++contact_count;
+                    penetration_sum += penetration;
+                    sample_weight_sum += weighted_inv_mass(solver, tri, wa, wb, wc);
+                    weighted_axis = add(weighted_axis, mul(normal, penetration));
+                    if (penetration > max_penetration) {
+                        max_penetration = penetration;
+                        best_normal = normal;
+                    }
+                    sample = solver.self_sample_next[sample];
+                }
+            }
+        }
+    }
+
+    if (contact_count <= 0) {
+        return;
+    }
+    diag_note_fast_overlap_island_candidates(solver, static_cast<unsigned long long>(contact_count));
+    if (contact_count < kFastOverlapIslandMinContacts) {
+        diag_note_fast_overlap_island_guarded(solver);
+        return;
+    }
+
+    float avg_penetration = penetration_sum / static_cast<float>(contact_count);
+    if (avg_penetration < thickness * kFastOverlapIslandMinAvgDepthScale) {
+        diag_note_fast_overlap_island_guarded(solver);
+        return;
+    }
+
+    float axis_len = norm(weighted_axis);
+    Vec3 aggregate_normal = axis_len > kEps ? mul(weighted_axis, 1.0f / axis_len) : best_normal;
+    float wi = solver.inv_mass[i];
+    float avg_sample_weight = sample_weight_sum / static_cast<float>(contact_count);
+    float mass_share = wi / fmaxf(wi + avg_sample_weight, kEps);
+    float max_delta = fmaxf(thickness * kFastOverlapIslandMaxDeltaScale, 1.0e-5f);
+    float delta_len = fminf(avg_penetration * kFastOverlapIslandCorrectionScale * mass_share, max_delta);
+    if (!isfinite(delta_len) || delta_len <= kEps || !finite_vec(aggregate_normal)) {
+        diag_note_fast_overlap_island_guarded(solver);
+        return;
+    }
+
+    Vec3 correction = mul(aggregate_normal, delta_len);
+    apply_self_collision_correction(solver, i, correction);
+    if (solver.self_sample_hash_dirty) {
+        atomicExch(solver.self_sample_hash_dirty, 1);
+    }
+    diag_note_fast_overlap_island_cluster(solver);
+    diag_note_fast_overlap_island_vertex_refs(solver, static_cast<unsigned long long>(contact_count));
+    diag_note_fast_overlap_island_applied_vertex(solver);
+    diag_note_fast_overlap_island_max_delta(solver, delta_len);
+}
+
 __global__ void probe_self_particle_collision_kernel(Solver solver) {
     int ordinal = blockIdx.x * blockDim.x + threadIdx.x;
     if (ordinal >= self_vertex_source_count(solver)) {
@@ -4749,6 +4974,13 @@ bool fetch_diagnostics_buffers(
     host_diag->dynamic_particle_candidate_count = static_cast<long long>(counts[kDiagDynamicParticleCandidates]);
     host_diag->dynamic_particle_contacts = static_cast<long long>(counts[kDiagDynamicParticleContacts]);
     host_diag->dynamic_particle_overflow = static_cast<long long>(counts[kDiagDynamicParticleOverflow]);
+    host_diag->fast_overlap_island_candidates = static_cast<long long>(counts[kDiagFastOverlapIslandCandidates]);
+    host_diag->fast_overlap_island_clusters = static_cast<long long>(counts[kDiagFastOverlapIslandClusters]);
+    host_diag->fast_overlap_island_vertex_refs = static_cast<long long>(counts[kDiagFastOverlapIslandVertexRefs]);
+    host_diag->fast_overlap_island_applied_vertices = static_cast<long long>(counts[kDiagFastOverlapIslandAppliedVertices]);
+    host_diag->fast_overlap_island_guarded = static_cast<long long>(counts[kDiagFastOverlapIslandGuarded]);
+    host_diag->fast_overlap_island_max_delta =
+        static_cast<float>(counts[kDiagFastOverlapIslandMaxDeltaMicrounits]) * 1.0e-6f;
     host_diag->min_gap = min_gap;
     return true;
 }
@@ -5018,6 +5250,7 @@ bool run_self_collision_pass(
     bool recovery_mode,
     bool run_surface_sample_pairs,
     bool force_full_fast_triangle_source,
+    bool run_fast_overlap_island,
     std::vector<TimedSegment>* timings
 ) {
     if (!solver || !solver->self_vert_heads || !solver->self_vert_next) {
@@ -5137,6 +5370,17 @@ bool run_self_collision_pass(
             }
             self_surface_sample_collision_kernel<<<sample_source_blocks, 256>>>(collision_solver);
             if (!end_timed_segment(timings, &solve_segment, "end self surface-pair timing")) {
+                return false;
+            }
+        }
+        if (run_fast_overlap_island
+            && collision_solver.cfg.self_collision_mode == kSelfCollisionModeFast
+            && !recovery_mode) {
+            if (!begin_timed_segment(timings, solve_slot, &solve_segment, "start fast overlap-island timing")) {
+                return false;
+            }
+            fast_overlap_island_aggregate_kernel<<<vertex_source_blocks, 256>>>(collision_solver);
+            if (!end_timed_segment(timings, &solve_segment, "end fast overlap-island timing")) {
                 return false;
             }
         }
@@ -5488,7 +5732,15 @@ bool run_substep(
                     && last_self_pass
                     && fast_cleanup_substep;
                 bool run_surface_sample_pairs = (run_surface_pairs || run_fast_triangle_slot) && last_self_pass;
-                if (!run_self_collision_pass(solver, v_blocks, false, run_surface_sample_pairs, run_fast_triangle_slot, timings)) {
+                bool run_fast_overlap_island = fast_self_collision && last_self_pass;
+                if (!run_self_collision_pass(
+                        solver,
+                        v_blocks,
+                        false,
+                        run_surface_sample_pairs,
+                        run_fast_triangle_slot,
+                        run_fast_overlap_island,
+                        timings)) {
                     solver->self_source_mode = kSelfSourceFull;
                     return false;
                 }
@@ -5524,7 +5776,7 @@ bool run_substep(
                     return false;
                 }
                 solver->self_source_mode = kSelfSourceFull;
-                if (!run_self_collision_pass(solver, v_blocks, true, true, false, timings)) {
+                if (!run_self_collision_pass(solver, v_blocks, true, true, false, false, timings)) {
                     solver->self_source_mode = kSelfSourceFull;
                     return false;
                 }

@@ -42,6 +42,7 @@ SOURCE_FLAGWAVER = "https://github.com/krikienoid/flagwaver"
 SOURCE_BINROOT = "https://github.com/BinRoot/Blender-Cloth-Simulation"
 SOURCE_GARMENTLAB = "https://github.com/GarmentLab/GarmentLab"
 SOURCE_DIFFCLOTH = "https://github.com/omegaiota/DiffCloth"
+PLUGIN_NAME = "SSBL"
 
 
 @dataclass
@@ -210,41 +211,33 @@ def _create_overlay(scene: bpy.types.Scene, camera: bpy.types.Object, title: str
     height = float(camera.data.ortho_scale)
     width = height * RESOLUTION[0] / RESOLUTION[1]
     left = -width * 0.5 + 0.18
-    top = height * 0.5 - 0.56
-    _camera_plane(
-        scene,
-        camera,
-        name="SSBL_Demo_Overlay_Backdrop",
-        location=(left + 2.32, top - 0.34, -4.06),
-        size=(4.95, 0.86),
-        color=(0.015, 0.018, 0.024, 1.0),
-    )
+    top = height * 0.5 - 0.20
     title_obj = _camera_text(
         scene,
         camera,
         name="SSBL_Demo_Overlay_Title",
-        body=title,
+        body=_format_overlay_header(title),
         location=(left, top, -4.0),
         size=0.13,
-        color=(0.95, 0.98, 1.0, 1.0),
+        color=(1.0, 1.0, 1.0, 1.0),
     )
     metrics_obj = _camera_text(
         scene,
         camera,
         name="SSBL_Demo_Overlay_Metrics",
         body="",
-        location=(left, top - 0.27, -4.0),
+        location=(left, top - 0.20, -4.0),
         size=0.092,
-        color=(0.77, 0.93, 1.0, 1.0),
+        color=(0.0, 1.0, 0.0, 1.0),
     )
     notes_obj = _camera_text(
         scene,
         camera,
         name="SSBL_Demo_Overlay_Notes",
         body="",
-        location=(left, top - 0.53, -4.0),
+        location=(left, top - 0.36, -4.0),
         size=0.08,
-        color=(1.0, 0.84, 0.52, 1.0),
+        color=(1.0, 1.0, 1.0, 0.0),
     )
     return Overlay(title_obj, metrics_obj, notes_obj)
 
@@ -256,7 +249,7 @@ def _update_overlay(
     note: str,
 ) -> None:
     overlay.metrics.data.body = metrics_line
-    overlay.notes.data.body = note
+    overlay.notes.data.body = ""
     bpy.context.view_layer.update()
 
 
@@ -317,54 +310,93 @@ def _current_sim_fps(last_step_ms: float, native_ms: float) -> float:
 
 
 def _format_metrics_line(frame: int, total_frames: int, last_step_ms: float, native_ms: float) -> str:
-    step_ms = _display_step_ms(last_step_ms, native_ms)
     sim_fps = _current_sim_fps(last_step_ms, native_ms)
-    return f"frame {frame:03d}/{total_frames:03d} | sim FPS {sim_fps:5.1f} | step {step_ms:5.2f} ms"
+    return f"Realtime FPS: {sim_fps:5.1f}"
 
 
 def _compose_overlay_text(title: str, metrics_line: str, note_line: str) -> str:
-    return "\n".join(line for line in (title, metrics_line, note_line) if line)
+    return "\n".join(line for line in (_format_overlay_header(title), metrics_line) if line)
 
 
-def _format_srt_timestamp(seconds: float) -> str:
-    total_ms = max(0, int(round(float(seconds) * 1000.0)))
-    hours = total_ms // 3_600_000
-    minutes = (total_ms // 60_000) % 60
-    secs = (total_ms // 1000) % 60
-    millis = total_ms % 1000
-    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+def _format_overlay_header(title: str) -> str:
+    title = str(title).strip()
+    if not title:
+        return PLUGIN_NAME
+    if title == PLUGIN_NAME or title.startswith(f"{PLUGIN_NAME} "):
+        return title
+    return f"{PLUGIN_NAME} {title}"
 
 
-def _write_overlay_srt(frames_dir: Path, overlay_text_frames: list[str]) -> Path:
+def _ass_color(red: int, green: int, blue: int, alpha: int = 0) -> str:
+    red = max(0, min(255, int(red)))
+    green = max(0, min(255, int(green)))
+    blue = max(0, min(255, int(blue)))
+    alpha = max(0, min(255, int(alpha)))
+    return f"&H{alpha:02X}{blue:02X}{green:02X}{red:02X}"
+
+
+def _escape_ass_text(text: str) -> str:
+    return str(text).replace("\\", r"\\").replace("{", r"\{").replace("}", r"\}")
+
+
+def _write_overlay_ass(frames_dir: Path, overlay_text_frames: list[str]) -> Path:
     if not overlay_text_frames:
         raise RuntimeError("overlay_text_frames must not be empty")
-    overlay_path = frames_dir / "overlay.srt"
-    entries: list[str] = []
+    overlay_path = frames_dir / "overlay.ass"
+    entries: list[str] = [
+        "[Script Info]",
+        "ScriptType: v4.00+",
+        f"PlayResX: {RESOLUTION[0]}",
+        f"PlayResY: {RESOLUTION[1]}",
+        "ScaledBorderAndShadow: yes",
+        "",
+        "[V4+ Styles]",
+        "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,"
+        "Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,"
+        "Alignment,MarginL,MarginR,MarginV,Encoding",
+        "Style: Header,Arial,22,"
+        f"{_ass_color(255, 255, 255)},{_ass_color(255, 255, 255)},{_ass_color(0, 0, 0)},{_ass_color(0, 0, 0, 128)},"
+        "1,0,0,0,100,100,0,0,1,1,0,7,28,28,22,1",
+        "Style: RealtimeFps,Arial,20,"
+        f"{_ass_color(0, 255, 0)},{_ass_color(0, 255, 0)},{_ass_color(0, 0, 0)},{_ass_color(0, 0, 0, 128)},"
+        "1,0,0,0,100,100,0,0,1,1,0,7,28,28,52,1",
+        "",
+        "[Events]",
+        "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text",
+    ]
     for index, text in enumerate(overlay_text_frames, start=1):
         start_s = (index - 1) / VIDEO_FPS
         end_s = index / VIDEO_FPS
+        lines = str(text).replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        header = _escape_ass_text(lines[0] if lines else "")
+        fps_line = _escape_ass_text(lines[1] if len(lines) > 1 else "")
         entries.extend(
             [
-                str(index),
-                f"{_format_srt_timestamp(start_s)} --> {_format_srt_timestamp(end_s)}",
-                str(text).replace("\r\n", "\n").replace("\r", "\n"),
-                "",
+                f"Dialogue: 0,{_format_ass_timestamp(start_s)},{_format_ass_timestamp(end_s)},Header,,0,0,0,,{header}",
+                f"Dialogue: 0,{_format_ass_timestamp(start_s)},{_format_ass_timestamp(end_s)},RealtimeFps,,0,0,0,,{fps_line}",
             ]
         )
     overlay_path.write_text("\n".join(entries), encoding="utf-8")
     return overlay_path
 
 
+def _format_ass_timestamp(seconds: float) -> str:
+    total_cs = max(0, int(round(float(seconds) * 100.0)))
+    hours = total_cs // 360000
+    minutes = (total_cs // 6000) % 60
+    secs = (total_cs // 100) % 60
+    centis = total_cs % 100
+    return f"{hours:d}:{minutes:02d}:{secs:02d}.{centis:02d}"
+
+
 def _encode_video(frames_dir: Path, video_path: Path, overlay_text_frames: list[str]) -> str:
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
         raise RuntimeError("ffmpeg was not found in PATH")
-    overlay_path = _write_overlay_srt(frames_dir, overlay_text_frames)
+    overlay_path = _write_overlay_ass(frames_dir, overlay_text_frames)
     filter_chain = (
         "scale=trunc(iw/2)*2:trunc(ih/2)*2,"
-        "subtitles=overlay.srt:"
-        "force_style='FontName=Arial,FontSize=20,Bold=1,Alignment=7,MarginL=28,MarginV=24,"
-        "BorderStyle=3,Outline=0,Shadow=0,BackColour=&H66000000,PrimaryColour=&H00FFFFFF,LineSpacing=6'"
+        f"subtitles={overlay_path.name}"
     )
     _run_checked(
         [
@@ -1463,6 +1495,10 @@ def _average_x(obj: bpy.types.Object) -> float:
     return sum(float(vertex.co.x) for vertex in obj.data.vertices) / max(len(obj.data.vertices), 1)
 
 
+def _average_world_z(obj: bpy.types.Object) -> float:
+    return sum(float((obj.matrix_world @ vertex.co).z) for vertex in obj.data.vertices) / max(len(obj.data.vertices), 1)
+
+
 def _record_force_field_tuning() -> DemoResult:
     name = "01_brand_flag_wind_realtime"
     title = "SSBL realtime flag - live wind control"
@@ -1487,16 +1523,11 @@ def _record_force_field_tuning() -> DemoResult:
     overlay = _create_overlay(scene, camera, title)
 
     cloth = _make_yz_flag("SSBL_Demo_Force_Field_Flag")
-    bpy.ops.mesh.primitive_cylinder_add(vertices=24, radius=0.04, depth=2.4, location=(-0.08, -0.92, 1.0))
-    pole = bpy.context.object
-    pole.name = "SSBL_Demo_Flag_Pole"
-    pole.rotation_euler = (math.pi / 2.0, 0.0, 0.0)
-    pole.data.materials.append(_material("SSBL_Demo_Flag_Pole_Mat", (0.72, 0.72, 0.75, 1.0)))
     _configure_cloth_settings(cloth.ssbl_cloth, frame_count=frame_count, pin_group="ssbl_pin")
     cloth.ssbl_cloth.preview_writeback_interval = 1
     cloth.ssbl_cloth.substeps = 5
     cloth.ssbl_cloth.iterations = 2
-    cloth.ssbl_cloth.gravity = (0.0, 0.0, 0.0)
+    cloth.ssbl_cloth.gravity = (0.0, 0.0, -2.4)
     cloth.ssbl_cloth.hardness = 0.25
     cloth.ssbl_cloth.use_blender_force_fields = True
     bpy.ops.object.effector_add(type="WIND", location=(-1.25, 0.0, 0.9), rotation=(0.0, math.pi / 2.0, 0.0))
@@ -1524,6 +1555,9 @@ def _record_force_field_tuning() -> DemoResult:
     finite = True
     simulation_elapsed = 0.0
     max_avg_x = _average_x(cloth)
+    start_avg_z = _average_world_z(cloth)
+    max_avg_z = start_avg_z
+    final_avg_z = start_avg_z
     force_field_counts: list[int] = []
     max_turbulence_strength = float(turbulence.field.strength)
 
@@ -1533,13 +1567,13 @@ def _record_force_field_tuning() -> DemoResult:
     for frame in range(0, frame_count + 1):
         progress = frame / max(frame_count, 1)
         gust = _gust_curve(progress * math.tau * 3.5)
-        turbulence.field.strength = 16.0 + 19.0 * gust
-        turbulence.field.size = 0.95 + 0.55 * (1.0 - gust)
-        turbulence.field.flow = 0.8 + 0.9 * _gust_curve(progress * math.tau * 2.2 + 0.9)
-        turbulence.field.noise = 1.35 + 1.1 * _gust_curve(progress * math.tau * 4.8 + 1.7)
-        turbulence.location.y = math.sin(progress * math.tau * 1.6) * 0.38
-        turbulence.location.z = 0.95 + math.cos(progress * math.tau * 1.9) * 0.18
-        wind.field.strength = 24.0 + 26.0 * _gust_curve(progress * math.tau * 2.8 + 0.4)
+        turbulence.field.strength = 6.0 + 10.0 * gust
+        turbulence.field.size = 0.85 + 0.35 * (1.0 - gust)
+        turbulence.field.flow = 0.55 + 0.55 * _gust_curve(progress * math.tau * 2.2 + 0.9)
+        turbulence.field.noise = 0.80 + 0.65 * _gust_curve(progress * math.tau * 4.8 + 1.7)
+        turbulence.location.y = math.sin(progress * math.tau * 1.6) * 0.32
+        turbulence.location.z = 0.88 + math.cos(progress * math.tau * 1.9) * 0.04
+        wind.field.strength = 18.0 + 20.0 * _gust_curve(progress * math.tau * 2.8 + 0.4)
         if frame >= frame_count * 0.72:
             cloth.ssbl_cloth.hardness = 0.72
             cloth.ssbl_cloth.hardness_initialized = True
@@ -1558,6 +1592,8 @@ def _record_force_field_tuning() -> DemoResult:
             step_ms_samples.append(last_ms)
         finite = finite and _finite_mesh(cloth) and bool(diag.finite)
         max_avg_x = max(max_avg_x, _average_x(cloth))
+        final_avg_z = _average_world_z(cloth)
+        max_avg_z = max(max_avg_z, final_avg_z)
         force_field_counts.append(int(diag.force_field_count))
         max_turbulence_strength = max(max_turbulence_strength, float(turbulence.field.strength))
         metrics_line = _format_metrics_line(frame, frame_count, last_ms, native_ms)
@@ -1596,103 +1632,170 @@ def _record_force_field_tuning() -> DemoResult:
             "final_wind_strength": float(wind.field.strength),
             "final_turbulence_strength": float(turbulence.field.strength),
             "max_turbulence_strength": max_turbulence_strength,
+            "start_average_z": start_avg_z,
+            "max_average_z": max_avg_z,
+            "final_average_z": final_avg_z,
             "final_hardness": float(cloth.ssbl_cloth.hardness),
         },
     )
 
 
-def _make_tshirt_cloth(name: str, color: tuple[float, float, float, float]) -> bpy.types.Object:
-    x_segments = 28
-    y_segments = 28
-    width = 2.2
-    height = 2.0
-    x_values = [-width * 0.5 + width * index / x_segments for index in range(x_segments + 1)]
-    y_values = [-height * 0.5 + height * index / y_segments for index in range(y_segments + 1)]
+def _smoothstep(value: float) -> float:
+    clamped = max(0.0, min(1.0, float(value)))
+    return clamped * clamped * (3.0 - 2.0 * clamped)
 
-    def _inside(center_x: float, center_y: float) -> bool:
-        torso = abs(center_x) <= 0.48 and center_y <= 0.28
-        sleeves = abs(center_x) <= 0.94 and 0.02 <= center_y <= 0.62
-        shoulders = abs(center_x) <= 0.62 and 0.28 <= center_y <= 0.86
-        neck = center_y >= 0.54 and (center_x ** 2 + (center_y - 0.72) ** 2) <= 0.05
-        return (torso or sleeves or shoulders) and not neck
 
-    used: dict[tuple[int, int], int] = {}
-    vertices: list[tuple[float, float, float]] = []
+def _make_spiral_floor_visual() -> None:
+    floor = _plane_mesh(
+        "SSBL_Demo_Spiral_Floor",
+        [(-3.6, -3.0, 0.0), (3.6, -3.0, 0.0), (3.6, 3.0, 0.0), (-3.6, 3.0, 0.0)],
+        (0.0, 0.0, 0.0),
+        (0.085, 0.090, 0.102, 1.0),
+    )
+    floor.show_wire = False
+
+
+def _make_spiral_drop_cloth(name: str, color: tuple[float, float, float, float]) -> bpy.types.Object:
+    segments = 42
+    size = 2.18
+    start_angle = -0.45
+    start_radius = 0.82
+    center = (
+        math.cos(start_angle) * start_radius,
+        math.sin(start_angle) * start_radius * 0.72,
+        2.28,
+    )
+    half = size * 0.5
+    verts: list[tuple[float, float, float]] = []
     faces: list[tuple[int, int, int, int]] = []
-
-    def _index(ix: int, iy: int) -> int:
-        key = (ix, iy)
-        existing = used.get(key)
-        if existing is not None:
-            return existing
-        new_index = len(vertices)
-        used[key] = new_index
-        vertices.append((x_values[ix], y_values[iy], 0.0))
-        return new_index
-
-    for iy in range(y_segments):
-        for ix in range(x_segments):
-            center_x = (x_values[ix] + x_values[ix + 1]) * 0.5
-            center_y = (y_values[iy] + y_values[iy + 1]) * 0.5
-            if not _inside(center_x, center_y):
-                continue
-            faces.append(
-                (
-                    _index(ix, iy),
-                    _index(ix + 1, iy),
-                    _index(ix + 1, iy + 1),
-                    _index(ix, iy + 1),
-                )
-            )
+    for y in range(segments + 1):
+        fy = -half + size * y / segments
+        for x in range(segments + 1):
+            fx = -half + size * x / segments
+            radial = max(abs(fx), abs(fy)) / max(half, 1.0e-6)
+            edge_lift = 0.035 * _smoothstep((radial - 0.58) / 0.42)
+            # A small asymmetric rest ripple helps the free settling keep soft folds.
+            fz = 0.026 * math.sin(fx * 4.2) * math.cos(fy * 3.5)
+            fz += edge_lift * math.sin(fx * 2.7 + fy * 1.9)
+            verts.append((fx, fy, fz))
+    stride = segments + 1
+    for y in range(segments):
+        for x in range(segments):
+            base = y * stride + x
+            faces.append((base, base + 1, base + stride + 1, base + stride))
 
     mesh = bpy.data.meshes.new(f"{name}_Mesh")
-    mesh.from_pydata(vertices, [], faces)
+    mesh.from_pydata(verts, [], faces)
     mesh.update()
     obj = bpy.data.objects.new(name, mesh)
-    obj.location = (0.0, 0.0, 2.7)
-    obj.rotation_euler = (0.0, 0.0, math.radians(12.0))
+    obj.location = center
+    obj.rotation_euler = (0.0, 0.0, math.radians(8.0))
     obj.data.materials.append(_material(f"{name}_Mat", color))
     bpy.context.scene.collection.objects.link(obj)
-    _beautify_cloth(obj)
+
+    pin = obj.vertex_groups.new(name="ssbl_pin")
+    for vert in obj.data.vertices:
+        fx = float(vert.co.x)
+        fy = float(vert.co.y)
+        edge = max(abs(fx), abs(fy)) / max(half, 1.0e-6)
+        corner = min(abs(fx), abs(fy)) / max(half, 1.0e-6)
+        near_center = math.hypot(fx, fy) <= size * 0.075
+        if edge < 0.60 and not near_center:
+            continue
+        weight = 0.22 + 0.30 * _smoothstep((edge - 0.60) / 0.40)
+        if corner > 0.70:
+            weight += 0.08
+        if near_center:
+            weight = 0.18
+        pin.add([vert.index], min(weight, 0.66), "ADD")
+    _beautify_cloth(obj, levels=1)
     return obj
 
 
-def _make_torso_collider() -> bpy.types.Collection:
-    torso_mat = _material("SSBL_Demo_Torso_Mat", (0.20, 0.22, 0.26, 1.0))
-    neck_mat = _material("SSBL_Demo_Neck_Mat", (0.28, 0.30, 0.34, 1.0))
+def _spiral_drop_pin_targets(cloth, frame: int, frame_count: int) -> tuple[np.ndarray, np.ndarray]:
+    pin_indices = np.asarray(cloth.pin_indices, dtype=np.intp)
+    rest = np.asarray(cloth.positions_world[pin_indices], dtype=np.float32)
+    rest_center = np.mean(rest, axis=0) if len(rest) else np.zeros(3, dtype=np.float32)
+    local = rest - rest_center
 
-    bpy.ops.mesh.primitive_uv_sphere_add(segments=28, ring_count=16, radius=0.72, location=(0.0, 0.0, 1.14))
-    torso = bpy.context.object
-    torso.name = "SSBL_Demo_Torso"
-    torso.scale = (0.95, 0.72, 1.28)
-    torso.data.materials.append(torso_mat)
+    progress = max(0.0, min(1.0, float(frame) / max(float(frame_count), 1.0)))
+    guide_end = 0.54
+    gather_start = 0.32
+    gather_end = 0.76
+    release_start = 0.70
+    release_end = 0.88
+    guide = _smoothstep(progress / guide_end)
+    drop = _smoothstep(progress / 0.62)
+    gather = _smoothstep((progress - gather_start) / max(gather_end - gather_start, 1.0e-6))
+    release = _smoothstep((progress - release_start) / max(release_end - release_start, 1.0e-6))
 
-    bpy.ops.mesh.primitive_uv_sphere_add(segments=20, ring_count=10, radius=0.22, location=(0.0, 0.0, 2.1))
-    neck = bpy.context.object
-    neck.name = "SSBL_Demo_Neck"
-    neck.scale = (0.72, 0.72, 1.05)
-    neck.data.materials.append(neck_mat)
+    start_angle = -0.45
+    angle = start_angle + math.tau * 1.42 * guide
+    radius = 0.82 + (0.10 - 0.82) * guide
+    center = np.array(
+        (
+            math.cos(angle) * radius,
+            math.sin(angle) * radius * 0.72,
+            2.28 + (0.48 - 2.28) * drop,
+        ),
+        dtype=np.float32,
+    )
 
-    collection = bpy.data.collections.new("SSBL_Demo_Torso_Collider_Collection")
-    bpy.context.scene.collection.children.link(collection)
-    for obj in (torso, neck):
-        try:
-            bpy.context.scene.collection.objects.unlink(obj)
-        except Exception:
-            pass
-        collection.objects.link(obj)
-    return collection
+    spin = math.radians(8.0) + math.tau * 1.18 * guide + math.radians(62.0) * gather
+    cos_spin = math.cos(spin)
+    sin_spin = math.sin(spin)
+    targets = np.empty_like(rest, dtype=np.float32)
+    phase = math.tau * 2.2 * guide + math.tau * 0.65 * gather
+    wave_strength = (0.13 + 0.16 * gather) * (1.0 - release)
+    for index, point in enumerate(local):
+        x = float(point[0])
+        y = float(point[1])
+        radial = min(1.25, math.hypot(x, y) / 1.30)
+        edge = _smoothstep((radial - 0.32) / 0.68)
+        fold_scale = 1.0 - gather * edge * 0.62
+        rotated_x = cos_spin * x - sin_spin * y
+        rotated_y = sin_spin * x + cos_spin * y
+        rotated_x *= fold_scale
+        rotated_y *= fold_scale
+        curl = gather * edge * 0.18
+        rotated_x += curl * math.sin(y * 5.2 + phase)
+        rotated_y += curl * math.cos(x * 4.7 - phase * 0.8)
+        ripple = wave_strength * math.sin(x * 4.1 + phase) * math.cos(y * 3.4 - phase * 0.65)
+        fold_lift = gather * edge * (0.10 + 0.17 * (0.5 + 0.5 * math.sin(math.atan2(y, x) * 4.0 + phase)))
+        floor_bias = 0.08 * gather * edge
+        targets[index] = (
+            center[0] + rotated_x,
+            center[1] + rotated_y,
+            max(0.10, center[2] + float(point[2]) + ripple + fold_lift - floor_bias),
+        )
+
+    weights = np.asarray(cloth.pin_weights, dtype=np.float32) * (1.0 - release)
+    if progress >= release_end:
+        weights = np.zeros_like(weights, dtype=np.float32)
+    return np.ascontiguousarray(targets, dtype=np.float32), np.ascontiguousarray(weights, dtype=np.float32)
+
+
+def _step_spiral_drop_frame(session, obj: bpy.types.Object, frame: int, frame_count: int):
+    slot = session.slots[obj.name]
+    if len(slot.cloth.pin_indices) > 0:
+        pin_targets, pin_weights = _spiral_drop_pin_targets(slot.cloth, frame, frame_count)
+        slot.native.update_pin_targets(slot.cloth.pin_indices, pin_targets, pin_weights)
+        slot.pin_targets_world = np.array(pin_targets, dtype=np.float32, copy=True)
+    slot.native.step(slot.substeps, slot.iterations)
+    slot.current_positions_world = np.array(slot.native.download_positions(), dtype=np.float32, copy=True)
+    _apply_world_positions(obj, slot.current_positions_world, slot.cloth.matrix_world_inv)
+    return slot.native.cached_diagnostics()
 
 
 def _record_tshirt_drape() -> DemoResult:
     name = "05_tshirt_drape_realtime"
-    title = "SSBL realtime T-shirt drop - body contact drape"
+    title = "SSBL realtime spiral cloth drop - floor pile"
     keywords = [
-        "T-Shirt Drape",
-        "Body Collision",
-        "Natural Wrinkles",
+        "Spiral Cloth Drop",
+        "Ground Contact",
+        "Stable Floor Pile",
     ]
-    frame_count = 60
+    frame_count = 144
     _clear_scene()
     _case_dir, frames_dir, video_path = _ensure_output_dir(name)
     scene = bpy.context.scene
@@ -1701,26 +1804,34 @@ def _record_tshirt_drape() -> DemoResult:
     scene.frame_set(1)
     camera = _configure_scene_render(
         scene,
-        camera_location=(3.6, -4.5, 2.95),
-        target=(0.0, 0.0, 1.42),
-        ortho_scale=4.2,
+        camera_location=(4.20, -5.35, 2.85),
+        target=(0.0, -0.04, 1.18),
+        ortho_scale=5.05,
     )
     overlay = _create_overlay(scene, camera, title)
 
-    collider_collection = _make_torso_collider()
-    cloth = _make_tshirt_cloth("SSBL_Demo_Tshirt", (0.93, 0.22, 0.18, 1.0))
+    _make_spiral_floor_visual()
+    cloth = _make_spiral_drop_cloth("SSBL_Demo_Tshirt", (0.86, 0.48, 0.62, 1.0))
     _configure_collision_settings(cloth.ssbl_cloth, frame_count=frame_count)
     cloth.ssbl_cloth.gravity = (0.0, 0.0, -9.8)
+    cloth.ssbl_cloth.pin_vertex_group = "ssbl_pin"
+    cloth.ssbl_cloth.use_ground = True
+    cloth.ssbl_cloth.ground_height = 0.0
     cloth.ssbl_cloth.self_collision = True
     cloth.ssbl_cloth.self_collision_mode = "fast"
     cloth.ssbl_cloth.self_collision_interval = 1
-    cloth.ssbl_cloth.max_self_collision_neighbors = 48
-    cloth.ssbl_cloth.static_collider_collection = collider_collection
+    cloth.ssbl_cloth.max_self_collision_neighbors = 96
+    cloth.ssbl_cloth.fast_self_collision_passes = 6
+    cloth.ssbl_cloth.static_collider_collection = None
     cloth.ssbl_cloth.damping = 0.992
-    cloth.ssbl_cloth.collision_margin = 0.026
-    cloth.ssbl_cloth.cloth_thickness = 0.028
-    cloth.ssbl_cloth.substeps = 10
-    cloth.ssbl_cloth.iterations = 2
+    cloth.ssbl_cloth.hardness = 0.34
+    cloth.ssbl_cloth.hardness_initialized = True
+    cloth.ssbl_cloth.collision_margin = 0.032
+    cloth.ssbl_cloth.cloth_thickness = 0.032
+    cloth.ssbl_cloth.substeps = 16
+    cloth.ssbl_cloth.iterations = 4
+    cloth.ssbl_cloth.contact_friction = 0.94
+    cloth.ssbl_cloth.contact_tangent_damping = 0.72
 
     before = _mesh_snapshot(cloth)
     bpy.ops.object.select_all(action="DESELECT")
@@ -1735,6 +1846,9 @@ def _record_tshirt_drape() -> DemoResult:
     simulation_elapsed = 0.0
     max_static_collision_ms = 0.0
     min_cloth_z = float("inf")
+    final_min_z = 0.0
+    final_height_span = 0.0
+    max_below_ground_depth = 0.0
     max_x_span = 0.0
 
     for frame in range(0, frame_count + 1):
@@ -1744,17 +1858,21 @@ def _record_tshirt_drape() -> DemoResult:
         if frame > 0:
             started = time.perf_counter()
             scene.frame_set(frame)
-            ssbl.solver.step_preview(bpy.context, cloth.name)
+            diag = _step_spiral_drop_frame(session, cloth, frame, frame_count)
             elapsed = time.perf_counter() - started
             simulation_elapsed += elapsed
             last_ms = elapsed * 1000.0
-            diag = ssbl.solver.session_diagnostics(cloth)
             native_ms = float(diag.step_ms)
             step_ms_samples.append(last_ms)
         finite = finite and _finite_mesh(cloth) and bool(diag.finite)
         positions = np.asarray(session.slots[cloth.name].current_positions_world, dtype=np.float64)
         if len(positions):
-            min_cloth_z = min(min_cloth_z, float(np.min(positions[:, 2])))
+            current_min_z = float(np.min(positions[:, 2]))
+            current_max_z = float(np.max(positions[:, 2]))
+            min_cloth_z = min(min_cloth_z, current_min_z)
+            final_min_z = current_min_z
+            final_height_span = current_max_z - current_min_z
+            max_below_ground_depth = max(max_below_ground_depth, max(0.0, -current_min_z))
             max_x_span = max(max_x_span, float(np.max(positions[:, 0]) - np.min(positions[:, 0])))
         max_static_collision_ms = max(max_static_collision_ms, float(diag.static_collision_ms))
         metrics_line = _format_metrics_line(frame, frame_count, last_ms, native_ms)
@@ -1777,7 +1895,7 @@ def _record_tshirt_drape() -> DemoResult:
         name=name,
         title=title,
         source_repo=SOURCE_DIFFCLOTH,
-        source_scene="DiffCloth T-shirt / sphere family adapted to a torso drape shot",
+        source_scene="Custom spiral-guided cloth drop onto an SSBL ground plane",
         keywords=keywords,
         video_path=video_path,
         frames_dir=frames_dir,
@@ -1790,6 +1908,10 @@ def _record_tshirt_drape() -> DemoResult:
             "slots": len(session.slots),
             "max_static_collision_ms": max_static_collision_ms,
             "min_cloth_z": min_cloth_z,
+            "final_min_z": final_min_z,
+            "max_below_ground_depth": max_below_ground_depth,
+            "final_height_span": final_height_span,
+            "self_collision_mode": str(cloth.ssbl_cloth.self_collision_mode),
             "max_x_span": max_x_span,
         },
     )

@@ -1,3 +1,5 @@
+import argparse
+import importlib.util
 import json
 import math
 import os
@@ -17,12 +19,17 @@ import ssbl
 
 
 def _find_monkey():
+    target_name = os.environ.get("SSBL_RECORD_TARGET") or os.environ.get("SSBL_CS2_TARGET")
+    if target_name:
+        obj = bpy.data.objects.get(target_name)
+        if obj is not None and obj.type == "MESH":
+            return obj
     active = bpy.context.active_object
-    if active is not None and active.type == "MESH":
-        return active
     for obj in bpy.context.scene.objects:
         if obj.type == "MESH" and "suzanne" in obj.name.lower():
             return obj
+    if active is not None and active.type == "MESH":
+        return active
     meshes = [obj for obj in bpy.context.scene.objects if obj.type == "MESH"]
     if not meshes:
         raise RuntimeError("No mesh object found in the scene")
@@ -88,6 +95,62 @@ def _float_env(name, default):
         return float(value)
     except ValueError:
         return default
+
+
+def _script_argv():
+    return sys.argv[sys.argv.index("--") + 1 :] if "--" in sys.argv else []
+
+
+def _key_steps_from_env():
+    raw = os.environ.get("SSBL_RECORD_KEY_STEPS", "").strip()
+    if not raw:
+        return set()
+    result = set()
+    for part in raw.replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            value = int(float(part))
+        except ValueError:
+            continue
+        if value > 0:
+            result.add(value)
+    return result
+
+
+def _load_quality_gate_module():
+    path = Path(__file__).with_name("cs2_fast_quality_gate.py")
+    spec = importlib.util.spec_from_file_location("ssbl_cs2_fast_quality_gate", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not load quality gate module from {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _parse_args():
+    gate_module = _load_quality_gate_module()
+    parser = argparse.ArgumentParser(description="Record current-scene SSBL monkey preview diagnostics.")
+    parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument(
+        "--quality-gate",
+        dest="quality_gate",
+        action="store_true",
+        default=_bool_env("SSBL_RECORD_QUALITY_GATE", True),
+    )
+    parser.add_argument("--no-quality-gate", dest="quality_gate", action="store_false")
+    gate_module.add_threshold_arguments(parser)
+    return parser.parse_args(_script_argv())
+
+
+def _thresholds_from_args(args):
+    gate_module = _load_quality_gate_module()
+    return gate_module.thresholds_from_args(
+        args,
+        gate_module.thresholds_from_env(("SSBL_RECORD_GATE", "SSBL_CS2_GATE")),
+    )
 
 
 def _apply_env_overrides(settings):
@@ -219,13 +282,14 @@ def _render_frame(scene, obj, frames_dir, index, label, diagnostics):
 
 
 def main():
+    args = _parse_args()
     try:
         ssbl.unregister()
     except Exception:
         pass
     ssbl.register()
 
-    output_override = os.environ.get("SSBL_RECORD_OUTPUT_DIR")
+    output_override = str(args.output_dir) if args.output_dir else os.environ.get("SSBL_RECORD_OUTPUT_DIR")
     output_dir = Path(output_override) if output_override else Path(tempfile.gettempdir()) / "ssbl_current_scene_monkey_recording"
     frames_dir = output_dir / "frames"
     frames_dir.mkdir(parents=True, exist_ok=True)
@@ -252,9 +316,11 @@ def main():
     _render_frame(scene, obj, frames_dir, 1, "start", diagnostics)
 
     frame_count = min(max(int(getattr(settings, "frame_count", 24)), 1), 60)
+    key_steps = _key_steps_from_env()
     for i in range(1, frame_count + 1):
         ssbl.solver.step_preview(bpy.context, obj.name)
-        if i <= 12 or i == frame_count or i % 5 == 0:
+        should_render_step = i in key_steps if key_steps else (i <= 12 or i == frame_count or i % 5 == 0)
+        if should_render_step:
             _render_frame(scene, obj, frames_dir, i + 1, f"step{i}", diagnostics)
 
     ssbl.solver.request_stop(obj)
@@ -279,10 +345,18 @@ def main():
         "diagnostics": diagnostics,
         "frame_paths": [str(path) for path in sorted(frames_dir.glob("*.*")) if path.suffix.lower() in {".png", ".jpg", ".jpeg"}],
     }
+    gate_module = _load_quality_gate_module()
+    gate_result = gate_module.evaluate_summary(summary, thresholds=_thresholds_from_args(args))
+    summary["quality_gate"] = gate_result
     summary_path = output_dir / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print("SSBL_SCENE_MONKEY_SUMMARY", str(summary_path))
+    print("SSBL_SCENE_MONKEY_QUALITY_GATE " + json.dumps(gate_result, ensure_ascii=False, sort_keys=True))
+    print("SSBL_SCENE_MONKEY_SUMMARY_JSON " + json.dumps(summary, ensure_ascii=False, sort_keys=True))
     print(json.dumps(summary, ensure_ascii=False))
+    if args.quality_gate and not bool(gate_result["passed"]):
+        categories = ", ".join(gate_result["failure_categories"])
+        raise RuntimeError(f"Scene monkey preview quality gate failed: {categories}")
 
 
 if __name__ == "__main__":

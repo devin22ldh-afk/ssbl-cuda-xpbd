@@ -100,6 +100,7 @@ def main() -> None:
         max_particle_overflow = 0
         max_dynamic_triangles = 0
         max_resolved_contacts = 0
+        max_contact_cache_overflow = 0
         for _frame in range(FRAME_COUNT):
             ssbl.solver.step_preview(bpy.context, cloth.name)
             diagnostics = ssbl.solver.session_diagnostics(cloth)
@@ -110,6 +111,7 @@ def main() -> None:
             max_particle_overflow = max(max_particle_overflow, int(diagnostics.dynamic_particle_overflow))
             max_dynamic_triangles = max(max_dynamic_triangles, int(diagnostics.dynamic_triangle_count))
             max_resolved_contacts = max(max_resolved_contacts, int(diagnostics.resolved_contacts))
+            max_contact_cache_overflow = max(max_contact_cache_overflow, int(diagnostics.external_contact_cache_overflow))
             for slot in session.slots.values():
                 finite = finite and _finite_positions(np.asarray(slot.current_positions_world, dtype=np.float64))
             if not finite:
@@ -129,8 +131,11 @@ def main() -> None:
             "max_dynamic_particle_overflow": int(max_particle_overflow),
             "max_dynamic_triangle_count": int(max_dynamic_triangles),
             "max_resolved_contacts": int(max_resolved_contacts),
+            "max_contact_cache_overflow": int(max_contact_cache_overflow),
             "dynamic_particle_collision_ms": float(diagnostics.dynamic_particle_collision_ms),
             "dynamic_collision_ms": float(diagnostics.dynamic_collision_ms),
+            "dynamic_triangle_upload_ms": float(diagnostics.dynamic_triangle_upload_ms),
+            "dynamic_particle_upload_ms": float(diagnostics.dynamic_particle_upload_ms),
             "stopped": bool(stopped),
         }
         print("SSBL_MULTICLOTH_PARTICLE_CONTACT_SMOKE", json.dumps(result, ensure_ascii=False, sort_keys=True))
@@ -144,6 +149,7 @@ def main() -> None:
             and result["max_dynamic_particle_overflow"] == 0
             and result["max_dynamic_triangle_count"] > 0
             and result["max_resolved_contacts"] > 0
+            and result["max_contact_cache_overflow"] == 0
             and result["stopped"]
         ):
             raise RuntimeError(f"Multi-cloth particle contact smoke failed: {result}")
@@ -152,7 +158,9 @@ def main() -> None:
             and result["max_dynamic_triangle_count"] > 4096
             and result["max_dynamic_particle_candidate_count"] > 0
             and result["max_dynamic_particle_contacts"] > 0
+            and result["max_dynamic_particle_overflow"] == 0
             and result["max_resolved_contacts"] > 0
+            and result["max_contact_cache_overflow"] == 0
             and result["finite"]
         ):
             raise RuntimeError(f"Large multi-cloth particle contact smoke failed: {result}")

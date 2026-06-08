@@ -148,6 +148,8 @@ def main() -> None:
         max_contact_cache_count = 0
         max_contact_cache_overflow = 0
         max_friction_corrections = 0
+        max_dynamic_particles = 0
+        max_particle_overflow = 0
         finite = True
         for _frame in range(FRAME_COUNT):
             ssbl.solver.step_preview(bpy.context, cloth.name)
@@ -158,6 +160,8 @@ def main() -> None:
             max_contact_cache_count = max(max_contact_cache_count, int(diagnostics.external_contact_cache_count))
             max_contact_cache_overflow = max(max_contact_cache_overflow, int(diagnostics.external_contact_cache_overflow))
             max_friction_corrections = max(max_friction_corrections, int(diagnostics.external_friction_corrections))
+            max_dynamic_particles = max(max_dynamic_particles, int(diagnostics.dynamic_particle_count))
+            max_particle_overflow = max(max_particle_overflow, int(diagnostics.dynamic_particle_overflow))
             finite = finite and bool(diagnostics.finite)
             for slot in session.slots.values():
                 finite = finite and _finite_positions(slot.current_positions_world)
@@ -178,13 +182,25 @@ def main() -> None:
             "max_contact_cache_count": int(max_contact_cache_count),
             "max_contact_cache_overflow": int(max_contact_cache_overflow),
             "max_friction_corrections": int(max_friction_corrections),
+            "max_dynamic_particle_count": int(max_dynamic_particles),
+            "max_dynamic_particle_overflow": int(max_particle_overflow),
             "dynamic_collision_ms": float(diagnostics.dynamic_collision_ms),
             "dynamic_upload_ms": float(diagnostics.dynamic_upload_ms),
+            "dynamic_triangle_upload_ms": float(diagnostics.dynamic_triangle_upload_ms),
+            "dynamic_particle_upload_ms": float(diagnostics.dynamic_particle_upload_ms),
             "restored_cloth_mesh": bool(cloth.data == session.slots[cloth.name].original_mesh) if cloth.name in session.slots else True,
             "stopped": bool(stopped),
             "cloth_restore_delta": _max_source_delta(cloth, before_cloth),
             "sphere_restore_delta": _max_source_delta(sphere, before_sphere),
         }
+        legacy_cache_active = result["max_contact_cache_hits"] > 0 and result["max_contact_cache_count"] > 0
+        dynamic_contact_path_active = (
+            result["max_dynamic_triangle_count"] > 0
+            and result["max_dynamic_particle_count"] > 0
+            and result["max_resolved_contacts"] > 0
+        )
+        result["legacy_contact_cache_active"] = bool(legacy_cache_active)
+        result["dynamic_contact_path_active"] = bool(dynamic_contact_path_active)
         print("SSBL_MULTICLOTH_CONTACT_STABILITY_SMOKE", json.dumps(result, ensure_ascii=False, sort_keys=True))
         if not (
             result["slots"] == 2
@@ -192,9 +208,10 @@ def main() -> None:
             and result["finite"]
             and result["max_dynamic_triangle_count"] > 0
             and result["max_resolved_contacts"] > 0
-            and result["max_contact_cache_hits"] > 0
-            and result["max_contact_cache_count"] > 0
+            and (legacy_cache_active or dynamic_contact_path_active)
             and result["max_contact_cache_overflow"] == 0
+            and result["max_dynamic_particle_count"] > 0
+            and result["max_dynamic_particle_overflow"] == 0
             and result["max_edge_ratio"] < MAX_EDGE_RATIO_LIMIT
             and result["stopped"]
             and result["cloth_restore_delta"] == 0.0
