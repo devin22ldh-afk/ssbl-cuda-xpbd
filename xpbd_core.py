@@ -194,6 +194,20 @@ def _clamp01(value: float) -> float:
     return max(0.0, min(1.0, float(value)))
 
 
+def pin_hardness_from_settings(settings) -> float:
+    return _clamp01(float(getattr(settings, "pin_hardness", 1.0)))
+
+
+def effective_pin_weights_from_settings(
+    obj: bpy.types.Object,
+    settings,
+    vertex_count: int,
+) -> np.ndarray:
+    group_name = str(getattr(settings, "pin_vertex_group", "")).strip()
+    weights = pin_weights_from_group(obj, group_name, vertex_count)
+    return np.ascontiguousarray(weights * pin_hardness_from_settings(settings), dtype=np.float32)
+
+
 def _log_interpolate(soft_value: float, hard_value: float, hardness: float) -> float:
     hardness = _clamp01(hardness)
     return float(np.exp(np.log(soft_value) * (1.0 - hardness) + np.log(hard_value) * hardness))
@@ -369,7 +383,7 @@ def _build_cloth_data_uncached(
     if len(triangles) == 0:
         raise ValueError("当前网格至少需要一个面")
 
-    pin_weights_by_vertex = pin_weights_from_group(obj, str(settings.pin_vertex_group).strip(), len(local))
+    pin_weights_by_vertex = effective_pin_weights_from_settings(obj, settings, len(local))
     pin_mask = pin_weights_by_vertex > 0.0
     hard_pin_mask = pin_weights_by_vertex >= PIN_HARD_WEIGHT_THRESHOLD
     if np.all(hard_pin_mask):
@@ -468,7 +482,7 @@ def _build_cloth_data_from_mesh(
 ) -> ClothBuildData:
     world, _matrix_world = to_world(local, matrix_world)
     matrix_world_inv = np.array(matrix_world.inverted(), dtype=np.float32)
-    pin_weights_by_vertex = pin_weights_from_group(obj, str(settings.pin_vertex_group).strip(), len(local))
+    pin_weights_by_vertex = effective_pin_weights_from_settings(obj, settings, len(local))
     pin_mask = pin_weights_by_vertex > 0.0
     hard_pin_mask = pin_weights_by_vertex >= PIN_HARD_WEIGHT_THRESHOLD
     pin_indices = np.flatnonzero(pin_mask).astype(np.int32)

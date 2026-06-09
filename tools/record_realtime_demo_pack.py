@@ -65,6 +65,9 @@ class DemoResult:
     simulation_steps: int
     simulation_elapsed_s: float
     average_simulation_fps: float
+    average_record_step_fps: float
+    average_viewport_preview_fps: float
+    encoded_video_fps: float
     average_step_ms: float
     p95_step_ms: float
     finite: bool
@@ -309,9 +312,42 @@ def _current_sim_fps(last_step_ms: float, native_ms: float) -> float:
     return 1000.0 / step_ms
 
 
-def _format_metrics_line(frame: int, total_frames: int, last_step_ms: float, native_ms: float) -> str:
-    sim_fps = _current_sim_fps(last_step_ms, native_ms)
-    return f"Realtime FPS: {sim_fps:5.1f}"
+def _valid_fps(value: float | None) -> bool:
+    if value is None:
+        return False
+    value = float(value)
+    return math.isfinite(value) and value > 0.0
+
+
+def _average_fps(values: list[float] | None) -> float:
+    if not values:
+        return 0.0
+    valid = [float(value) for value in values if _valid_fps(value)]
+    return sum(valid) / len(valid) if valid else 0.0
+
+
+def _sample_fps_for_frame(samples: list[float] | None, frame: int) -> float:
+    if not samples:
+        return 0.0
+    index = max(0, min(int(frame), len(samples) - 1))
+    value = float(samples[index])
+    if _valid_fps(value):
+        return value
+    for fallback in samples:
+        if _valid_fps(fallback):
+            return float(fallback)
+    return 0.0
+
+
+def _format_metrics_line(
+    frame: int,
+    total_frames: int,
+    last_step_ms: float,
+    native_ms: float,
+    viewport_fps: float | None = None,
+) -> str:
+    fps = float(viewport_fps) if _valid_fps(viewport_fps) else _current_sim_fps(last_step_ms, native_ms)
+    return f"Viewport FPS: {fps:5.1f}"
 
 
 def _compose_overlay_text(title: str, metrics_line: str, note_line: str) -> str:
@@ -506,10 +542,12 @@ def _summarize_demo(
     finite: bool,
     restore_delta: float,
     metrics: dict[str, object],
+    viewport_fps_samples: list[float] | None = None,
 ) -> DemoResult:
     steps = len(step_ms_samples)
-    average_fps = steps / max(float(simulation_elapsed), 1.0e-9)
+    average_record_step_fps = steps / max(float(simulation_elapsed), 1.0e-9)
     average_ms = sum(step_ms_samples) / max(steps, 1)
+    average_viewport_preview_fps = _average_fps(viewport_fps_samples)
     probe = _ffprobe(video_path)
     validation_passed = bool(finite and restore_delta <= RESTORE_TOLERANCE and video_path.exists() and video_path.stat().st_size > 0)
     if not validation_passed:
@@ -530,7 +568,10 @@ def _summarize_demo(
         frame_count=len(frame_paths),
         simulation_steps=steps,
         simulation_elapsed_s=float(simulation_elapsed),
-        average_simulation_fps=float(average_fps),
+        average_simulation_fps=float(average_record_step_fps),
+        average_record_step_fps=float(average_record_step_fps),
+        average_viewport_preview_fps=float(average_viewport_preview_fps),
+        encoded_video_fps=float(VIDEO_FPS),
         average_step_ms=float(average_ms),
         p95_step_ms=float(_p95(step_ms_samples)),
         finite=bool(finite),

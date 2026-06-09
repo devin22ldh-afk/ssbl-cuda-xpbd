@@ -94,6 +94,7 @@ class SSBL_PT_material(bpy.types.Panel):
         col.label(text="空间约束", icon="PINNED")
         box_pin = col.box()
         box_pin.prop(settings, "pin_vertex_group", text="钉固顶点组")
+        box_pin.prop(settings, "pin_hardness", text="钉固硬度", slider=True)
         
         layout.separator()
 

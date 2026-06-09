@@ -23,6 +23,7 @@ from .xpbd_core import (
     SELF_COLLISION_FAST,
     build_cloth_data,
     clear_cloth_topology_cache,
+    effective_pin_weights_from_settings,
     make_pin_attachment_batch,
     settings_to_options,
     to_local,
@@ -38,6 +39,8 @@ _CACHE_PATH_PROP = "_ssbl_xpbd_cache_path"
 _CACHE_MODIFIER_NAME = "SSBL XPBD Cache"
 _UNSUPPORTED_INPUT_TYPES = {"solid", "rod", "stitch", "tet"}
 _OBJECT_COLLISION_LAYER_PROP = "ssbl_collision_layer"
+_INTERACTIVE_PIN_PROP = "_ssbl_interactive_pin"
+_INTERACTIVE_PIN_PREFIX = "SSBL_Interactive_Pin"
 _IDENTITY_4X4 = np.eye(4, dtype=np.float32)
 _AUTO_WRITEBACK_INTERVAL = 0
 _MIN_WRITEBACK_INTERVAL = 1
@@ -148,6 +151,21 @@ class CrossClothColliderCache:
 
 
 @dataclass
+class InteractivePinState:
+    object_name: str
+    vertex_index: int
+    pin_group_name: str
+    hook_group_name: str
+    hook_modifier_name: str
+    empty_name: str
+    previous_weight: float | None
+    previous_preview_weight: float | None
+    previous_active_name: str
+    previous_selection_names: list[str]
+    previous_use_evaluated_mesh: bool
+
+
+@dataclass
 class ClothSlot:
     object_name: str
     cloth: ClothBuildData
@@ -177,6 +195,7 @@ class ClothSlot:
     force_fields_active: bool
     auto_sphere_object_name: str = ""
     force_next_writeback: bool = False
+    interactive_pin: InteractivePinState | None = None
     dynamic_collider_cache: CrossClothColliderCache = field(default_factory=CrossClothColliderCache)
 
 
@@ -405,6 +424,139 @@ def record_viewport_tag_ms(object_name: str, elapsed_ms: float) -> None:
 
 def has_session(obj: Optional[bpy.types.Object]) -> bool:
     return obj is not None and _session_for_object_name(obj.name) is not None
+
+
+def session_object_names(scene: bpy.types.Scene | None = None) -> list[str]:
+    if scene is not None:
+        session = _SCENE_SESSIONS.get(_scene_key(scene))
+        if session is None or session.closed or session.paused:
+            return []
+        return list(session.solve_order)
+    names: list[str] = []
+    for session in _SCENE_SESSIONS.values():
+        if session.closed or session.paused:
+            continue
+        names.extend(session.solve_order)
+    return names
+
+
+def begin_interactive_pin(
+    context: bpy.types.Context,
+    object_name: str,
+    vertex_index: int,
+    world_position,
+) -> bpy.types.Object | None:
+    session = _session_for_object_name(object_name)
+    if session is None or session.closed or session.paused:
+        return None
+    slot = session.slots.get(object_name)
+    obj = bpy.data.objects.get(object_name)
+    if slot is None or obj is None or obj.type != "MESH" or not _rna_alive(slot.original_mesh):
+        return None
+    vertex_index = int(vertex_index)
+    if vertex_index < 0 or vertex_index >= len(slot.original_mesh.vertices):
+        return None
+
+    _clear_interactive_pin_state(slot, obj, restore_selection=False)
+    settings = _settings_for_slot(context, slot)
+    pin_group_name = str(getattr(settings, "pin_vertex_group", "")).strip()
+    if not pin_group_name:
+        pin_group_name = "ssbl_pin"
+        settings.pin_vertex_group = pin_group_name
+
+    previous_active = getattr(context.view_layer.objects, "active", None)
+    previous_selection = [
+        selected.name
+        for selected in getattr(context, "selected_objects", [])
+        if selected is not None and _rna_alive(selected)
+    ]
+    handle = _make_interactive_pin_empty(context, obj, vertex_index, Vector(world_position))
+    state: InteractivePinState | None = None
+    previous_preview_weight = (
+        _vertex_group_weight_on_mesh(obj, slot.preview_mesh, pin_group_name, vertex_index)
+        if _rna_alive(slot.preview_mesh) and not _same_mesh(slot.preview_mesh, slot.original_mesh)
+        else None
+    )
+    with _with_preview_source_state(slot, obj):
+        pin_group = obj.vertex_groups.get(pin_group_name) or obj.vertex_groups.new(name=pin_group_name)
+        previous_weight = _vertex_group_weight(pin_group, vertex_index)
+        pin_group.add([vertex_index], 1.0, "ADD")
+
+        hook_group_name = _unique_vertex_group_name(obj, f"{_INTERACTIVE_PIN_PREFIX}_Hook_{vertex_index}")
+        hook_group = obj.vertex_groups.new(name=hook_group_name)
+        hook_group.add([vertex_index], 1.0, "REPLACE")
+
+        hook_modifier_name = _unique_modifier_name(obj, f"{_INTERACTIVE_PIN_PREFIX}_Hook")
+        modifier = obj.modifiers.new(hook_modifier_name, "HOOK")
+        modifier.object = handle
+        modifier.vertex_group = hook_group_name
+        modifier.matrix_inverse = handle.matrix_world.inverted()
+        modifier.strength = 1.0
+        modifier.show_viewport = True
+        modifier.show_render = True
+        slot.suspended_modifiers.append((modifier.name, True, True))
+        state = InteractivePinState(
+            object_name=obj.name,
+            vertex_index=vertex_index,
+            pin_group_name=pin_group_name,
+            hook_group_name=hook_group_name,
+            hook_modifier_name=modifier.name,
+            empty_name=handle.name,
+            previous_weight=previous_weight,
+            previous_preview_weight=previous_preview_weight,
+            previous_active_name=previous_active.name if previous_active is not None and _rna_alive(previous_active) else "",
+            previous_selection_names=previous_selection,
+            previous_use_evaluated_mesh=bool(slot.use_evaluated_mesh),
+        )
+        slot.interactive_pin = state
+        slot.use_evaluated_mesh = True
+        _refresh_slot_pin_weights_from_group(obj, slot, settings)
+
+    if _rna_alive(slot.preview_mesh) and not _same_mesh(slot.preview_mesh, slot.original_mesh):
+        _add_vertex_group_weight_on_mesh(obj, slot.preview_mesh, pin_group_name, vertex_index, 1.0, "ADD")
+        _add_vertex_group_weight_on_mesh(obj, slot.preview_mesh, hook_group_name, vertex_index, 1.0, "REPLACE")
+
+    _select_interactive_pin_handle(context, handle)
+    slot.force_next_writeback = True
+    return handle
+
+
+def move_interactive_pin(object_name: str, world_position) -> bool:
+    session = _session_for_object_name(object_name)
+    if session is None:
+        return False
+    slot = session.slots.get(object_name)
+    state = slot.interactive_pin if slot is not None else None
+    if state is None:
+        return False
+    handle = bpy.data.objects.get(state.empty_name)
+    if handle is None:
+        return False
+    handle.location = Vector(world_position)
+    slot.force_next_writeback = True
+    return True
+
+
+def end_interactive_pin(object_name: str, *, restore_selection: bool = True) -> bool:
+    session = _session_for_object_name(object_name)
+    if session is None:
+        return False
+    slot = session.slots.get(object_name)
+    obj = bpy.data.objects.get(object_name)
+    if slot is None or obj is None:
+        return False
+    return _clear_interactive_pin_state(slot, obj, restore_selection=restore_selection)
+
+
+def cleanup_interactive_pins(scene: bpy.types.Scene | None = None) -> None:
+    sessions = [_SCENE_SESSIONS.get(_scene_key(scene))] if scene is not None else list(_SCENE_SESSIONS.values())
+    for session in sessions:
+        if session is None:
+            continue
+        for slot in session.slots.values():
+            obj = bpy.data.objects.get(slot.object_name)
+            if obj is not None:
+                _clear_interactive_pin_state(slot, obj)
 
 
 def preview_warnings(obj: bpy.types.Object, settings) -> list[str]:
@@ -803,6 +955,10 @@ def pause_timeline_preview(scene: bpy.types.Scene | None = None) -> None:
         return
     session.paused = True
     for name in session.solve_order:
+        slot = session.slots.get(name)
+        obj = bpy.data.objects.get(name)
+        if slot is not None and obj is not None:
+            _clear_interactive_pin_state(slot, obj)
         _STATUS[name] = STATUS_PREVIEW_PAUSED
 
 
@@ -1244,6 +1400,7 @@ def _solver_options_signature(options, settings=None) -> tuple:
         int(getattr(options, "static_sdf_max_resolution", 160)),
         round(float(getattr(settings, "density", 1.0)), 6) if settings is not None else 1.0,
         str(getattr(settings, "pin_vertex_group", "")) if settings is not None else "",
+        round(float(getattr(settings, "pin_hardness", 1.0)), 6) if settings is not None else 1.0,
     )
 
 
@@ -1330,6 +1487,65 @@ def _pin_attachment_batch_from_object(
     return make_pin_attachment_batch(pin_indices, targets), matrix_world
 
 
+def _pin_attachment_batch_from_slot_object(
+    obj: bpy.types.Object,
+    slot: ClothSlot,
+    settings,
+    depsgraph: bpy.types.Depsgraph | None = None,
+) -> tuple[PinAttachmentBatch, bpy.types.Matrix]:
+    _refresh_slot_pin_weights_from_group(obj, slot, settings)
+    if len(slot.cloth.pin_indices) > 0:
+        targets, matrix_world = _pin_targets_from_object(
+            obj,
+            slot.cloth.pin_indices,
+            slot.use_evaluated_mesh,
+            depsgraph=depsgraph,
+            expected_vertex_count=len(slot.cloth.positions_world),
+        )
+    else:
+        targets = np.empty((0, 3), dtype=np.float32)
+        matrix_world = obj.matrix_world.copy()
+    batch = make_pin_attachment_batch(slot.cloth.pin_indices, targets, slot.cloth.pin_weights)
+    batch = _apply_interactive_pin_target_override(slot, batch)
+    slot.cloth.pin_attachment_pairs = np.array(batch.pairs, dtype=np.int32, copy=True)
+    slot.cloth.pin_targets_world = np.array(batch.targets_world, dtype=np.float32, copy=True)
+    slot.pin_attachment_pairs = np.array(batch.pairs, dtype=np.int32, copy=True)
+    return batch, matrix_world
+
+
+def _apply_interactive_pin_target_override(slot: ClothSlot, batch: PinAttachmentBatch) -> PinAttachmentBatch:
+    state = slot.interactive_pin
+    if state is None or len(batch.pairs) == 0:
+        return batch
+    handle = bpy.data.objects.get(state.empty_name)
+    if handle is None:
+        return batch
+    indices = np.asarray(batch.pairs[:, 0], dtype=np.int32)
+    matches = np.flatnonzero(indices == int(state.vertex_index))
+    if len(matches) == 0:
+        return batch
+    targets = np.array(batch.targets_world, dtype=np.float32, copy=True)
+    targets[int(matches[0])] = np.asarray(handle.location, dtype=np.float32)
+    return make_pin_attachment_batch(slot.cloth.pin_indices, targets, slot.cloth.pin_weights)
+
+
+def _refresh_slot_pin_weights_from_group(obj: bpy.types.Object, slot: ClothSlot, settings) -> bool:
+    weights_by_vertex = effective_pin_weights_from_settings(obj, settings, len(slot.cloth.positions_world))
+    pin_indices = np.flatnonzero(weights_by_vertex > 0.0).astype(np.int32)
+    pin_weights = weights_by_vertex[pin_indices].astype(np.float32, copy=True)
+    if np.array_equal(pin_indices, slot.cloth.pin_indices) and _array_equal(pin_weights, slot.cloth.pin_weights):
+        return False
+    slot.cloth.pin_indices = np.ascontiguousarray(pin_indices, dtype=np.int32)
+    slot.cloth.pin_weights = np.ascontiguousarray(pin_weights, dtype=np.float32)
+    empty_targets = np.zeros((len(pin_indices), 3), dtype=np.float32)
+    batch = make_pin_attachment_batch(pin_indices, empty_targets, pin_weights)
+    slot.cloth.pin_attachment_pairs = np.array(batch.pairs, dtype=np.int32, copy=True)
+    slot.pin_attachment_pairs = np.array(batch.pairs, dtype=np.int32, copy=True)
+    slot.pin_targets_world = np.empty((0, 3), dtype=np.float32)
+    slot.force_next_writeback = True
+    return True
+
+
 def _pin_targets_from_mesh(mesh: bpy.types.Mesh, matrix_world, pin_indices: np.ndarray) -> np.ndarray:
     if len(pin_indices) == 0:
         return np.empty((0, 3), dtype=np.float32)
@@ -1349,6 +1565,223 @@ def _session_for_object_name(object_name: str) -> SceneSession | None:
     if scene_key is None:
         return None
     return _SCENE_SESSIONS.get(scene_key)
+
+
+def _unique_vertex_group_name(obj: bpy.types.Object, base: str) -> str:
+    name = base
+    index = 1
+    while obj.vertex_groups.get(name) is not None:
+        name = f"{base}.{index:03d}"
+        index += 1
+    return name
+
+
+def _unique_modifier_name(obj: bpy.types.Object, base: str) -> str:
+    name = base
+    index = 1
+    while obj.modifiers.get(name) is not None:
+        name = f"{base}.{index:03d}"
+        index += 1
+    return name
+
+
+def _vertex_group_weight(group: bpy.types.VertexGroup, vertex_index: int) -> float | None:
+    try:
+        return float(group.weight(int(vertex_index)))
+    except RuntimeError:
+        return None
+
+
+@contextmanager
+def _with_object_mesh_data(obj: bpy.types.Object, mesh: bpy.types.Mesh):
+    old_mesh = obj.data
+    obj.data = mesh
+    try:
+        yield
+    finally:
+        if _rna_alive(obj) and _rna_alive(old_mesh):
+            obj.data = old_mesh
+
+
+def _ensure_vertex_group_on_mesh(
+    obj: bpy.types.Object,
+    mesh: bpy.types.Mesh,
+    group_name: str,
+) -> bpy.types.VertexGroup | None:
+    if not _rna_alive(obj) or not _rna_alive(mesh):
+        return None
+    with _with_object_mesh_data(obj, mesh):
+        return obj.vertex_groups.get(group_name) or obj.vertex_groups.new(name=group_name)
+
+
+def _vertex_group_weight_on_mesh(
+    obj: bpy.types.Object,
+    mesh: bpy.types.Mesh,
+    group_name: str,
+    vertex_index: int,
+) -> float | None:
+    if not _rna_alive(obj) or not _rna_alive(mesh):
+        return None
+    with _with_object_mesh_data(obj, mesh):
+        group = obj.vertex_groups.get(group_name)
+        if group is None:
+            return None
+        return _vertex_group_weight(group, vertex_index)
+
+
+def _add_vertex_group_weight_on_mesh(
+    obj: bpy.types.Object,
+    mesh: bpy.types.Mesh,
+    group_name: str,
+    vertex_index: int,
+    weight: float,
+    mode: str,
+) -> None:
+    group = _ensure_vertex_group_on_mesh(obj, mesh, group_name)
+    if group is None:
+        return
+    with _with_object_mesh_data(obj, mesh):
+        group = obj.vertex_groups.get(group_name)
+        if group is not None:
+            group.add([int(vertex_index)], float(weight), mode)
+
+
+def _restore_vertex_group_weight_on_mesh(
+    obj: bpy.types.Object,
+    mesh: bpy.types.Mesh,
+    group_name: str,
+    vertex_index: int,
+    previous_weight: float | None,
+) -> None:
+    if not _rna_alive(obj) or not _rna_alive(mesh):
+        return
+    with _with_object_mesh_data(obj, mesh):
+        group = obj.vertex_groups.get(group_name)
+        if group is None:
+            return
+        if previous_weight is None:
+            try:
+                group.remove([int(vertex_index)])
+            except RuntimeError:
+                pass
+        else:
+            group.add([int(vertex_index)], float(previous_weight), "REPLACE")
+
+
+def _remove_vertex_group_on_mesh(
+    obj: bpy.types.Object,
+    mesh: bpy.types.Mesh,
+    group_name: str,
+) -> None:
+    if not _rna_alive(obj) or not _rna_alive(mesh):
+        return
+    with _with_object_mesh_data(obj, mesh):
+        group = obj.vertex_groups.get(group_name)
+        if group is not None:
+            obj.vertex_groups.remove(group)
+
+
+def _make_interactive_pin_empty(
+    context: bpy.types.Context,
+    obj: bpy.types.Object,
+    vertex_index: int,
+    world_position: Vector,
+) -> bpy.types.Object:
+    name = f"{_INTERACTIVE_PIN_PREFIX}_{obj.name}_{int(vertex_index)}"
+    handle = bpy.data.objects.new(name, None)
+    handle.empty_display_type = "SPHERE"
+    handle.empty_display_size = max(max(float(value) for value in obj.dimensions) * 0.04, 0.04)
+    handle.location = world_position
+    handle[_INTERACTIVE_PIN_PROP] = True
+    handle["_ssbl_source_object"] = obj.name
+    collection = getattr(context, "collection", None)
+    if collection is None:
+        collection = context.scene.collection
+    collection.objects.link(handle)
+    return handle
+
+
+def _select_interactive_pin_handle(context: bpy.types.Context, handle: bpy.types.Object) -> None:
+    for selected in list(getattr(context, "selected_objects", [])):
+        if selected is not None and _rna_alive(selected):
+            selected.select_set(False)
+    handle.select_set(True)
+    context.view_layer.objects.active = handle
+
+
+def _restore_interactive_selection(context: bpy.types.Context, state: InteractivePinState) -> None:
+    for selected in list(getattr(context, "selected_objects", [])):
+        if selected is not None and _rna_alive(selected):
+            selected.select_set(False)
+    for name in state.previous_selection_names:
+        obj = bpy.data.objects.get(name)
+        if obj is not None and _rna_alive(obj):
+            obj.select_set(True)
+    active = bpy.data.objects.get(state.previous_active_name)
+    if active is not None and _rna_alive(active):
+        context.view_layer.objects.active = active
+
+
+def _remove_interactive_pin_empty(state: InteractivePinState) -> None:
+    handle = bpy.data.objects.get(state.empty_name)
+    if handle is not None and bool(handle.get(_INTERACTIVE_PIN_PROP, False)):
+        bpy.data.objects.remove(handle, do_unlink=True)
+
+
+def _clear_interactive_pin_state(
+    slot: ClothSlot,
+    obj: bpy.types.Object,
+    *,
+    restore_selection: bool = True,
+) -> bool:
+    state = slot.interactive_pin
+    if state is None:
+        return False
+
+    def restore_weight_and_remove_hook() -> None:
+        _restore_vertex_group_weight_on_mesh(
+            obj,
+            slot.original_mesh,
+            state.pin_group_name,
+            state.vertex_index,
+            state.previous_weight,
+        )
+        if _rna_alive(slot.preview_mesh) and not _same_mesh(slot.preview_mesh, slot.original_mesh):
+            _restore_vertex_group_weight_on_mesh(
+                obj,
+                slot.preview_mesh,
+                state.pin_group_name,
+                state.vertex_index,
+                state.previous_preview_weight,
+            )
+
+        modifier = obj.modifiers.get(state.hook_modifier_name)
+        if modifier is not None:
+            obj.modifiers.remove(modifier)
+
+        _remove_vertex_group_on_mesh(obj, slot.original_mesh, state.hook_group_name)
+        if _rna_alive(slot.preview_mesh) and not _same_mesh(slot.preview_mesh, slot.original_mesh):
+            _remove_vertex_group_on_mesh(obj, slot.preview_mesh, state.hook_group_name)
+
+    try:
+        if _rna_alive(obj) and _rna_alive(slot.original_mesh) and _rna_alive(slot.preview_mesh):
+            with _with_preview_source_state(slot, obj):
+                restore_weight_and_remove_hook()
+                settings = _settings_for_slot(bpy.context, slot)
+                _refresh_slot_pin_weights_from_group(obj, slot, settings)
+        elif _rna_alive(obj):
+            restore_weight_and_remove_hook()
+    finally:
+        slot.suspended_modifiers = [
+            item for item in slot.suspended_modifiers if item[0] != state.hook_modifier_name
+        ]
+        slot.use_evaluated_mesh = bool(state.previous_use_evaluated_mesh)
+        slot.interactive_pin = None
+        slot.force_next_writeback = True
+        _remove_interactive_pin_empty(state)
+        if restore_selection:
+            _restore_interactive_selection(bpy.context, state)
+    return True
 
 
 def _sessions_for_objects(objects: list[bpy.types.Object]) -> list[SceneSession]:
@@ -1677,18 +2110,13 @@ def _refresh_session_runtime_inputs(context: bpy.types.Context, session: SceneSe
 
             static_collection = settings.static_collider_collection
             has_static_collection = static_collection is not None
-            if len(slot.cloth.pin_indices) > 0:
-                pin_attachment_batch, matrix_world = _pin_attachment_batch_from_object(
-                    obj,
-                    slot.cloth.pin_indices,
-                    slot.use_evaluated_mesh,
-                    depsgraph=depsgraph,
-                    expected_vertex_count=len(slot.cloth.positions_world),
-                )
-                pin_targets = pin_attachment_batch.targets_world
-            else:
-                pin_targets = np.empty((0, 3), dtype=np.float32)
-                matrix_world = obj.matrix_world.copy()
+            pin_attachment_batch, matrix_world = _pin_attachment_batch_from_slot_object(
+                obj,
+                slot,
+                settings,
+                depsgraph=depsgraph,
+            )
+            pin_targets = pin_attachment_batch.targets_world
             static_runtime_signature = (
                 _static_collider_runtime_signature(
                     static_collection,
@@ -2699,6 +3127,7 @@ def _finish_session(session: SceneSession, status: str) -> None:
         _LAST_DIAGNOSTICS[slot.object_name] = session.last_diagnostics
         obj = bpy.data.objects.get(slot.object_name)
         if obj is not None and obj.type == "MESH" and _rna_alive(obj):
+            _clear_interactive_pin_state(slot, obj)
             try:
                 if _same_mesh(obj.data, slot.preview_mesh) and _rna_alive(slot.original_mesh):
                     obj.data = slot.original_mesh

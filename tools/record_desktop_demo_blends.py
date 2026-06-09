@@ -105,6 +105,137 @@ def _select_active(obj: bpy.types.Object) -> None:
     bpy.context.view_layer.objects.active = obj
 
 
+def _single_preview_interval_s() -> float:
+    return 1.0 / 60.0
+
+
+def _timeline_preview_interval_s(scene: bpy.types.Scene) -> float:
+    fps = float(getattr(scene.render, "fps", demo.VIDEO_FPS))
+    fps_base = max(float(getattr(scene.render, "fps_base", 1.0)), 1.0e-6)
+    return 1.0 / max(fps / fps_base, 1.0)
+
+
+def _append_viewport_fps_sample(
+    samples: list[float],
+    display_obj: bpy.types.Object | None,
+    step_started: float,
+    target_interval_s: float,
+) -> None:
+    elapsed = time.perf_counter() - step_started
+    if target_interval_s > elapsed:
+        time.sleep(target_interval_s - elapsed)
+        elapsed = target_interval_s
+    fps = ssbl.solver.session_fps(display_obj) if display_obj is not None else 0.0
+    if not demo._valid_fps(fps):
+        fps = 1.0 / max(elapsed, 1.0e-6)
+    samples.append(float(fps))
+
+
+def _complete_viewport_fps_samples(samples: list[float], frame_count: int, target_interval_s: float) -> list[float]:
+    default_fps = 1.0 / max(float(target_interval_s), 1.0e-6)
+    first_valid = next((float(value) for value in samples if demo._valid_fps(value)), default_fps)
+    full = [first_valid] + list(samples[:frame_count])
+    while len(full) < frame_count + 1:
+        full.append(full[-1] if full else first_valid)
+    last_valid = first_valid
+    for index, value in enumerate(full):
+        if demo._valid_fps(value):
+            last_valid = float(value)
+        else:
+            full[index] = last_valid
+    return full[: frame_count + 1]
+
+
+def _constant_viewport_fps_samples(frame_count: int, target_interval_s: float) -> list[float]:
+    fps = 1.0 / max(float(target_interval_s), 1.0e-6)
+    return [float(fps)] * (frame_count + 1)
+
+
+def _apply_flag_inputs(
+    cloth: bpy.types.Object,
+    wind: bpy.types.Object,
+    turbulence: bpy.types.Object,
+    frame: int,
+    frame_count: int,
+) -> None:
+    progress = frame / max(frame_count, 1)
+
+    def gust_curve(value: float) -> float:
+        return 0.5 + 0.5 * math.sin(value)
+
+    gust = gust_curve(progress * math.tau * 3.5)
+    turbulence.field.strength = 6.0 + 10.0 * gust
+    turbulence.field.size = 0.85 + 0.35 * (1.0 - gust)
+    turbulence.field.flow = 0.55 + 0.55 * gust_curve(progress * math.tau * 2.2 + 0.9)
+    turbulence.field.noise = 0.80 + 0.65 * gust_curve(progress * math.tau * 4.8 + 1.7)
+    turbulence.location.y = math.sin(progress * math.tau * 1.6) * 0.32
+    turbulence.location.z = 0.88 + math.cos(progress * math.tau * 1.9) * 0.04
+    wind.field.strength = 18.0 + 20.0 * gust_curve(progress * math.tau * 2.8 + 0.4)
+    if frame >= frame_count * 0.72:
+        cloth.ssbl_cloth.hardness = 0.72
+        cloth.ssbl_cloth.hardness_initialized = True
+
+
+def _probe_flag_viewport_fps(frame_count: int) -> list[float]:
+    scene = bpy.context.scene
+    cloth = _active_mesh_or_named("SSBL_Demo_Force_Field_Flag")
+    wind = bpy.data.objects["SSBL_Demo_Wind_Field"]
+    turbulence = bpy.data.objects["SSBL_Demo_Turbulence_Field"]
+    _select_active(cloth)
+    ssbl.solver.start_preview(bpy.context, cloth)
+    samples: list[float] = []
+    interval_s = _single_preview_interval_s()
+    try:
+        for frame in range(1, frame_count + 1):
+            _apply_flag_inputs(cloth, wind, turbulence, frame, frame_count)
+            started = time.perf_counter()
+            ssbl.solver.step_preview(bpy.context, cloth.name)
+            _append_viewport_fps_sample(samples, cloth, started, interval_s)
+    finally:
+        ssbl.solver.cleanup_all_sessions()
+        scene.frame_set(int(scene.frame_start))
+    return _complete_viewport_fps_samples(samples, frame_count, interval_s)
+
+
+def _probe_wring_viewport_fps(frame_count: int) -> list[float]:
+    scene = bpy.context.scene
+    towel = _active_mesh_or_named("SSBL_Wring_Towel")
+    _select_active(towel)
+    session = ssbl.solver.start_preview(bpy.context, towel)
+    samples: list[float] = []
+    interval_s = _single_preview_interval_s()
+    try:
+        for frame in range(1, frame_count + 1):
+            started = time.perf_counter()
+            demo._step_wring_frame(session, towel, frame, frame_count)
+            _append_viewport_fps_sample(samples, towel, started, interval_s)
+    finally:
+        ssbl.solver.cleanup_all_sessions()
+        scene.frame_set(int(scene.frame_start))
+    return _complete_viewport_fps_samples(samples, frame_count, interval_s)
+
+
+def _probe_timeline_viewport_fps(frame_count: int) -> list[float]:
+    scene = bpy.context.scene
+    scene.frame_set(int(scene.frame_start))
+    session = ssbl.solver.start_timeline_preview(bpy.context, scene)
+    if session is None:
+        raise RuntimeError("No enabled cloth objects in desktop blend for viewport FPS probe")
+    display_obj = bpy.data.objects.get(session.object_name)
+    samples: list[float] = []
+    interval_s = _timeline_preview_interval_s(scene)
+    try:
+        for frame in range(1, frame_count + 1):
+            scene.frame_set(int(scene.frame_start) + frame)
+            started = time.perf_counter()
+            ssbl.solver.step_timeline_preview(bpy.context, scene)
+            _append_viewport_fps_sample(samples, display_obj, started, interval_s)
+    finally:
+        ssbl.solver.cleanup_all_sessions()
+        scene.frame_set(int(scene.frame_start))
+    return _complete_viewport_fps_samples(samples, frame_count, interval_s)
+
+
 def _render_case_frame(
     scene: bpy.types.Scene,
     frames_dir: Path,
@@ -117,8 +248,9 @@ def _render_case_frame(
     frame_count: int,
     last_ms: float,
     native_ms: float,
+    viewport_fps: float,
 ) -> None:
-    metrics_line = demo._format_metrics_line(frame, frame_count, last_ms, native_ms)
+    metrics_line = demo._format_metrics_line(frame, frame_count, last_ms, native_ms, viewport_fps)
     note = demo._keyword_line(*keywords)
     demo._update_overlay(overlay, metrics_line=metrics_line, note=note)
     overlay_text_frames.append(demo._compose_overlay_text(title, metrics_line, note))
@@ -139,6 +271,7 @@ def _finish(
     finite: bool,
     restore_delta: float,
     metrics: dict[str, object],
+    viewport_fps_samples: list[float],
 ) -> demo.DemoResult:
     demo._encode_video(frames_dir, video_path, overlay_text_frames=_OVERLAY_TEXT[name])
     return demo._summarize_demo(
@@ -155,6 +288,7 @@ def _finish(
         finite=finite,
         restore_delta=restore_delta,
         metrics=metrics,
+        viewport_fps_samples=viewport_fps_samples,
     )
 
 
@@ -168,6 +302,11 @@ def _record_flag() -> demo.DemoResult:
     frame_count = _frame_count(scene, 112)
     title = _title(scene, "SSBL realtime flag - live wind control")
     keywords = KEYWORDS[name]
+    viewport_fps_samples = _probe_flag_viewport_fps(frame_count)
+
+    blend_path = _open_demo_blend(name)
+    scene = bpy.context.scene
+    title = _title(scene, title)
     _case_dir, frames_dir, video_path = demo._ensure_output_dir(name)
     overlay = _overlay(scene)
     cloth = _active_mesh_or_named("SSBL_Demo_Force_Field_Flag")
@@ -222,7 +361,20 @@ def _record_flag() -> demo.DemoResult:
         max_avg_z = max(max_avg_z, final_avg_z)
         force_field_counts.append(int(diag.force_field_count))
         max_turbulence_strength = max(max_turbulence_strength, float(turbulence.field.strength))
-        _render_case_frame(scene, frames_dir, frame_paths, _OVERLAY_TEXT[name], overlay, title, keywords, frame, frame_count, last_ms, native_ms)
+        _render_case_frame(
+            scene,
+            frames_dir,
+            frame_paths,
+            _OVERLAY_TEXT[name],
+            overlay,
+            title,
+            keywords,
+            frame,
+            frame_count,
+            last_ms,
+            native_ms,
+            demo._sample_fps_for_frame(viewport_fps_samples, frame),
+        )
 
     ssbl.solver.request_stop(cloth)
     restore_delta = demo._mesh_delta(cloth, before)
@@ -238,6 +390,7 @@ def _record_flag() -> demo.DemoResult:
         simulation_elapsed=simulation_elapsed,
         finite=finite,
         restore_delta=restore_delta,
+        viewport_fps_samples=viewport_fps_samples,
         metrics={
             "slots": len(session.slots),
             "max_force_field_count": max(force_field_counts) if force_field_counts else 0,
@@ -260,6 +413,11 @@ def _record_wring() -> demo.DemoResult:
     frame_count = _frame_count(scene, demo.WRING_FRAME_COUNT)
     title = _title(scene, "SSBL realtime wring towel - hook driven twist")
     keywords = KEYWORDS[name]
+    viewport_fps_samples = _constant_viewport_fps_samples(frame_count, _single_preview_interval_s())
+
+    blend_path = _open_demo_blend(name)
+    scene = bpy.context.scene
+    title = _title(scene, title)
     _case_dir, frames_dir, video_path = demo._ensure_output_dir(name)
     overlay = _overlay(scene)
     towel = _active_mesh_or_named("SSBL_Wring_Towel")
@@ -290,7 +448,20 @@ def _record_wring() -> demo.DemoResult:
         for vert in towel.data.vertices:
             min_z = min(min_z, float((towel.matrix_world @ vert.co).z))
             max_radius = max(max_radius, math.hypot(float(vert.co.y), float(vert.co.z - 1.25)))
-        _render_case_frame(scene, frames_dir, frame_paths, _OVERLAY_TEXT[name], overlay, title, keywords, frame, frame_count, last_ms, native_ms)
+        _render_case_frame(
+            scene,
+            frames_dir,
+            frame_paths,
+            _OVERLAY_TEXT[name],
+            overlay,
+            title,
+            keywords,
+            frame,
+            frame_count,
+            last_ms,
+            native_ms,
+            demo._sample_fps_for_frame(viewport_fps_samples, frame),
+        )
 
     tethers = len(session.cloth.lra_edges)
     ssbl.solver.request_stop(towel)
@@ -309,6 +480,7 @@ def _record_wring() -> demo.DemoResult:
         simulation_elapsed=simulation_elapsed,
         finite=finite,
         restore_delta=restore_delta,
+        viewport_fps_samples=viewport_fps_samples,
         metrics={
             "vertices": len(towel.data.vertices),
             "triangles": len(session.cloth.triangles),
@@ -328,6 +500,11 @@ def _record_timeline(name: str) -> demo.DemoResult:
     frame_count = _frame_count(scene, fallback)
     title = _title(scene, name)
     keywords = KEYWORDS[name]
+    viewport_fps_samples = _probe_timeline_viewport_fps(frame_count)
+
+    blend_path = _open_demo_blend(name)
+    scene = bpy.context.scene
+    title = _title(scene, title)
     _case_dir, frames_dir, video_path = demo._ensure_output_dir(name)
     overlay = _overlay(scene)
     scene.frame_set(int(scene.frame_start))
@@ -376,7 +553,20 @@ def _record_timeline(name: str) -> demo.DemoResult:
             original = before.get(slot_name)
             if original is not None and len(original) == len(obj.data.vertices):
                 max_displacement = max(max_displacement, demo._mesh_delta(obj, original))
-        _render_case_frame(scene, frames_dir, frame_paths, _OVERLAY_TEXT[name], overlay, title, keywords, frame, frame_count, last_ms, native_ms)
+        _render_case_frame(
+            scene,
+            frames_dir,
+            frame_paths,
+            _OVERLAY_TEXT[name],
+            overlay,
+            title,
+            keywords,
+            frame,
+            frame_count,
+            last_ms,
+            native_ms,
+            demo._sample_fps_for_frame(viewport_fps_samples, frame),
+        )
 
     stopper = bpy.data.objects.get(session.object_name)
     if stopper is not None:
@@ -406,6 +596,7 @@ def _record_timeline(name: str) -> demo.DemoResult:
         simulation_elapsed=simulation_elapsed,
         finite=finite,
         restore_delta=restore_delta,
+        viewport_fps_samples=viewport_fps_samples,
         metrics=metrics,
     )
 

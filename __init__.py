@@ -573,6 +573,14 @@ class SSBL_PreviewSettings(PropertyGroup):
         default="ssbl_pin",
         description="该顶点组中的顶点会保持在静止位置",
     )
+    pin_hardness: FloatProperty(
+        name="钉固硬度",
+        default=1.0,
+        min=0.0,
+        max=1.0,
+        precision=3,
+        description="全局缩放钉固顶点组权重；0 关闭钉固，1 保持顶点组权重",
+    )
     collision_margin: FloatProperty(
         name="碰撞边距",
         default=0.005,
@@ -754,6 +762,7 @@ class SSBL_PreviewSettings(PropertyGroup):
 
 CLASSES = (
     SSBL_PreviewSettings,
+    operators.SSBL_OT_interactive_pin_monitor,
     operators.SSBL_OT_start_preview,
     operators.SSBL_OT_stop_preview,
     operators.SSBL_OT_reset_preview,
@@ -800,6 +809,10 @@ def register():
 def unregister():
     try:
         operators.cleanup_fps_overlays()
+    except Exception:
+        pass
+    try:
+        operators.cleanup_interactive_pin_monitor()
     except Exception:
         pass
     try:
