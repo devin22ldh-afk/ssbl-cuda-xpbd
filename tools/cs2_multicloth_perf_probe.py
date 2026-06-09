@@ -450,7 +450,13 @@ def main() -> None:
             "diag_done",
             step=step_number,
             finite=bool(getattr(diag, "finite", True)),
+            native_step_ms=float(getattr(diag, "step_ms", 0.0)),
             cuda_step_ms=float(getattr(diag, "cuda_step_call_ms", 0.0)),
+            hash_build_ms=float(getattr(diag, "hash_build_ms", 0.0)),
+            constraints_ms=float(getattr(diag, "constraints_ms", 0.0)),
+            static_collision_ms=float(getattr(diag, "static_collision_ms", 0.0)),
+            dynamic_collision_ms=float(getattr(diag, "dynamic_collision_ms", 0.0)),
+            dynamic_particle_collision_ms=float(getattr(diag, "dynamic_particle_collision_ms", 0.0)),
             dynamic_pack_ms=float(getattr(diag, "dynamic_collider_pack_ms", 0.0)),
             dynamic_upload_ms=float(getattr(diag, "dynamic_upload_ms", 0.0)),
             dynamic_triangles=int(getattr(diag, "dynamic_triangle_count", 0)),
@@ -471,6 +477,13 @@ def main() -> None:
             pcg_initial_residual=float(getattr(diag, "abi41_pcg_initial_residual", 0.0)),
             pcg_final_residual=float(getattr(diag, "abi41_pcg_final_residual", 0.0)),
             pcg_max_delta=float(getattr(diag, "abi41_pcg_max_delta", 0.0)),
+            pcg_system_ms=float(getattr(diag, "abi41_pcg_system_ms", 0.0)),
+            pcg_ad_ms=float(getattr(diag, "abi41_pcg_ad_ms", 0.0)),
+            direct_stretch_ms=float(getattr(diag, "abi41_direct_stretch_ms", 0.0)),
+            lra_tack_count=int(getattr(diag, "abi41_lra_tack_count", 0)),
+            bending_wing_count=int(getattr(diag, "abi41_bending_wing_count", 0)),
+            bending_texture_ready=int(getattr(diag, "abi41_bending_texture_ready", 0)),
+            bending_guarded=int(getattr(diag, "abi41_bending_guarded", 0)),
         )
         finite = finite and bool(getattr(diag, "finite", True))
         for key in (
@@ -612,6 +625,10 @@ def main() -> None:
         raise RuntimeError(f"CS2 multicloth perf probe failed stability gate: {summary}")
     if float(args.fail_under_fps) > 0.0 and fps < float(args.fail_under_fps):
         raise RuntimeError(f"CS2 multicloth perf probe below FPS gate {args.fail_under_fps}: {fps:.2f}")
+    if bpy.app.background:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
 
 
 if __name__ == "__main__":

@@ -58,6 +58,34 @@ class SSBL_PT_physics_panel(bpy.types.Panel):
             
             row_status = box_col.row()
             row_status.label(text=status_str + fps_str, icon="INFO")
+            if solver.has_session(obj):
+                diag = solver.session_diagnostics(obj)
+                row_perf = box_col.row()
+                row_perf.label(
+                    text=(
+                        "Frame %.1fms | CUDA %.1f | Input %.1f | DynUp %.1f | DynCol %.2f"
+                        % (
+                            float(getattr(diag, "frame_ms", 0.0)),
+                            float(getattr(diag, "cuda_step_call_ms", 0.0)),
+                            float(getattr(diag, "input_refresh_ms", 0.0)),
+                            float(getattr(diag, "dynamic_upload_ms", 0.0)),
+                            float(getattr(diag, "dynamic_collision_ms", 0.0)),
+                        )
+                    ),
+                    icon="TIME",
+                )
+                row_perf2 = box_col.row()
+                row_perf2.label(
+                    text=(
+                        "Download %.1f | Writeback %.1f | Viewport %.2f"
+                        % (
+                            float(getattr(diag, "download_ms", 0.0)),
+                            float(getattr(diag, "writeback_ms", 0.0)),
+                            float(getattr(diag, "viewport_tag_ms", 0.0)),
+                        )
+                    ),
+                    icon="GRAPH",
+                )
             
             row_backend = box_col.row()
             row_backend.label(text=solver.backend_status_text(), icon="CONSOLE")
@@ -138,6 +166,8 @@ class SSBL_PT_collision(bpy.types.Panel):
         box_world.separator()
         box_world.prop(settings, "static_collider_collection", text="静态碰撞体集合")
         
+        box_world.prop(settings, "dynamic_collider_collection", text="动画碰撞体集合")
+
         # Static SDF Settings
         if settings.static_collider_collection:
             sdf_col = box_world.column(align=True)
@@ -253,6 +283,7 @@ class SSBL_PT_cache(bpy.types.Panel):
         col.label(text="预览设定", icon="PLAY")
         box_preview = col.box()
         box_preview.prop(settings, "preview_target_fps", text="目标预览帧率")
+        box_preview.prop(settings, "auto_cache_realtime", text="实时模拟自动缓存")
         box_preview.prop(settings, "use_evaluated_mesh", text="使用修改器形态 (Evaluated)")
         
         layout.separator()

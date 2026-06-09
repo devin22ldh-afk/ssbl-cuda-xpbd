@@ -31,6 +31,7 @@ _LEGACY_BALANCED_STRETCH = 1.0e-6
 _LEGACY_BALANCED_BEND = 1.0e-4
 _STARTUP_CACHE_LIMIT = 16
 PIN_HARD_WEIGHT_THRESHOLD = 0.75
+ALLOW_ALL_PINNED_KINEMATIC_SLOT = True
 
 
 @dataclass
@@ -386,7 +387,9 @@ def _build_cloth_data_uncached(
     pin_weights_by_vertex = effective_pin_weights_from_settings(obj, settings, len(local))
     pin_mask = pin_weights_by_vertex > 0.0
     hard_pin_mask = pin_weights_by_vertex >= PIN_HARD_WEIGHT_THRESHOLD
-    if np.all(hard_pin_mask):
+    # All-hard-pin meshes are valid kinematic dynamic-collider slots.
+    # Their inverse mass is zero, while pin targets keep them on evaluated animation.
+    if np.all(hard_pin_mask) and not ALLOW_ALL_PINNED_KINEMATIC_SLOT:
         raise ValueError("所有顶点都被固定了，没有可模拟的部分")
     rest_volume = signed_mesh_volume(world, triangles)
 
@@ -531,7 +534,9 @@ def _build_cloth_data_from_mesh(
 
     if len(triangles) == 0:
         raise ValueError("The cloth mesh needs at least one face.")
-    if np.all(hard_pin_mask):
+    # All-hard-pin meshes are valid kinematic dynamic-collider slots.
+    # Their inverse mass is zero, while pin targets keep them on evaluated animation.
+    if np.all(hard_pin_mask) and not ALLOW_ALL_PINNED_KINEMATIC_SLOT:
         raise ValueError("All vertices are pinned; there is no simulated cloth region.")
 
     rest_volume = signed_mesh_volume(world, triangles)

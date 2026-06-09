@@ -192,6 +192,11 @@ typedef struct SsblXpbdDiagnostics {
     long long self_filter_cache_misses;
     long long self_cluster_count;
     long long self_cluster_owned_contacts;
+    long long dynamic_triangle_candidate_count;
+    long long dynamic_triangle_bucket_overflow;
+    long long dynamic_triangle_large_primitive_count;
+    long long dynamic_triangle_aabb_reject_count;
+    long long dynamic_triangle_max_bucket_occupancy;
 } SsblXpbdDiagnostics;
 
 typedef struct SsblXpbdMesh {
@@ -265,6 +270,12 @@ typedef struct SsblXpbdFrameInputs {
     int update_dynamic_triangles;
     const float* dynamic_triangles;
     int dynamic_triangle_count;
+    int update_dynamic_indexed_triangles;
+    const float* dynamic_triangle_vertices;
+    int dynamic_triangle_vertex_count;
+    const int* dynamic_triangle_indices;
+    int dynamic_indexed_triangle_count;
+    int dynamic_triangle_topology_changed;
     int update_dynamic_particles;
     const float* dynamic_particle_positions;
     const float* dynamic_particle_radii;

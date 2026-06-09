@@ -7,7 +7,7 @@ import math
 import os
 import struct
 import time
-from typing import Callable, Optional
+from typing import BinaryIO, Callable, Optional
 
 import bpy
 from mathutils import Vector
@@ -19,14 +19,18 @@ from .force_fields import EMPTY_FORCE_FIELD_BATCH, ForceFieldBatch, collect_forc
 from .native_backend import NativeStepDiagnostics, NativeXpbdSolver, status as native_status
 from .xpbd_core import (
     ClothBuildData,
+    PIN_HARD_WEIGHT_THRESHOLD,
     PinAttachmentBatch,
     SELF_COLLISION_FAST,
     build_cloth_data,
     clear_cloth_topology_cache,
     effective_pin_weights_from_settings,
     make_pin_attachment_batch,
+    mesh_local_positions,
     settings_to_options,
     to_local,
+    to_world,
+    triangulated_faces,
     world_positions_from_object,
 )
 
@@ -35,6 +39,7 @@ _SCENE_SESSIONS: dict[str, "SceneSession"] = {}
 _OBJECT_TO_SCENE_SESSION: dict[str, str] = {}
 _STATUS: dict[str, str] = {}
 _LAST_DIAGNOSTICS: dict[str, NativeStepDiagnostics] = {}
+_FREE_SIM_VERTEX_CACHE: dict[str, tuple[tuple, bool]] = {}
 _CACHE_PATH_PROP = "_ssbl_xpbd_cache_path"
 _CACHE_MODIFIER_NAME = "SSBL XPBD Cache"
 _UNSUPPORTED_INPUT_TYPES = {"solid", "rod", "stitch", "tet"}
@@ -55,6 +60,7 @@ STATUS_PREVIEW_STOPPED = "Preview Stopped"
 STATUS_BAKING = "Baking"
 STATUS_FINISHED = "Finished"
 STATUS_ERROR = "Error"
+STATUS_NO_SIMULATED_VERTICES = "No Simulated Vertices"
 
 
 def _set_bake_progress_state(
@@ -166,6 +172,16 @@ class InteractivePinState:
 
 
 @dataclass
+class RealtimeCacheWriter:
+    path: str
+    temp_path: str
+    handle: BinaryIO
+    start_frame: int
+    vertex_count: int
+    sample_count: int = 0
+
+
+@dataclass
 class ClothSlot:
     object_name: str
     cloth: ClothBuildData
@@ -194,8 +210,26 @@ class ClothSlot:
     use_object_settings: bool
     force_fields_active: bool
     auto_sphere_object_name: str = ""
+    auto_cache_realtime: bool = False
+    realtime_cache: RealtimeCacheWriter | None = None
+    pin_settings_signature: tuple = ()
     force_next_writeback: bool = False
     interactive_pin: InteractivePinState | None = None
+    dynamic_collider_cache: CrossClothColliderCache = field(default_factory=CrossClothColliderCache)
+
+
+@dataclass
+class DynamicCollisionSource:
+    object_name: str
+    target_names: set[str] = field(default_factory=set)
+    current_positions_world: np.ndarray = field(default_factory=lambda: np.empty((0, 3), dtype=np.float32))
+    previous_positions_world: np.ndarray = field(default_factory=lambda: np.empty((0, 3), dtype=np.float32))
+    local_positions_buffer: np.ndarray = field(default_factory=lambda: np.empty((0, 3), dtype=np.float32))
+    triangle_indices: np.ndarray = field(default_factory=lambda: np.empty((0, 3), dtype=np.int32))
+    topology_signature: tuple = ()
+    collision_layer: int = 0
+    external_contact_distance: float = 0.02
+    max_edge_length: float = 0.08
     dynamic_collider_cache: CrossClothColliderCache = field(default_factory=CrossClothColliderCache)
 
 
@@ -225,6 +259,7 @@ class SceneSession:
     playback_driven: bool = False
     paused: bool = False
     last_scene_frame: int = 0
+    dynamic_collision_sources: dict[str, DynamicCollisionSource] = field(default_factory=dict)
 
     @property
     def cloth(self) -> ClothBuildData:
@@ -310,6 +345,11 @@ def record_viewport_tag_ms(object_name: str, elapsed_ms: float) -> None:
         dynamic_particle_contacts=diag.dynamic_particle_contacts,
         dynamic_particle_overflow=diag.dynamic_particle_overflow,
         dynamic_triangle_count=diag.dynamic_triangle_count,
+        dynamic_triangle_candidate_count=diag.dynamic_triangle_candidate_count,
+        dynamic_triangle_bucket_overflow=diag.dynamic_triangle_bucket_overflow,
+        dynamic_triangle_large_primitive_count=diag.dynamic_triangle_large_primitive_count,
+        dynamic_triangle_aabb_reject_count=diag.dynamic_triangle_aabb_reject_count,
+        dynamic_triangle_max_bucket_occupancy=diag.dynamic_triangle_max_bucket_occupancy,
         static_triangle_count=diag.static_triangle_count,
         finite=diag.finite,
         fast_exact_vt_candidates=diag.fast_exact_vt_candidates,
@@ -420,6 +460,8 @@ def record_viewport_tag_ms(object_name: str, elapsed_ms: float) -> None:
     )
     for slot_name in session.solve_order:
         _LAST_DIAGNOSTICS[slot_name] = session.last_diagnostics
+    for source_name in session.dynamic_collision_sources:
+        _LAST_DIAGNOSTICS[source_name] = session.last_diagnostics
 
 
 def has_session(obj: Optional[bpy.types.Object]) -> bool:
@@ -510,7 +552,7 @@ def begin_interactive_pin(
         )
         slot.interactive_pin = state
         slot.use_evaluated_mesh = True
-        _refresh_slot_pin_weights_from_group(obj, slot, settings)
+        _refresh_slot_pin_weights_from_group(obj, slot, settings, force=True)
 
     if _rna_alive(slot.preview_mesh) and not _same_mesh(slot.preview_mesh, slot.original_mesh):
         _add_vertex_group_weight_on_mesh(obj, slot.preview_mesh, pin_group_name, vertex_index, 1.0, "ADD")
@@ -600,7 +642,7 @@ def request_stop(obj: bpy.types.Object) -> bool:
     session = _session_for_object_name(obj.name if obj else "")
     if session is None:
         return False
-    _finish_session(session, STATUS_PREVIEW_STOPPED)
+    _finish_session(session, STATUS_PREVIEW_STOPPED, finalize_realtime_cache=True)
     return True
 
 
@@ -608,7 +650,7 @@ def reset_preview_object(obj: bpy.types.Object) -> bool:
     session = _session_for_object_name(obj.name if obj else "")
     if session is None:
         return False
-    _finish_session(session, STATUS_IDLE)
+    _finish_session(session, STATUS_IDLE, finalize_realtime_cache=True)
     return True
 
 
@@ -624,7 +666,7 @@ def reset_timeline_preview_if_endpoint(scene: bpy.types.Scene | None = None) -> 
     session = _SCENE_SESSIONS.get(_scene_key(scene))
     if session is None or not bool(session.playback_driven):
         return False
-    _finish_session(session, STATUS_IDLE)
+    _finish_session(session, STATUS_IDLE, finalize_realtime_cache=_session_has_realtime_cache(session))
     return True
 
 
@@ -701,7 +743,53 @@ def _settings_reference_collision_object(settings, candidate: bpy.types.Object, 
         if sphere_obj == candidate or sphere_obj.name == candidate.name:
             return True
     static_collection = getattr(settings, "static_collider_collection", None)
-    return _collection_contains_object(static_collection, candidate)
+    if _collection_contains_object(static_collection, candidate):
+        return True
+    dynamic_collection = getattr(settings, "dynamic_collider_collection", None)
+    return _collection_contains_object(dynamic_collection, candidate)
+
+
+def _has_free_simulation_vertices(obj: bpy.types.Object | None, settings) -> bool:
+    if obj is None or obj.type != "MESH" or settings is None:
+        return False
+    mesh = getattr(obj, "data", None)
+    vertex_count = int(len(mesh.vertices)) if mesh is not None else 0
+    if vertex_count <= 0:
+        return False
+    group_name = str(getattr(settings, "pin_vertex_group", "") or "").strip()
+    group = obj.vertex_groups.get(group_name) if group_name else None
+    signature = (
+        int(id(mesh)),
+        int(vertex_count),
+        group_name,
+        int(group.index) if group is not None else -1,
+        float(getattr(settings, "pin_hardness", 1.0)),
+    )
+    cached = _FREE_SIM_VERTEX_CACHE.get(obj.name)
+    if cached is not None and cached[0] == signature:
+        return bool(cached[1])
+    weights = effective_pin_weights_from_settings(obj, settings, vertex_count)
+    if len(weights) != vertex_count:
+        result = True
+    else:
+        result = not bool(np.all(weights >= PIN_HARD_WEIGHT_THRESHOLD))
+    _FREE_SIM_VERTEX_CACHE[obj.name] = (signature, result)
+    return result
+
+
+def _invalidate_free_simulation_vertex_cache(obj: bpy.types.Object | None) -> None:
+    if obj is not None:
+        _FREE_SIM_VERTEX_CACHE.pop(obj.name, None)
+
+
+def _is_enabled_simulatable_cloth_object(obj: bpy.types.Object | None) -> bool:
+    settings = _object_cloth_settings(obj)
+    return bool(
+        settings is not None
+        and _has_simulatable_cloth_source_geometry(obj)
+        and _declared_input_type(obj) not in _UNSUPPORTED_INPUT_TYPES
+        and _has_free_simulation_vertices(obj, settings)
+    )
 
 
 def _collision_only_object_names_for_scene(scene: bpy.types.Scene) -> set[str]:
@@ -711,6 +799,8 @@ def _collision_only_object_names_for_scene(scene: bpy.types.Scene) -> set[str]:
     scene_settings = getattr(scene, "ssbl_preview", None)
     if scene_settings is not None:
         for candidate in scene.objects:
+            if _is_enabled_simulatable_cloth_object(candidate):
+                continue
             if candidate is not None and candidate.type == "MESH" and _settings_reference_collision_object(scene_settings, candidate):
                 collision_only.add(candidate.name)
     for owner in scene.objects:
@@ -719,6 +809,8 @@ def _collision_only_object_names_for_scene(scene: bpy.types.Scene) -> set[str]:
             continue
         for candidate in scene.objects:
             if candidate is None or candidate.type != "MESH":
+                continue
+            if _is_enabled_simulatable_cloth_object(candidate):
                 continue
             if _settings_reference_collision_object(owner_settings, candidate, owner):
                 collision_only.add(candidate.name)
@@ -795,6 +887,9 @@ def _enabled_playback_cloth_objects(scene: bpy.types.Scene) -> list[bpy.types.Ob
             continue
         if _declared_input_type(obj) in _UNSUPPORTED_INPUT_TYPES:
             continue
+        if not _has_free_simulation_vertices(obj, settings):
+            _STATUS[obj.name] = STATUS_NO_SIMULATED_VERTICES
+            continue
         objects.append(obj)
     return sorted(objects, key=lambda item: (int(getattr(item, _OBJECT_COLLISION_LAYER_PROP, item.get(_OBJECT_COLLISION_LAYER_PROP, 1))), item.name.casefold()))
 
@@ -810,6 +905,8 @@ def start_preview(context: bpy.types.Context, obj: bpy.types.Object) -> SceneSes
         settings = _settings_for_object(context, obj, context.scene.ssbl_preview)
         auto_sphere_obj = _auto_sphere_collider_for_preview(context, obj, settings)
         cloth_objects = _preview_cloth_objects(context, obj, settings)
+        if not cloth_objects:
+            raise ValueError("No simulated SSBL cloth vertices found. Put animated character meshes in Dynamic Collider Collection instead of enabling them as cloth.")
         for cloth_obj in cloth_objects:
             _ensure_supported_cloth_object(cloth_obj)
 
@@ -859,6 +956,8 @@ def start_preview(context: bpy.types.Context, obj: bpy.types.Object) -> SceneSes
             last_scene_frame=int(context.scene.frame_current),
         )
         _SCENE_SESSIONS[scene_key] = session
+        slot_settings = {name: _settings_for_slot(context, slot) for name, slot in slots.items()}
+        _sync_session_dynamic_collision_sources(context, session, depsgraph, slot_settings)
         for name, slot in slots.items():
             _OBJECT_TO_SCENE_SESSION[name] = scene_key
             _STATUS[name] = STATUS_PREVIEW_RUNNING
@@ -869,9 +968,14 @@ def start_preview(context: bpy.types.Context, obj: bpy.types.Object) -> SceneSes
                 local_buffer=slot.writeback_local_buffer,
                 flat_buffer=slot.writeback_flat_buffer,
             )
+        try:
+            _begin_realtime_cache_for_session(session)
+        except Exception:
+            _finish_session(session, STATUS_ERROR, finalize_realtime_cache=False)
+            raise
         return session
     except Exception:
-        if obj is not None:
+        if obj is not None and _STATUS.get(obj.name) != STATUS_NO_SIMULATED_VERTICES:
             _STATUS[obj.name] = STATUS_ERROR
         raise
 
@@ -935,6 +1039,8 @@ def start_timeline_preview(context: bpy.types.Context, scene: bpy.types.Scene | 
         last_scene_frame=int(scene.frame_current),
     )
     _SCENE_SESSIONS[scene_key] = session
+    slot_settings = {name: _settings_for_slot(context, slot) for name, slot in slots.items()}
+    _sync_session_dynamic_collision_sources(context, session, depsgraph, slot_settings)
     for name, slot in slots.items():
         _OBJECT_TO_SCENE_SESSION[name] = scene_key
         _STATUS[name] = STATUS_PREVIEW_RUNNING
@@ -945,6 +1051,11 @@ def start_timeline_preview(context: bpy.types.Context, scene: bpy.types.Scene | 
             local_buffer=slot.writeback_local_buffer,
             flat_buffer=slot.writeback_flat_buffer,
         )
+    try:
+        _begin_realtime_cache_for_session(session)
+    except Exception:
+        _finish_session(session, STATUS_ERROR, finalize_realtime_cache=False)
+        raise
     return session
 
 
@@ -960,6 +1071,17 @@ def pause_timeline_preview(scene: bpy.types.Scene | None = None) -> None:
         if slot is not None and obj is not None:
             _clear_interactive_pin_state(slot, obj)
         _STATUS[name] = STATUS_PREVIEW_PAUSED
+
+
+def stop_timeline_preview(scene: bpy.types.Scene | None = None) -> bool:
+    scene = scene or bpy.context.scene
+    session = _SCENE_SESSIONS.get(_scene_key(scene))
+    if session is None or not bool(session.playback_driven):
+        return False
+    if not _session_has_realtime_cache(session):
+        return False
+    _finish_session(session, STATUS_PREVIEW_STOPPED, finalize_realtime_cache=True)
+    return True
 
 
 def _effective_writeback_interval(session: SceneSession, slot: ClothSlot) -> int:
@@ -989,6 +1111,20 @@ def _clear_forced_writeback_flags(session: SceneSession, decisions: dict[str, bo
     for slot_name, did_writeback in decisions.items():
         if did_writeback and slot_name in session.slots:
             session.slots[slot_name].force_next_writeback = False
+
+
+def _session_has_realtime_cache(session: SceneSession | None) -> bool:
+    if session is None:
+        return False
+    return any(slot.realtime_cache is not None for slot in session.slots.values())
+
+
+def _realtime_cache_download_decisions(session: SceneSession, writeback_by_slot: dict[str, bool]) -> dict[str, bool]:
+    decisions = dict(writeback_by_slot)
+    for slot_name, slot in session.slots.items():
+        if slot.realtime_cache is not None:
+            decisions[slot_name] = True
+    return decisions
 
 
 def _update_adaptive_writeback_interval(session: SceneSession, perf: FramePerf) -> None:
@@ -1047,8 +1183,10 @@ def step_timeline_preview(context: bpy.types.Context, scene: bpy.types.Scene | N
     try:
         _refresh_session_runtime_inputs(context, session, perf)
         writeback_by_slot = _writeback_decisions(session, current_frame, scene_end=int(scene.frame_end))
+        download_by_slot = _realtime_cache_download_decisions(session, writeback_by_slot)
         perf.writeback_performed = any(writeback_by_slot.values())
-        _step_session_slots(session, writeback_by_slot, perf)
+        _step_session_slots(session, download_by_slot, perf)
+        _write_realtime_cache_samples(session)
         if perf.writeback_performed:
             started = time.perf_counter()
             for slot_name, should_writeback in writeback_by_slot.items():
@@ -1080,6 +1218,8 @@ def step_timeline_preview(context: bpy.types.Context, scene: bpy.types.Scene | N
     for slot_name in session.solve_order:
         _LAST_DIAGNOSTICS[slot_name] = session.last_diagnostics
         _STATUS[slot_name] = STATUS_PREVIEW_RUNNING
+    for source_name in session.dynamic_collision_sources:
+        _LAST_DIAGNOSTICS[source_name] = session.last_diagnostics
     _update_adaptive_writeback_interval(session, perf)
     _update_session_fps(session, step_started)
     return False
@@ -1094,11 +1234,11 @@ def step_preview(context: bpy.types.Context, object_name: str) -> bool:
         _finish_session(session, STATUS_ERROR)
         return True
     if session.stop_requested:
-        _finish_session(session, STATUS_PREVIEW_STOPPED)
+        _finish_session(session, STATUS_PREVIEW_STOPPED, finalize_realtime_cache=True)
         return True
     next_frame = session.start_frame + session.frame_index + 1
     if session.frame_index >= session.frame_count or next_frame > int(scene.frame_end):
-        _finish_session(session, STATUS_FINISHED)
+        _finish_session(session, STATUS_FINISHED, finalize_realtime_cache=True)
         return True
 
     step_started = time.perf_counter()
@@ -1109,8 +1249,10 @@ def step_preview(context: bpy.types.Context, object_name: str) -> bool:
         perf.frame_set_ms += _elapsed_ms(started)
         _refresh_session_runtime_inputs(context, session, perf)
         writeback_by_slot = _writeback_decisions(session, next_frame, scene_end=int(scene.frame_end))
+        download_by_slot = _realtime_cache_download_decisions(session, writeback_by_slot)
         perf.writeback_performed = any(writeback_by_slot.values())
-        _step_session_slots(session, writeback_by_slot, perf)
+        _step_session_slots(session, download_by_slot, perf)
+        _write_realtime_cache_samples(session)
         if perf.writeback_performed:
             started = time.perf_counter()
             for slot_name, should_writeback in writeback_by_slot.items():
@@ -1139,6 +1281,8 @@ def step_preview(context: bpy.types.Context, object_name: str) -> bool:
     session.last_diagnostics = _aggregate_session_diagnostics(session, perf)
     for slot_name in session.solve_order:
         _LAST_DIAGNOSTICS[slot_name] = session.last_diagnostics
+    for source_name in session.dynamic_collision_sources:
+        _LAST_DIAGNOSTICS[source_name] = session.last_diagnostics
     _update_adaptive_writeback_interval(session, perf)
     _update_session_fps(session, step_started)
     return False
@@ -1409,13 +1553,15 @@ def _static_collider_runtime_signature(
     exclude_obj: bpy.types.Object | None,
     depsgraph: bpy.types.Depsgraph | None,
     use_evaluated_mesh: bool,
+    exclude_names: set[str] | frozenset[str] | None = None,
 ) -> tuple:
     if collection is None:
         return ()
+    excluded = frozenset(exclude_names or ())
     entries = []
     depsgraph = depsgraph or bpy.context.evaluated_depsgraph_get()
     for obj in sorted(collection.objects, key=lambda item: item.name):
-        if obj is None or obj == exclude_obj or obj.type != "MESH":
+        if obj is None or obj == exclude_obj or obj.type != "MESH" or obj.name in excluded:
             continue
         if use_evaluated_mesh:
             source = obj.evaluated_get(depsgraph)
@@ -1487,6 +1633,17 @@ def _pin_attachment_batch_from_object(
     return make_pin_attachment_batch(pin_indices, targets), matrix_world
 
 
+def _pin_settings_signature(obj: bpy.types.Object | None, settings, vertex_count: int) -> tuple:
+    group_name = str(getattr(settings, "pin_vertex_group", "") or "").strip()
+    group = obj.vertex_groups.get(group_name) if obj is not None and group_name else None
+    return (
+        group_name,
+        int(group.index) if group is not None else -1,
+        float(getattr(settings, "pin_hardness", 1.0)),
+        int(vertex_count),
+    )
+
+
 def _pin_attachment_batch_from_slot_object(
     obj: bpy.types.Object,
     slot: ClothSlot,
@@ -1529,11 +1686,23 @@ def _apply_interactive_pin_target_override(slot: ClothSlot, batch: PinAttachment
     return make_pin_attachment_batch(slot.cloth.pin_indices, targets, slot.cloth.pin_weights)
 
 
-def _refresh_slot_pin_weights_from_group(obj: bpy.types.Object, slot: ClothSlot, settings) -> bool:
+def _refresh_slot_pin_weights_from_group(
+    obj: bpy.types.Object,
+    slot: ClothSlot,
+    settings,
+    *,
+    force: bool = False,
+) -> bool:
+    if force:
+        _invalidate_free_simulation_vertex_cache(obj)
+    signature = _pin_settings_signature(obj, settings, len(slot.cloth.positions_world))
+    if not force and slot.pin_settings_signature == signature:
+        return False
     weights_by_vertex = effective_pin_weights_from_settings(obj, settings, len(slot.cloth.positions_world))
     pin_indices = np.flatnonzero(weights_by_vertex > 0.0).astype(np.int32)
     pin_weights = weights_by_vertex[pin_indices].astype(np.float32, copy=True)
     if np.array_equal(pin_indices, slot.cloth.pin_indices) and _array_equal(pin_weights, slot.cloth.pin_weights):
+        slot.pin_settings_signature = signature
         return False
     slot.cloth.pin_indices = np.ascontiguousarray(pin_indices, dtype=np.int32)
     slot.cloth.pin_weights = np.ascontiguousarray(pin_weights, dtype=np.float32)
@@ -1542,7 +1711,9 @@ def _refresh_slot_pin_weights_from_group(obj: bpy.types.Object, slot: ClothSlot,
     slot.cloth.pin_attachment_pairs = np.array(batch.pairs, dtype=np.int32, copy=True)
     slot.pin_attachment_pairs = np.array(batch.pairs, dtype=np.int32, copy=True)
     slot.pin_targets_world = np.empty((0, 3), dtype=np.float32)
+    slot.pin_settings_signature = signature
     slot.force_next_writeback = True
+    _invalidate_free_simulation_vertex_cache(obj)
     return True
 
 
@@ -1768,7 +1939,7 @@ def _clear_interactive_pin_state(
             with _with_preview_source_state(slot, obj):
                 restore_weight_and_remove_hook()
                 settings = _settings_for_slot(bpy.context, slot)
-                _refresh_slot_pin_weights_from_group(obj, slot, settings)
+                _refresh_slot_pin_weights_from_group(obj, slot, settings, force=True)
         elif _rna_alive(obj):
             restore_weight_and_remove_hook()
     finally:
@@ -1814,9 +1985,15 @@ def _preview_cloth_objects(context: bpy.types.Context, obj: bpy.types.Object, se
             continue
         if _declared_input_type(selected_obj) in _UNSUPPORTED_INPUT_TYPES:
             continue
+        if not _has_free_simulation_vertices(selected_obj, _object_cloth_settings(selected_obj)):
+            _STATUS[selected_obj.name] = STATUS_NO_SIMULATED_VERTICES
+            continue
         if _is_collision_only_object(context.scene, selected_obj, active_obj=obj, active_settings=settings):
             continue
         selected.append(selected_obj)
+    if not _has_free_simulation_vertices(obj, settings):
+        _STATUS[obj.name] = STATUS_NO_SIMULATED_VERTICES
+        return []
     return [obj] + sorted(
         selected,
         key=lambda item: (
@@ -1859,6 +2036,7 @@ def _create_cloth_slot(
         cloth=cloth,
         preview_slot_count=preview_slot_count,
     )
+    static_exclude_names = _dynamic_collider_object_names(settings, obj)
     return ClothSlot(
         object_name=obj.name,
         cloth=cloth,
@@ -1874,6 +2052,7 @@ def _create_cloth_slot(
             obj,
             depsgraph,
             use_evaluated_mesh,
+            exclude_names=static_exclude_names,
         ),
         pin_attachment_pairs=np.array(cloth.pin_attachment_pairs, dtype=np.int32, copy=True),
         pin_targets_world=np.array(cloth.pin_targets_world, dtype=np.float32, copy=True),
@@ -1892,6 +2071,8 @@ def _create_cloth_slot(
         use_object_settings=bool(_object_cloth_settings(obj) is not None),
         force_fields_active=False,
         auto_sphere_object_name=auto_sphere_object.name if auto_sphere_object is not None else "",
+        auto_cache_realtime=bool(getattr(settings, "auto_cache_realtime", False)),
+        pin_settings_signature=_pin_settings_signature(obj, settings, len(cloth.positions_world)),
     )
 
 
@@ -1921,11 +2102,17 @@ def _create_native_solver(
             cloth=cloth,
             preview_slot_count=preview_slot_count,
         )
+        static_exclude_names = (
+            _dynamic_collider_object_names(settings, obj)
+            if str(runtime_mode_override or "preview").lower() == "preview"
+            else set()
+        )
         static_tris, static_signature = collect_static_triangles(
             settings.static_collider_collection,
             obj,
             depsgraph=depsgraph,
             use_evaluated_mesh=use_evaluated_mesh,
+            exclude_names=static_exclude_names,
         )
         native = NativeXpbdSolver(cloth, options, static_tris)
         native.update_runtime_colliders(options)
@@ -2034,12 +2221,14 @@ def _rebuild_slot_native(
         slot.static_triangles = np.array(static_tris, dtype=np.float32, copy=True)
         slot.static_collider_signature = static_signature
         static_collection = getattr(settings, "static_collider_collection", None)
+        static_exclude_names = _dynamic_collider_object_names(settings, obj)
         slot.static_runtime_signature = (
             _static_collider_runtime_signature(
                 static_collection,
                 obj,
                 depsgraph,
                 slot.use_evaluated_mesh,
+                exclude_names=static_exclude_names,
             )
             if static_collection is not None
             else ()
@@ -2050,6 +2239,7 @@ def _rebuild_slot_native(
         slot.solver_options_signature = solver_signature
         slot.pin_attachment_pairs = np.array(cloth.pin_attachment_pairs, dtype=np.int32, copy=True)
         slot.pin_targets_world = np.empty((0, 3), dtype=np.float32)
+        slot.pin_settings_signature = _pin_settings_signature(obj, settings, len(cloth.positions_world))
         slot.force_next_writeback = True
     finally:
         if new_native is not None:
@@ -2066,12 +2256,14 @@ def _refresh_session_runtime_inputs(context: bpy.types.Context, session: SceneSe
     slot_settings = {name: _settings_for_slot(context, slot) for name, slot in session.slots.items()}
     needs_depsgraph = any(
         getattr(slot_settings[name], "static_collider_collection", None) is not None
+        or getattr(slot_settings[name], "dynamic_collider_collection", None) is not None
         or slot.use_evaluated_mesh
         or has_force_field_sources(context.scene, slot_settings[name])
         for name, slot in session.slots.items()
     )
     with _with_session_source_state(session):
-        context.view_layer.update()
+        if not bool(session.playback_driven):
+            context.view_layer.update()
         depsgraph = context.evaluated_depsgraph_get() if needs_depsgraph else None
         for slot in list(session.slots.values()):
             obj = bpy.data.objects.get(slot.object_name)
@@ -2110,6 +2302,7 @@ def _refresh_session_runtime_inputs(context: bpy.types.Context, session: SceneSe
 
             static_collection = settings.static_collider_collection
             has_static_collection = static_collection is not None
+            static_exclude_names = _dynamic_collider_object_names(settings, obj)
             pin_attachment_batch, matrix_world = _pin_attachment_batch_from_slot_object(
                 obj,
                 slot,
@@ -2123,6 +2316,7 @@ def _refresh_session_runtime_inputs(context: bpy.types.Context, session: SceneSe
                     obj,
                     depsgraph,
                     slot.use_evaluated_mesh,
+                    exclude_names=static_exclude_names,
                 )
                 if has_static_collection
                 else ()
@@ -2135,6 +2329,7 @@ def _refresh_session_runtime_inputs(context: bpy.types.Context, session: SceneSe
                     obj,
                     depsgraph=depsgraph,
                     use_evaluated_mesh=slot.use_evaluated_mesh,
+                    exclude_names=static_exclude_names,
                 )
             force_fields_enabled = has_force_field_sources(context.scene, settings)
             force_fields = (
@@ -2155,6 +2350,7 @@ def _refresh_session_runtime_inputs(context: bpy.types.Context, session: SceneSe
                 force_fields_enabled,
                 perf,
             )
+        _sync_session_dynamic_collision_sources(context, session, depsgraph, slot_settings)
         _refresh_session_live_settings(context, session, slot_settings)
     if perf is not None:
         perf.input_refresh_ms += _elapsed_ms(refresh_started)
@@ -2167,19 +2363,20 @@ def _slot_should_download(download_positions, slot_name: str) -> bool:
 
 
 def _step_session_slots(session: SceneSession, download_positions, perf: FramePerf | None = None) -> None:
-    cross_cloth_enabled = len(session.slots) > 1 and str(session.cross_cloth_mode or "off").lower() != "off"
-    if cross_cloth_enabled:
+    dynamic_colliders_enabled = _session_dynamic_colliders_enabled(session)
+    if dynamic_colliders_enabled:
         _prepare_cross_cloth_collider_caches(session, perf)
     for slot_name in session.solve_order:
         slot = session.slots[slot_name]
         should_download = _slot_should_download(download_positions, slot_name)
-        if cross_cloth_enabled:
+        if dynamic_colliders_enabled:
             started = time.perf_counter()
             pack_started = time.perf_counter()
-            dynamic_triangles, dynamic_particles = _collect_cross_cloth_colliders(session, slot, perf)
+            dynamic_triangles, dynamic_indexed_triangles, dynamic_particles = _collect_cross_cloth_colliders(session, slot, perf)
+            dynamic_triangle_count = int(len(dynamic_triangles)) + int(len(dynamic_indexed_triangles.get("indices", ())))
             if perf is not None:
                 perf.dynamic_collider_pack_ms += _elapsed_ms(pack_started)
-                perf.dynamic_triangle_count += int(len(dynamic_triangles))
+                perf.dynamic_triangle_count += dynamic_triangle_count
                 perf.dynamic_particle_count += int(len(dynamic_particles.get("positions", ())))
             did_upload_dynamic = slot.native.update_frame_inputs(
                 pin_indices=None,
@@ -2192,6 +2389,17 @@ def _step_session_slots(session: SceneSession, download_positions, perf: FramePe
                 update_static=False,
                 dynamic_triangles=dynamic_triangles,
                 update_dynamic=True,
+                dynamic_triangle_vertices=(
+                    dynamic_indexed_triangles.get("vertices")
+                    if len(dynamic_indexed_triangles.get("indices", ())) > 0
+                    else None
+                ),
+                dynamic_triangle_indices=(
+                    dynamic_indexed_triangles.get("indices")
+                    if len(dynamic_indexed_triangles.get("indices", ())) > 0
+                    else None
+                ),
+                dynamic_triangle_topology_signature=dynamic_indexed_triangles.get("signature"),
                 dynamic_particles=dynamic_particles,
                 update_dynamic_particles=True,
                 force_fields=None,
@@ -2203,7 +2411,7 @@ def _step_session_slots(session: SceneSession, download_positions, perf: FramePe
                 perf.frame_input_upload_ms += elapsed
         started = time.perf_counter()
         is_last_slot = slot_name == session.solve_order[-1]
-        sample_diagnostics = bool(should_download or (cross_cloth_enabled and is_last_slot))
+        sample_diagnostics = bool(should_download or (dynamic_colliders_enabled and is_last_slot))
         slot.native.step(
             slot.substeps,
             slot.iterations,
@@ -2212,7 +2420,7 @@ def _step_session_slots(session: SceneSession, download_positions, perf: FramePe
         )
         if perf is not None:
             perf.cuda_step_call_ms += _elapsed_ms(started)
-        if should_download or cross_cloth_enabled:
+        if should_download or dynamic_colliders_enabled:
             started = time.perf_counter()
             downloaded_positions = np.asarray(slot.native.download_positions(), dtype=np.float32)
             if slot.previous_positions_world.shape == slot.current_positions_world.shape:
@@ -2237,6 +2445,13 @@ def _empty_dynamic_particles() -> dict[str, np.ndarray]:
     }
 
 
+def _empty_dynamic_indexed_triangles() -> dict[str, np.ndarray]:
+    return {
+        "vertices": np.empty((0, 3), dtype=np.float32),
+        "indices": np.empty((0, 3), dtype=np.int32),
+    }
+
+
 def _single_or_concat_float32(arrays: list[np.ndarray], empty_shape: tuple[int, ...]) -> np.ndarray:
     if not arrays:
         return np.empty(empty_shape, dtype=np.float32)
@@ -2251,6 +2466,14 @@ def _single_or_concat_int32(arrays: list[np.ndarray]) -> np.ndarray:
     if len(arrays) == 1:
         return np.ascontiguousarray(arrays[0], dtype=np.int32).reshape((-1,))
     return np.ascontiguousarray(np.concatenate(arrays, axis=0), dtype=np.int32).reshape((-1,))
+
+
+def _single_or_concat_int32_rows(arrays: list[np.ndarray], empty_shape: tuple[int, ...]) -> np.ndarray:
+    if not arrays:
+        return np.empty(empty_shape, dtype=np.int32)
+    if len(arrays) == 1:
+        return np.ascontiguousarray(arrays[0], dtype=np.int32)
+    return np.ascontiguousarray(np.concatenate(arrays, axis=0), dtype=np.int32)
 
 
 def _ensure_bool_buffer(buffer: np.ndarray, count: int) -> np.ndarray:
@@ -2578,10 +2801,262 @@ def _slot_max_motion_arrays(current: np.ndarray, previous: np.ndarray) -> float:
     return float(np.max(finite))
 
 
+def _refresh_full_dynamic_triangle_cache(cache: CrossClothColliderCache, positions: np.ndarray) -> None:
+    triangles = cache.triangle_indices
+    if (
+        len(positions) == 0
+        or triangles.ndim != 2
+        or triangles.shape[1] != 3
+        or len(triangles) == 0
+    ):
+        cache.triangles = np.empty((0, 3, 3), dtype=np.float32)
+        return
+    triangle_count = int(len(triangles))
+    cache.triangles = _ensure_float32_capacity(cache.triangles, (triangle_count, 3, 3))
+    triangle_view = cache.triangles[:triangle_count]
+    np.take(positions, triangles.reshape((-1,)), axis=0, out=triangle_view.reshape((-1, 3)))
+    cache.triangles = triangle_view
+
+
+def _mesh_topology_signature(mesh: bpy.types.Mesh) -> tuple:
+    loop_indices = np.empty(len(mesh.loops), dtype=np.int32)
+    if len(loop_indices) > 0:
+        mesh.loops.foreach_get("vertex_index", loop_indices)
+    digest = hashlib.blake2b(digest_size=16)
+    digest.update(np.asarray(loop_indices.shape, dtype=np.int64).tobytes())
+    digest.update(loop_indices.tobytes())
+    return (
+        int(len(mesh.vertices)),
+        int(len(mesh.polygons)),
+        int(len(mesh.loops)),
+        digest.hexdigest(),
+    )
+
+
+def _mesh_topology_count_signature(mesh: bpy.types.Mesh) -> tuple:
+    return (
+        int(len(mesh.vertices)),
+        int(len(mesh.polygons)),
+        int(len(mesh.loops)),
+    )
+
+
+def _triangulated_faces_fast(mesh: bpy.types.Mesh) -> np.ndarray:
+    polygon_count = int(len(mesh.polygons))
+    loop_count = int(len(mesh.loops))
+    if polygon_count > 0 and loop_count == polygon_count * 3:
+        loop_totals = np.empty(polygon_count, dtype=np.int32)
+        mesh.polygons.foreach_get("loop_total", loop_totals)
+        if bool(np.all(loop_totals == 3)):
+            loop_indices = np.empty(loop_count, dtype=np.int32)
+            mesh.loops.foreach_get("vertex_index", loop_indices)
+            return np.ascontiguousarray(loop_indices.reshape((-1, 3)), dtype=np.int32)
+    return np.ascontiguousarray(triangulated_faces(mesh), dtype=np.int32)
+
+
+def _dynamic_source_world_positions_into(
+    source: DynamicCollisionSource,
+    mesh: bpy.types.Mesh,
+    matrix_world,
+) -> None:
+    count = int(len(mesh.vertices))
+    shape = (count, 3)
+    if source.local_positions_buffer.shape != shape:
+        source.local_positions_buffer = np.empty(shape, dtype=np.float32)
+    initialize_previous = False
+    if source.current_positions_world.shape == shape:
+        if source.previous_positions_world.shape != shape:
+            source.previous_positions_world = np.empty(shape, dtype=np.float32)
+        np.copyto(source.previous_positions_world, source.current_positions_world, casting="unsafe")
+    else:
+        source.current_positions_world = np.empty(shape, dtype=np.float32)
+        source.previous_positions_world = np.empty(shape, dtype=np.float32)
+        initialize_previous = True
+
+    local = source.local_positions_buffer
+    flat = local.reshape((-1,))
+    if "position" in mesh.attributes:
+        mesh.attributes["position"].data.foreach_get("vector", flat)
+    else:
+        mesh.vertices.foreach_get("co", flat)
+
+    matrix = np.asarray(matrix_world, dtype=np.float32)
+    world = source.current_positions_world
+    np.multiply(local[:, 0], matrix[0, 0], out=world[:, 0])
+    np.add(world[:, 0], local[:, 1] * matrix[0, 1], out=world[:, 0])
+    np.add(world[:, 0], local[:, 2] * matrix[0, 2], out=world[:, 0])
+    np.add(world[:, 0], matrix[0, 3], out=world[:, 0])
+
+    np.multiply(local[:, 0], matrix[1, 0], out=world[:, 1])
+    np.add(world[:, 1], local[:, 1] * matrix[1, 1], out=world[:, 1])
+    np.add(world[:, 1], local[:, 2] * matrix[1, 2], out=world[:, 1])
+    np.add(world[:, 1], matrix[1, 3], out=world[:, 1])
+
+    np.multiply(local[:, 0], matrix[2, 0], out=world[:, 2])
+    np.add(world[:, 2], local[:, 1] * matrix[2, 1], out=world[:, 2])
+    np.add(world[:, 2], local[:, 2] * matrix[2, 2], out=world[:, 2])
+    np.add(world[:, 2], matrix[2, 3], out=world[:, 2])
+
+    if initialize_previous:
+        np.copyto(source.previous_positions_world, world, casting="unsafe")
+
+
+def _triangle_max_edge_length(positions: np.ndarray, triangles: np.ndarray) -> float:
+    if (
+        len(positions) == 0
+        or triangles.ndim != 2
+        or triangles.shape[1] != 3
+        or len(triangles) == 0
+    ):
+        return 0.08
+    if int(np.min(triangles)) < 0 or int(np.max(triangles)) >= len(positions):
+        return 0.08
+    a = positions[triangles[:, 0]]
+    b = positions[triangles[:, 1]]
+    c = positions[triangles[:, 2]]
+    ab = b - a
+    bc = c - b
+    ca = a - c
+    max_sq = max(
+        float(np.max(np.einsum("ij,ij->i", ab, ab))),
+        float(np.max(np.einsum("ij,ij->i", bc, bc))),
+        float(np.max(np.einsum("ij,ij->i", ca, ca))),
+    )
+    if not math.isfinite(max_sq) or max_sq <= 0.0:
+        return 0.08
+    return float(math.sqrt(max_sq))
+
+
+def _refresh_dynamic_collision_source(
+    source: DynamicCollisionSource,
+    obj: bpy.types.Object,
+    depsgraph: bpy.types.Depsgraph | None,
+) -> None:
+    depsgraph = depsgraph or bpy.context.evaluated_depsgraph_get()
+    eval_obj = obj.evaluated_get(depsgraph)
+    mesh = eval_obj.to_mesh()
+    try:
+        topology_signature = _mesh_topology_count_signature(mesh)
+        _dynamic_source_world_positions_into(source, mesh, eval_obj.matrix_world)
+        if topology_signature != source.topology_signature:
+            source.triangle_indices = _triangulated_faces_fast(mesh)
+            source.topology_signature = topology_signature
+            source.dynamic_collider_cache.triangle_signature = ()
+            source.dynamic_collider_cache.particle_signature = ()
+            source.dynamic_collider_cache.pair_packages.clear()
+            source.max_edge_length = _triangle_max_edge_length(source.current_positions_world, source.triangle_indices)
+    finally:
+        eval_obj.to_mesh_clear()
+
+
+def _dynamic_collider_collection_for_settings(settings) -> bpy.types.Collection | None:
+    return getattr(settings, "dynamic_collider_collection", None) if settings is not None else None
+
+
+def _iter_dynamic_collider_objects(
+    settings,
+    target_obj: bpy.types.Object | None,
+) -> list[bpy.types.Object]:
+    collection = _dynamic_collider_collection_for_settings(settings)
+    if collection is None:
+        return []
+    objects: list[bpy.types.Object] = []
+    seen: set[str] = set()
+    for obj in _iter_collection_mesh_objects(collection):
+        if obj is None or obj.type != "MESH":
+            continue
+        if target_obj is not None and (obj == target_obj or obj.name == target_obj.name):
+            continue
+        if obj.name in seen or not _has_simulatable_cloth_source_geometry(obj):
+            continue
+        seen.add(obj.name)
+        objects.append(obj)
+    return objects
+
+
+def _dynamic_collider_object_names(
+    settings,
+    target_obj: bpy.types.Object | None,
+) -> set[str]:
+    return {obj.name for obj in _iter_dynamic_collider_objects(settings, target_obj)}
+
+
+def _sync_session_dynamic_collision_sources(
+    context: bpy.types.Context,
+    session: SceneSession,
+    depsgraph: bpy.types.Depsgraph | None,
+    slot_settings: dict[str, object],
+) -> None:
+    desired_targets: dict[str, set[str]] = {}
+    desired_distance: dict[str, float] = {}
+    for slot_name, slot in session.slots.items():
+        obj = bpy.data.objects.get(slot.object_name)
+        settings = slot_settings.get(slot_name)
+        for source_obj in _iter_dynamic_collider_objects(settings, obj):
+            target_names = desired_targets.setdefault(source_obj.name, set())
+            target_names.add(slot_name)
+            desired_distance[source_obj.name] = max(
+                float(desired_distance.get(source_obj.name, 0.0)),
+                float(slot.external_contact_distance),
+            )
+
+    for stale_name in set(session.dynamic_collision_sources.keys()) - set(desired_targets.keys()):
+        session.dynamic_collision_sources.pop(stale_name, None)
+        _OBJECT_TO_SCENE_SESSION.pop(stale_name, None)
+
+    scene_key = session.scene_name
+    for source_name, target_names in desired_targets.items():
+        obj = bpy.data.objects.get(source_name)
+        if obj is None or obj.type != "MESH":
+            continue
+        source = session.dynamic_collision_sources.get(source_name)
+        if source is None:
+            source = DynamicCollisionSource(object_name=source_name)
+            session.dynamic_collision_sources[source_name] = source
+        source.target_names = set(target_names)
+        source.external_contact_distance = max(float(desired_distance.get(source_name, 0.0)), 1.0e-6)
+        source.collision_layer = _object_collision_layer(obj)
+        _refresh_dynamic_collision_source(source, obj, depsgraph)
+        _OBJECT_TO_SCENE_SESSION[source_name] = scene_key
+
+
+def _dynamic_source_enabled_for_target(target: ClothSlot, source: DynamicCollisionSource) -> bool:
+    if target.object_name not in source.target_names:
+        return False
+    source_obj = bpy.data.objects.get(source.object_name)
+    if source_obj is not None and not bool(
+        getattr(
+            source_obj,
+            "ssbl_enable_cross_cloth_collision",
+            source_obj.get("ssbl_enable_cross_cloth_collision", True),
+        )
+    ):
+        return False
+    return True
+
+
+def _iter_all_dynamic_collision_sources(session: SceneSession):
+    yield from session.slots.values()
+    yield from session.dynamic_collision_sources.values()
+
+
+def _session_has_dynamic_collision_sources(session: SceneSession) -> bool:
+    return any(source.target_names for source in session.dynamic_collision_sources.values())
+
+
+def _cross_cloth_slots_enabled(session: SceneSession) -> bool:
+    return len(session.slots) > 1 and str(session.cross_cloth_mode or "off").lower() != "off"
+
+
+def _session_dynamic_colliders_enabled(session: SceneSession) -> bool:
+    return _session_has_dynamic_collision_sources(session) or _cross_cloth_slots_enabled(session)
+
+
 def _prepare_cross_cloth_collider_caches(session: SceneSession, perf: FramePerf | None = None) -> None:
     started = time.perf_counter()
-    slot_ids = {name: index + 1 for index, name in enumerate(session.solve_order)}
-    for source in session.slots.values():
+    source_names = list(session.solve_order) + sorted(session.dynamic_collision_sources.keys())
+    slot_ids = {name: index + 1 for index, name in enumerate(source_names)}
+    for source in _iter_all_dynamic_collision_sources(session):
         positions = np.asarray(source.current_positions_world, dtype=np.float32)
         if positions.ndim != 2 or positions.shape[1] != 3:
             positions = np.empty((0, 3), dtype=np.float32)
@@ -2607,7 +3082,12 @@ def _prepare_cross_cloth_collider_caches(session: SceneSession, perf: FramePerf 
             cache.positions_generation += 1
         cache.motion_accumulated += float(max(cache.max_motion, 0.0))
 
-        triangles = np.asarray(source.cloth.triangles, dtype=np.int32)
+        if isinstance(source, DynamicCollisionSource):
+            triangles = np.asarray(source.triangle_indices, dtype=np.int32)
+            topology_token = tuple(source.topology_signature)
+        else:
+            triangles = np.asarray(source.cloth.triangles, dtype=np.int32)
+            topology_token = (id(source.cloth.triangles), id(source.cloth.edge_rest_lengths))
         triangles_valid = (
             triangles.ndim == 2
             and triangles.shape[1] == 3
@@ -2617,8 +3097,7 @@ def _prepare_cross_cloth_collider_caches(session: SceneSession, perf: FramePerf 
         triangle_signature = (
             int(len(triangles)) if triangles_valid else 0,
             int(len(positions)),
-            id(source.cloth.triangles),
-            id(source.cloth.edge_rest_lengths),
+            topology_token,
         )
         if cache.triangle_signature != triangle_signature:
             cache.triangles = np.empty((0, 3, 3), dtype=np.float32)
@@ -2630,9 +3109,12 @@ def _prepare_cross_cloth_collider_caches(session: SceneSession, perf: FramePerf 
             cache.triangle_signature = triangle_signature
             cache.pair_packages.clear()
             cache.motion_accumulated = 0.0
-            rest_lengths = np.asarray(source.cloth.edge_rest_lengths, dtype=np.float32).reshape((-1,))
-            finite_rest = rest_lengths[np.isfinite(rest_lengths)]
-            rest_max = float(np.max(finite_rest)) if len(finite_rest) else 0.0
+            if isinstance(source, DynamicCollisionSource):
+                rest_max = float(source.max_edge_length)
+            else:
+                rest_lengths = np.asarray(source.cloth.edge_rest_lengths, dtype=np.float32).reshape((-1,))
+                finite_rest = rest_lengths[np.isfinite(rest_lengths)]
+                rest_max = float(np.max(finite_rest)) if len(finite_rest) else 0.0
             cache.max_edge_length = max(
                 rest_max * 3.0,
                 float(source.external_contact_distance) * 8.0,
@@ -2643,19 +3125,32 @@ def _prepare_cross_cloth_collider_caches(session: SceneSession, perf: FramePerf 
         else:
             if perf is not None:
                 perf.dynamic_collider_cache_hits += 1
+        if not isinstance(source, DynamicCollisionSource):
+            _refresh_full_dynamic_triangle_cache(cache, positions)
 
         count = int(len(positions))
         slot_id = int(slot_ids.get(source.object_name, 0))
+        particle_radius = float(source.external_contact_distance)
+        if isinstance(source, DynamicCollisionSource):
+            motion_padding = min(
+                max(float(cache.max_motion), 0.0),
+                max(particle_radius * 1.5, 0.01),
+            )
+            particle_radius += motion_padding
         particle_signature = (
             count,
-            float(source.external_contact_distance),
+            float(particle_radius),
             int(source.collision_layer),
             slot_id,
-            id(source.cloth.inv_mass),
+            id(source.cloth.inv_mass) if not isinstance(source, DynamicCollisionSource) else tuple(source.topology_signature),
         )
         if cache.particle_signature != particle_signature or cache.particle_positions.shape != (count, 3):
-            cache.particle_radii = np.full(count, float(source.external_contact_distance), dtype=np.float32)
-            source_inv_mass = np.asarray(source.cloth.inv_mass, dtype=np.float32).reshape((-1,))
+            cache.particle_radii = np.full(count, float(particle_radius), dtype=np.float32)
+            source_inv_mass = (
+                np.zeros(count, dtype=np.float32)
+                if isinstance(source, DynamicCollisionSource)
+                else np.asarray(source.cloth.inv_mass, dtype=np.float32).reshape((-1,))
+            )
             if len(source_inv_mass) == count:
                 cache.particle_inv_mass = np.ascontiguousarray(source_inv_mass, dtype=np.float32)
             else:
@@ -2706,39 +3201,21 @@ def _cross_source_expanded_target_aabb(
 
 def _collect_cross_cloth_triangles(session: SceneSession, target: ClothSlot) -> np.ndarray:
     mode = str(session.cross_cloth_mode or "off").lower()
-    if mode == "off":
+    if mode == "off" and not _session_has_dynamic_collision_sources(session):
         return np.empty((0, 3, 3), dtype=np.float32)
     all_tris: list[np.ndarray] = []
     for source in session.slots.values():
         if not _cross_cloth_source_enabled(mode, target, source):
             continue
-        if len(source.cloth.triangles) == 0:
+        triangles = source.dynamic_collider_cache.triangles
+        if len(triangles) > 0:
+            all_tris.append(triangles)
+    for source in session.dynamic_collision_sources.values():
+        if not _dynamic_source_enabled_for_target(target, source):
             continue
-        expanded = _cross_source_expanded_target_aabb(target, source)
-        if expanded is None:
-            continue
-        positions = source.dynamic_collider_cache.particle_positions
-        triangles = np.asarray(source.cloth.triangles, dtype=np.int32)
-        if (
-            len(positions) == 0
-            or triangles.ndim != 2
-            or triangles.shape[1] != 3
-            or len(triangles) == 0
-            or int(np.min(triangles)) < 0
-            or int(np.max(triangles)) >= len(positions)
-        ):
-            continue
-        vertex_mask = np.all(positions >= expanded[0], axis=1) & np.all(positions <= expanded[1], axis=1)
-        if not bool(np.any(vertex_mask)):
-            continue
-        tri_mask = np.any(vertex_mask[triangles], axis=1)
-        if not bool(np.any(tri_mask)):
-            continue
-        if bool(np.all(tri_mask)):
-            selected_triangles = triangles
-        else:
-            selected_triangles = triangles[tri_mask]
-        all_tris.append(np.ascontiguousarray(positions[selected_triangles], dtype=np.float32))
+        triangles = source.dynamic_collider_cache.triangles
+        if len(triangles) > 0:
+            all_tris.append(triangles)
     if not all_tris:
         return np.empty((0, 3, 3), dtype=np.float32)
     return np.ascontiguousarray(np.concatenate(all_tris, axis=0), dtype=np.float32)
@@ -2748,13 +3225,18 @@ def _collect_cross_cloth_colliders(
     session: SceneSession,
     target: ClothSlot,
     perf: FramePerf | None = None,
-) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+) -> tuple[np.ndarray, dict[str, np.ndarray], dict[str, np.ndarray]]:
     mode = str(session.cross_cloth_mode or "off").lower()
-    if mode == "off":
-        return np.empty((0, 3, 3), dtype=np.float32), _empty_dynamic_particles()
+    if mode == "off" and not _session_has_dynamic_collision_sources(session):
+        return np.empty((0, 3, 3), dtype=np.float32), _empty_dynamic_indexed_triangles(), _empty_dynamic_particles()
     triangles_list: list[np.ndarray] = []
+    vertex_list: list[np.ndarray] = []
+    triangle_index_list: list[np.ndarray] = []
+    triangle_index_signature_items: list[tuple] = []
     positions_list: list[np.ndarray] = []
     radii_list: list[np.ndarray] = []
+    particle_signature_items: list[tuple] = []
+    vertex_offset = 0
     for source in session.slots.values():
         if not _cross_cloth_source_enabled(mode, target, source):
             continue
@@ -2819,21 +3301,88 @@ def _collect_cross_cloth_colliders(
             continue
         positions_list.append(package.particle_positions)
         radii_list.append(package.particle_radii)
+        particle_signature_items.append(
+            (
+                "cloth",
+                str(source.object_name),
+                int(source.dynamic_collider_cache.positions_generation),
+                int(target.dynamic_collider_cache.positions_generation),
+                int(len(package.particle_positions)),
+                bool(package.full_vertex_selection),
+                tuple(source.dynamic_collider_cache.particle_signature),
+            )
+        )
         if len(package.triangles) > 0:
             triangles_list.append(package.triangles)
+    for source in session.dynamic_collision_sources.values():
+        if not _dynamic_source_enabled_for_target(target, source):
+            continue
+        cache = source.dynamic_collider_cache
+        positions = cache.particle_positions
+        if len(positions) == 0:
+            continue
+        vertex_list.append(positions)
+        positions_list.append(positions)
+        radii_list.append(cache.particle_radii)
+        particle_signature_items.append(
+            (
+                "dynamic_source",
+                str(source.object_name),
+                int(cache.positions_generation),
+                int(target.dynamic_collider_cache.positions_generation),
+                int(len(positions)),
+                tuple(source.topology_signature),
+                tuple(cache.particle_signature),
+            )
+        )
+        if len(cache.triangle_indices) > 0:
+            if int(vertex_offset) == 0:
+                triangle_index_list.append(cache.triangle_indices)
+            else:
+                triangle_index_list.append(
+                    np.ascontiguousarray(cache.triangle_indices + int(vertex_offset), dtype=np.int32)
+                )
+            triangle_index_signature_items.append(
+                (
+                    str(source.object_name),
+                    int(len(positions)),
+                    int(len(cache.triangle_indices)),
+                    int(vertex_offset),
+                    tuple(source.topology_signature),
+                )
+            )
+        vertex_offset += int(len(positions))
 
     dynamic_triangles = _single_or_concat_float32(triangles_list, (0, 3, 3))
+    dynamic_vertices = _single_or_concat_float32(vertex_list, (0, 3))
+    dynamic_indices = _single_or_concat_int32_rows(triangle_index_list, (0, 3))
+    if len(dynamic_triangles) > 0 and len(dynamic_indices) > 0:
+        indexed_triangles = np.ascontiguousarray(dynamic_vertices[dynamic_indices], dtype=np.float32)
+        dynamic_triangles = _single_or_concat_float32([dynamic_triangles, indexed_triangles], (0, 3, 3))
+        dynamic_vertices = np.empty((0, 3), dtype=np.float32)
+        dynamic_indices = np.empty((0, 3), dtype=np.int32)
+        triangle_index_signature_items.clear()
+
     if not positions_list:
-        return dynamic_triangles, _empty_dynamic_particles()
+        return dynamic_triangles, {
+            "vertices": dynamic_vertices,
+            "indices": dynamic_indices,
+            "signature": tuple(triangle_index_signature_items),
+        }, _empty_dynamic_particles()
     return dynamic_triangles, {
+        "vertices": dynamic_vertices,
+        "indices": dynamic_indices,
+        "signature": tuple(triangle_index_signature_items),
+    }, {
         "positions": _single_or_concat_float32(positions_list, (0, 3)),
         "radii": _single_or_concat_float32(radii_list, (0,)).reshape((-1,)),
+        "signature": tuple(particle_signature_items),
     }
 
 
 def _collect_cross_cloth_particles(session: SceneSession, target: ClothSlot) -> dict[str, np.ndarray]:
     mode = str(session.cross_cloth_mode or "off").lower()
-    if mode == "off":
+    if mode == "off" and not _session_has_dynamic_collision_sources(session):
         return _empty_dynamic_particles()
     positions_list: list[np.ndarray] = []
     radii_list: list[np.ndarray] = []
@@ -2843,28 +3392,27 @@ def _collect_cross_cloth_particles(session: SceneSession, target: ClothSlot) -> 
     for source in session.slots.values():
         if not _cross_cloth_source_enabled(mode, target, source):
             continue
-        expanded = _cross_source_expanded_target_aabb(target, source)
-        if expanded is None:
+        cache = source.dynamic_collider_cache
+        positions = cache.particle_positions
+        if len(positions) == 0:
+            continue
+        positions_list.append(positions)
+        radii_list.append(cache.particle_radii)
+        inv_mass_list.append(cache.particle_inv_mass)
+        slot_ids_list.append(cache.particle_slot_ids)
+        phase_list.append(cache.particle_phases)
+    for source in session.dynamic_collision_sources.values():
+        if not _dynamic_source_enabled_for_target(target, source):
             continue
         cache = source.dynamic_collider_cache
         positions = cache.particle_positions
         if len(positions) == 0:
             continue
-        mask = np.all(positions >= expanded[0], axis=1) & np.all(positions <= expanded[1], axis=1)
-        if not bool(np.any(mask)):
-            continue
-        if bool(np.all(mask)):
-            positions_list.append(positions)
-            radii_list.append(cache.particle_radii)
-            inv_mass_list.append(cache.particle_inv_mass)
-            slot_ids_list.append(cache.particle_slot_ids)
-            phase_list.append(cache.particle_phases)
-        else:
-            positions_list.append(np.ascontiguousarray(positions[mask], dtype=np.float32))
-            radii_list.append(np.ascontiguousarray(cache.particle_radii[mask], dtype=np.float32))
-            inv_mass_list.append(np.ascontiguousarray(cache.particle_inv_mass[mask], dtype=np.float32))
-            slot_ids_list.append(np.ascontiguousarray(cache.particle_slot_ids[mask], dtype=np.int32))
-            phase_list.append(np.ascontiguousarray(cache.particle_phases[mask], dtype=np.int32))
+        positions_list.append(positions)
+        radii_list.append(cache.particle_radii)
+        inv_mass_list.append(cache.particle_inv_mass)
+        slot_ids_list.append(cache.particle_slot_ids)
+        phase_list.append(cache.particle_phases)
     if not positions_list:
         return _empty_dynamic_particles()
     return {
@@ -3115,13 +3663,18 @@ def _mesh_is_probably_sphere_like(obj: bpy.types.Object) -> bool:
     return low_to_mid_poly and roughly_round and (name_hint or _mesh_is_probably_closed(mesh))
 
 
-def _finish_session(session: SceneSession, status: str) -> None:
+def _finish_session(session: SceneSession, status: str, *, finalize_realtime_cache: bool = False) -> None:
     if session.closed:
         return
     session.closed = True
     _SCENE_SESSIONS.pop(session.scene_name, None)
     for slot_name in list(session.slots.keys()):
         _OBJECT_TO_SCENE_SESSION.pop(slot_name, None)
+    for source_name in list(session.dynamic_collision_sources.keys()):
+        _OBJECT_TO_SCENE_SESSION.pop(source_name, None)
+        _LAST_DIAGNOSTICS[source_name] = session.last_diagnostics
+        if _STATUS.get(source_name) == STATUS_PREVIEW_RUNNING:
+            _STATUS[source_name] = status
 
     for slot in list(session.slots.values()):
         _LAST_DIAGNOSTICS[slot.object_name] = session.last_diagnostics
@@ -3134,13 +3687,20 @@ def _finish_session(session: SceneSession, status: str) -> None:
             except (ReferenceError, RuntimeError, AttributeError):
                 pass
             _restore_preview_modifiers(obj, slot.suspended_modifiers)
+        slot_status = status
+        if not _finish_realtime_cache_for_slot(
+            slot,
+            obj if obj is not None and _rna_alive(obj) else None,
+            bool(finalize_realtime_cache) and status != STATUS_ERROR,
+        ):
+            slot_status = STATUS_ERROR
         try:
             slot.native.close()
         except Exception:
             pass
         finally:
             _safe_remove_mesh(slot.preview_mesh)
-        _STATUS[slot.object_name] = status
+        _STATUS[slot.object_name] = slot_status
     scene = bpy.data.scenes.get(session.scene_name)
     if scene is not None and not bool(session.playback_driven):
         try:
@@ -3339,6 +3899,11 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
     dynamic_particle_contacts = 0
     dynamic_particle_overflow = 0
     dynamic_triangle_count = 0
+    dynamic_triangle_candidate_count = 0
+    dynamic_triangle_bucket_overflow = 0
+    dynamic_triangle_large_primitive_count = 0
+    dynamic_triangle_aabb_reject_count = 0
+    dynamic_triangle_max_bucket_occupancy = 0
     static_triangle_count = 0
     fast_exact_vt_candidates = 0
     fast_exact_vt_projected = 0
@@ -3468,6 +4033,14 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
         dynamic_particle_contacts += int(diag.dynamic_particle_contacts)
         dynamic_particle_overflow += int(diag.dynamic_particle_overflow)
         dynamic_triangle_count += int(diag.dynamic_triangle_count)
+        dynamic_triangle_candidate_count += int(diag.dynamic_triangle_candidate_count)
+        dynamic_triangle_bucket_overflow += int(diag.dynamic_triangle_bucket_overflow)
+        dynamic_triangle_large_primitive_count += int(diag.dynamic_triangle_large_primitive_count)
+        dynamic_triangle_aabb_reject_count += int(diag.dynamic_triangle_aabb_reject_count)
+        dynamic_triangle_max_bucket_occupancy = max(
+            dynamic_triangle_max_bucket_occupancy,
+            int(diag.dynamic_triangle_max_bucket_occupancy)
+        )
         static_triangle_count += int(diag.static_triangle_count)
         fast_exact_vt_candidates += int(diag.fast_exact_vt_candidates)
         fast_exact_vt_projected += int(diag.fast_exact_vt_projected)
@@ -3604,6 +4177,11 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
         dynamic_triangle_count=(
             perf.dynamic_triangle_count if perf is not None and perf.dynamic_triangle_count > 0 else dynamic_triangle_count
         ),
+        dynamic_triangle_candidate_count=dynamic_triangle_candidate_count,
+        dynamic_triangle_bucket_overflow=dynamic_triangle_bucket_overflow,
+        dynamic_triangle_large_primitive_count=dynamic_triangle_large_primitive_count,
+        dynamic_triangle_aabb_reject_count=dynamic_triangle_aabb_reject_count,
+        dynamic_triangle_max_bucket_occupancy=dynamic_triangle_max_bucket_occupancy,
         static_triangle_count=static_triangle_count,
         fast_exact_vt_candidates=fast_exact_vt_candidates,
         fast_exact_vt_projected=fast_exact_vt_projected,
@@ -3753,6 +4331,97 @@ def _write_pc2_header(handle, vertex_count: int, start_frame: int, sample_count:
 def _write_pc2_sample(handle, world_positions: np.ndarray, matrix_world_inv: np.ndarray) -> None:
     local = to_local(np.asarray(world_positions, dtype=np.float64), matrix_world_inv)
     handle.write(np.ascontiguousarray(local, dtype="<f4").tobytes())
+
+
+def _realtime_cache_temp_path(path: str) -> str:
+    return f"{path}.realtime.tmp"
+
+
+def _discard_realtime_cache_writer(writer: RealtimeCacheWriter) -> None:
+    try:
+        if not getattr(writer.handle, "closed", True):
+            writer.handle.close()
+    except Exception:
+        pass
+    try:
+        if os.path.exists(writer.temp_path):
+            os.remove(writer.temp_path)
+    except Exception:
+        pass
+
+
+def _write_realtime_cache_sample(slot: ClothSlot) -> None:
+    writer = slot.realtime_cache
+    if writer is None:
+        return
+    _write_pc2_sample(writer.handle, slot.current_positions_world, slot.cloth.matrix_world_inv)
+    writer.sample_count += 1
+
+
+def _begin_realtime_cache_for_slot(obj: bpy.types.Object, slot: ClothSlot, start_frame: int) -> None:
+    if not bool(slot.auto_cache_realtime) or slot.realtime_cache is not None:
+        return
+    path = _cache_path_for_object(obj)
+    temp_path = _realtime_cache_temp_path(path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if os.path.exists(temp_path):
+        os.remove(temp_path)
+    handle = open(temp_path, "w+b")
+    writer = RealtimeCacheWriter(
+        path=path,
+        temp_path=temp_path,
+        handle=handle,
+        start_frame=int(start_frame),
+        vertex_count=int(len(slot.current_positions_world)),
+    )
+    slot.realtime_cache = writer
+    try:
+        _write_pc2_header(handle, writer.vertex_count, writer.start_frame, 0)
+        _write_realtime_cache_sample(slot)
+    except Exception:
+        slot.realtime_cache = None
+        _discard_realtime_cache_writer(writer)
+        raise
+
+
+def _begin_realtime_cache_for_session(session: SceneSession) -> None:
+    for slot_name in session.solve_order:
+        slot = session.slots[slot_name]
+        if not bool(slot.auto_cache_realtime):
+            continue
+        obj = bpy.data.objects.get(slot.object_name)
+        if obj is None or obj.type != "MESH":
+            raise ValueError(f"Missing object for realtime auto cache: {slot.object_name}")
+        _begin_realtime_cache_for_slot(obj, slot, session.start_frame)
+
+
+def _write_realtime_cache_samples(session: SceneSession) -> None:
+    for slot_name in session.solve_order:
+        slot = session.slots[slot_name]
+        if slot.realtime_cache is not None:
+            _write_realtime_cache_sample(slot)
+
+
+def _finish_realtime_cache_for_slot(slot: ClothSlot, obj: bpy.types.Object | None, commit: bool) -> bool:
+    writer = slot.realtime_cache
+    slot.realtime_cache = None
+    if writer is None:
+        return True
+    if not bool(commit) or writer.sample_count <= 0 or obj is None or obj.type != "MESH":
+        _discard_realtime_cache_writer(writer)
+        return True
+    try:
+        writer.handle.seek(0)
+        _write_pc2_header(writer.handle, writer.vertex_count, writer.start_frame, writer.sample_count)
+        writer.handle.flush()
+        writer.handle.close()
+        os.replace(writer.temp_path, writer.path)
+        _bind_mesh_cache(obj, writer.path, writer.start_frame)
+        obj[_CACHE_PATH_PROP] = writer.path
+        return True
+    except Exception:
+        _discard_realtime_cache_writer(writer)
+        return False
 
 
 def _bind_mesh_cache(obj: bpy.types.Object, path: str, start_frame: int) -> None:

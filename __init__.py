@@ -266,6 +266,11 @@ class SSBL_PreviewSettings(PropertyGroup):
         options={"HIDDEN"},
         description="0 uses adaptive preview mesh writeback; values >= 1 force a fixed interval. Baking still writes every frame",
     )
+    auto_cache_realtime: BoolProperty(
+        name="Realtime Auto Cache",
+        default=False,
+        description="Write a PC2 cache while realtime preview or timeline playback is running",
+    )
     use_evaluated_mesh: BoolProperty(
         name="动态网格",
         default=False,
@@ -757,6 +762,11 @@ class SSBL_PreviewSettings(PropertyGroup):
         name="静态碰撞集合",
         type=bpy.types.Collection,
         description="该集合中的网格对象会被用作静态三角形碰撞体",
+    )
+    dynamic_collider_collection: PointerProperty(
+        name="动画碰撞体集合",
+        type=bpy.types.Collection,
+        description="Collection of animated mesh objects used as one-way evaluated dynamic collision sources for this cloth",
     )
 
 

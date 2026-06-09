@@ -92,12 +92,14 @@ def _cache_key(
     collection: bpy.types.Collection,
     exclude_obj: bpy.types.Object | None,
     use_evaluated_mesh: bool,
+    exclude_names: frozenset[str],
     source_signatures: tuple,
 ) -> tuple:
     return (
         int(collection.as_pointer()),
         int(exclude_obj.as_pointer()) if exclude_obj is not None else 0,
         bool(use_evaluated_mesh),
+        tuple(sorted(exclude_names)),
         source_signatures,
     )
 
@@ -126,15 +128,17 @@ def _collect_static_triangles_uncached(
     exclude_obj: bpy.types.Object | None,
     depsgraph: bpy.types.Depsgraph | None = None,
     use_evaluated_mesh: bool = False,
+    exclude_names: set[str] | frozenset[str] | None = None,
 ) -> tuple[np.ndarray, tuple[tuple[str, int, int], ...]]:
     if collection is None:
         return np.empty((0, 3, 3), dtype=np.float32), ()
 
+    excluded = frozenset(exclude_names or ())
     triangles_world: list[np.ndarray] = []
     signature_entries: list[tuple[str, int, int]] = []
     objects = sorted(collection.objects, key=lambda item: item.name)
     for obj in objects:
-        if obj is None or obj == exclude_obj or obj.type != "MESH":
+        if obj is None or obj == exclude_obj or obj.type != "MESH" or obj.name in excluded:
             continue
         local, faces, matrix_world = _mesh_input_data(obj, depsgraph, use_evaluated_mesh)
         if len(faces) == 0:
@@ -153,17 +157,19 @@ def collect_static_triangles(
     exclude_obj: bpy.types.Object | None,
     depsgraph: bpy.types.Depsgraph | None = None,
     use_evaluated_mesh: bool = False,
+    exclude_names: set[str] | frozenset[str] | None = None,
 ) -> tuple[np.ndarray, tuple[tuple[str, int, int], ...]]:
     if collection is None:
         return np.empty((0, 3, 3), dtype=np.float32), ()
 
     depsgraph = depsgraph or bpy.context.evaluated_depsgraph_get()
+    excluded = frozenset(exclude_names or ())
     sources: list[_StaticSource] = []
     source_signatures: list[tuple] = []
     try:
         objects = sorted(collection.objects, key=lambda item: item.name)
         for obj in objects:
-            if obj is None or obj == exclude_obj or obj.type != "MESH":
+            if obj is None or obj == exclude_obj or obj.type != "MESH" or obj.name in excluded:
                 continue
             if use_evaluated_mesh:
                 eval_obj = obj.evaluated_get(depsgraph)
@@ -186,7 +192,7 @@ def collect_static_triangles(
             sources.append(source)
             source_signatures.append(_source_signature(source, obj, use_evaluated_mesh))
 
-        key = _cache_key(collection, exclude_obj, use_evaluated_mesh, tuple(source_signatures))
+        key = _cache_key(collection, exclude_obj, use_evaluated_mesh, excluded, tuple(source_signatures))
         cache_entry = _get_static_cache_entry(key)
         if cache_entry is not None:
             return (

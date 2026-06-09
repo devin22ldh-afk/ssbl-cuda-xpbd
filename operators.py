@@ -65,7 +65,8 @@ def _ssbl_animation_playback_post(*args):
         return
     try:
         if not solver.reset_timeline_preview_if_endpoint(scene):
-            solver.pause_timeline_preview(scene)
+            if not solver.stop_timeline_preview(scene):
+                solver.pause_timeline_preview(scene)
         _tag_viewports(bpy.context)
     except Exception:
         pass
@@ -99,11 +100,27 @@ def _draw_preview_fps(object_name: str) -> None:
 
     fps = solver.session_fps(obj)
     fps_text = "采样中" if fps <= 0.0 else f"{fps:.1f}"
+    diag = solver.session_diagnostics(obj)
     font_id = 0
     blf.position(font_id, 16, 52, 0)
     blf.size(font_id, 15)
     blf.color(font_id, 0.92, 0.97, 1.0, 1.0)
     blf.draw(font_id, f"SSBL 预览 FPS：{fps_text}")
+    blf.position(font_id, 16, 32, 0)
+    blf.size(font_id, 12)
+    blf.color(font_id, 0.82, 0.90, 1.0, 1.0)
+    blf.draw(
+        font_id,
+        "Frame %.1fms | CUDA %.1f | Input %.1f | DynUp %.1f | DynCol %.2f | VP %.2f"
+        % (
+            float(getattr(diag, "frame_ms", 0.0)),
+            float(getattr(diag, "cuda_step_call_ms", 0.0)),
+            float(getattr(diag, "input_refresh_ms", 0.0)),
+            float(getattr(diag, "dynamic_upload_ms", 0.0)),
+            float(getattr(diag, "dynamic_collision_ms", 0.0)),
+            float(getattr(diag, "viewport_tag_ms", 0.0)),
+        ),
+    )
 
 
 def _add_fps_overlay(object_name: str) -> None:

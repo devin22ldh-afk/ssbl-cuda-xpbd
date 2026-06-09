@@ -49,6 +49,7 @@ def _make_cloth() -> bpy.types.Object:
     group.add([vertex.index for vertex in obj.data.vertices if vertex.co.y > 0.5], 1.0, "ADD")
     settings = obj.ssbl_cloth
     settings.enabled = True
+    settings.auto_cache_realtime = True
     settings.pin_vertex_group = "ssbl_pin"
     settings.use_evaluated_mesh = True
     settings.use_volume_pressure = False

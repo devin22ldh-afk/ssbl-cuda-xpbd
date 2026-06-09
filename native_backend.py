@@ -149,6 +149,12 @@ class _NativeFrameInputs(ctypes.Structure):
         ("update_dynamic_triangles", ctypes.c_int),
         ("dynamic_triangles", ctypes.POINTER(ctypes.c_float)),
         ("dynamic_triangle_count", ctypes.c_int),
+        ("update_dynamic_indexed_triangles", ctypes.c_int),
+        ("dynamic_triangle_vertices", ctypes.POINTER(ctypes.c_float)),
+        ("dynamic_triangle_vertex_count", ctypes.c_int),
+        ("dynamic_triangle_indices", ctypes.POINTER(ctypes.c_int)),
+        ("dynamic_indexed_triangle_count", ctypes.c_int),
+        ("dynamic_triangle_topology_changed", ctypes.c_int),
         ("update_dynamic_particles", ctypes.c_int),
         ("dynamic_particle_positions", ctypes.POINTER(ctypes.c_float)),
         ("dynamic_particle_radii", ctypes.POINTER(ctypes.c_float)),
@@ -290,6 +296,11 @@ class _NativeDiagnostics(ctypes.Structure):
         ("self_filter_cache_misses", ctypes.c_longlong),
         ("self_cluster_count", ctypes.c_longlong),
         ("self_cluster_owned_contacts", ctypes.c_longlong),
+        ("dynamic_triangle_candidate_count", ctypes.c_longlong),
+        ("dynamic_triangle_bucket_overflow", ctypes.c_longlong),
+        ("dynamic_triangle_large_primitive_count", ctypes.c_longlong),
+        ("dynamic_triangle_aabb_reject_count", ctypes.c_longlong),
+        ("dynamic_triangle_max_bucket_occupancy", ctypes.c_longlong),
     ]
 
 
@@ -427,6 +438,11 @@ class NativeStepDiagnostics:
     self_filter_cache_misses: int = 0
     self_cluster_count: int = 0
     self_cluster_owned_contacts: int = 0
+    dynamic_triangle_candidate_count: int = 0
+    dynamic_triangle_bucket_overflow: int = 0
+    dynamic_triangle_large_primitive_count: int = 0
+    dynamic_triangle_aabb_reject_count: int = 0
+    dynamic_triangle_max_bucket_occupancy: int = 0
     frame_ms: float = 0.0
     frame_set_ms: float = 0.0
     input_refresh_ms: float = 0.0
@@ -579,6 +595,10 @@ def _array_content_signature(arr: np.ndarray) -> tuple:
 
 def _dynamic_triangle_signature(dynamic_arr: np.ndarray, triangle_count: int) -> tuple:
     return (int(triangle_count), _array_content_signature(dynamic_arr))
+
+
+def _dynamic_indexed_triangle_topology_signature(vertex_count: int, indices_arr: np.ndarray, triangle_count: int) -> tuple:
+    return (int(vertex_count), int(triangle_count), _array_content_signature(indices_arr))
 
 
 def _dynamic_particle_signature(
@@ -860,6 +880,9 @@ class NativeXpbdSolver:
         update_static: bool,
         dynamic_triangles: np.ndarray | None,
         update_dynamic: bool,
+        dynamic_triangle_vertices: np.ndarray | None = None,
+        dynamic_triangle_indices: np.ndarray | None = None,
+        dynamic_triangle_topology_signature=None,
         dynamic_particles: dict[str, np.ndarray] | None = None,
         update_dynamic_particles: bool = False,
         force_fields=None,
@@ -877,13 +900,33 @@ class NativeXpbdSolver:
         if len(pin_indices_arr) != len(pin_positions_arr) or len(pin_indices_arr) != len(pin_weights_arr):
             raise NativeSolverError("Pin index, target, and weight arrays must have matching lengths.")
         static_triangle_count = int(len(static_triangles)) if static_triangles is not None else 0
-        dynamic_triangle_count = int(len(dynamic_triangles)) if dynamic_triangles is not None else 0
+        dynamic_vertex_arr = np.ascontiguousarray(
+            dynamic_triangle_vertices.reshape((-1, 3)) if dynamic_triangle_vertices is not None else np.empty((0, 3), dtype=np.float32),
+            dtype=np.float32,
+        )
+        dynamic_index_arr = np.ascontiguousarray(
+            dynamic_triangle_indices.reshape((-1, 3)) if dynamic_triangle_indices is not None else np.empty((0, 3), dtype=np.int32),
+            dtype=np.int32,
+        )
+        use_indexed_dynamic = bool(
+            update_dynamic
+            and self._is_abi41_abi40
+            and dynamic_triangle_vertices is not None
+            and dynamic_triangle_indices is not None
+        )
+        if update_dynamic and not use_indexed_dynamic and dynamic_triangles is None and len(dynamic_vertex_arr) > 0 and len(dynamic_index_arr) > 0:
+            dynamic_triangles = np.ascontiguousarray(dynamic_vertex_arr[dynamic_index_arr], dtype=np.float32)
+        dynamic_triangle_count = (
+            int(len(dynamic_index_arr))
+            if use_indexed_dynamic
+            else (int(len(dynamic_triangles)) if dynamic_triangles is not None else 0)
+        )
         static_arr = np.ascontiguousarray(
             static_triangles.reshape((-1, 3)) if static_triangles is not None else np.empty((0, 3), dtype=np.float32),
             dtype=np.float32,
         )
         dynamic_arr = np.ascontiguousarray(
-            dynamic_triangles.reshape((-1, 3)) if dynamic_triangles is not None else np.empty((0, 3), dtype=np.float32),
+            dynamic_triangles.reshape((-1, 3)) if (dynamic_triangles is not None and not use_indexed_dynamic) else np.empty((0, 3), dtype=np.float32),
             dtype=np.float32,
         )
         particle_positions = np.ascontiguousarray(
@@ -925,21 +968,45 @@ class NativeXpbdSolver:
             and (not needs_particle_extras or len(particle_phases) == dynamic_particle_count)
         ):
             raise NativeSolverError("Dynamic particle arrays must have matching lengths.")
-        dynamic_signature = _dynamic_triangle_signature(dynamic_arr, dynamic_triangle_count) if update_dynamic else None
-        if update_dynamic and self._dynamic_triangle_signature == dynamic_signature:
+        dynamic_signature = None
+        dynamic_topology_changed = False
+        if update_dynamic and use_indexed_dynamic:
+            if dynamic_triangle_topology_signature is not None:
+                dynamic_signature = (
+                    int(len(dynamic_vertex_arr)),
+                    int(dynamic_triangle_count),
+                    "provided",
+                    dynamic_triangle_topology_signature,
+                )
+            else:
+                dynamic_signature = _dynamic_indexed_triangle_topology_signature(
+                    int(len(dynamic_vertex_arr)),
+                    dynamic_index_arr,
+                    dynamic_triangle_count,
+                )
+            dynamic_topology_changed = self._dynamic_triangle_signature != dynamic_signature
+        elif update_dynamic:
+            dynamic_signature = _dynamic_triangle_signature(dynamic_arr, dynamic_triangle_count)
+        if update_dynamic and not use_indexed_dynamic and self._dynamic_triangle_signature == dynamic_signature:
             update_dynamic = False
-        particle_signature = (
-            _dynamic_particle_signature(
-                particle_positions,
-                particle_radii,
-                particle_inv_mass,
-                particle_slot_ids,
-                particle_phases,
-                dynamic_particle_count,
-            )
-            if update_dynamic_particles
+        provided_particle_signature = (
+            (dynamic_particles or {}).get("signature")
+            if isinstance(dynamic_particles, dict)
             else None
         )
+        particle_signature = None
+        if update_dynamic_particles:
+            if provided_particle_signature is not None:
+                particle_signature = ("provided", provided_particle_signature)
+            else:
+                particle_signature = _dynamic_particle_signature(
+                    particle_positions,
+                    particle_radii,
+                    particle_inv_mass,
+                    particle_slot_ids,
+                    particle_phases,
+                    dynamic_particle_count,
+                )
         if update_dynamic_particles and self._dynamic_particle_signature == particle_signature:
             update_dynamic_particles = False
         if not hasattr(self._lib, "ssbl_update_frame_inputs"):
@@ -982,9 +1049,15 @@ class NativeXpbdSolver:
             update_static_triangles=int(update_static),
             static_triangles=_as_float_ptr(static_arr),
             static_triangle_count=static_triangle_count,
-            update_dynamic_triangles=int(update_dynamic),
+            update_dynamic_triangles=int(update_dynamic and not use_indexed_dynamic),
             dynamic_triangles=_as_float_ptr(dynamic_arr),
-            dynamic_triangle_count=dynamic_triangle_count,
+            dynamic_triangle_count=0 if use_indexed_dynamic else dynamic_triangle_count,
+            update_dynamic_indexed_triangles=int(update_dynamic and use_indexed_dynamic),
+            dynamic_triangle_vertices=_as_float_ptr(dynamic_vertex_arr),
+            dynamic_triangle_vertex_count=int(len(dynamic_vertex_arr)),
+            dynamic_triangle_indices=_as_int_ptr(dynamic_index_arr),
+            dynamic_indexed_triangle_count=dynamic_triangle_count if use_indexed_dynamic else 0,
+            dynamic_triangle_topology_changed=int(dynamic_topology_changed),
             update_dynamic_particles=int(update_dynamic_particles),
             dynamic_particle_positions=_as_float_ptr(particle_positions),
             dynamic_particle_radii=_as_float_ptr(particle_radii),
@@ -1174,6 +1247,11 @@ class NativeXpbdSolver:
             self_filter_cache_misses=int(raw.self_filter_cache_misses),
             self_cluster_count=int(raw.self_cluster_count),
             self_cluster_owned_contacts=int(raw.self_cluster_owned_contacts),
+            dynamic_triangle_candidate_count=int(raw.dynamic_triangle_candidate_count),
+            dynamic_triangle_bucket_overflow=int(raw.dynamic_triangle_bucket_overflow),
+            dynamic_triangle_large_primitive_count=int(raw.dynamic_triangle_large_primitive_count),
+            dynamic_triangle_aabb_reject_count=int(raw.dynamic_triangle_aabb_reject_count),
+            dynamic_triangle_max_bucket_occupancy=int(raw.dynamic_triangle_max_bucket_occupancy),
         )
         self._last_diagnostics = diag
         return diag

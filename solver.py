@@ -31,6 +31,7 @@ from .session_manager import (
     pause_timeline_preview,
     start_preview,
     start_timeline_preview,
+    stop_timeline_preview,
     step_preview,
     step_timeline_preview,
 )
