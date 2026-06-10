@@ -122,13 +122,13 @@ constexpr float kAbi41ExtremeStretchHardCapVelocityTrimScale = 1.0f;
 constexpr int kAbi41ExtremeStretchHardCapPasses = 3;
 constexpr float kAbi41LraPrevSyncScale = 0.32f;
 constexpr float kAbi41BendPrevSyncScale = 0.06f;
-constexpr float kAbi41SelfPrevSyncScale = 0.08f;
+constexpr float kAbi41SelfPrevSyncScale = 0.55f;
 constexpr float kAbi41ConstraintAdditiveVelocityFeedback = 0.9f;
 constexpr float kAbi41ConstraintVelocityMaxDeltaScale = 0.35f;
 constexpr float kAbi41ConstraintVelocityMaxDeltaFloor = 2.0e-4f;
 constexpr float kAbi41DynamicNeighborImpulseScale = 0.5f;
 constexpr float kAbi41SignedDynamicProjectionRelaxation = 1.0f / 3.0f;
-constexpr float kAbi41SignedDynamicOutwardVelocityRetention = 2.0f / 9.0f;
+constexpr float kAbi41SignedDynamicOutwardVelocityRetention = 1.0f / 8.0f;
 constexpr float kAbi41SignedDynamicContactMarginScale = 0.75f;
 constexpr float kAbi41DynamicContactMaxDeltaScale = 3.0f;
 constexpr float kAbi41DynamicContactMaxDeltaFloor = 5.0e-4f;
@@ -147,6 +147,7 @@ constexpr int kAbi41FastOverlapIslandMaxContacts = 48;
 constexpr float kAbi41FastOverlapIslandCorrectionScale = 0.50f;
 constexpr float kAbi41FastOverlapIslandMaxDeltaScale = 0.30f;
 constexpr float kAbi41FastOverlapIslandMinAvgDepthScale = 0.04f;
+constexpr float kPinMinEffectiveWeight = 0.05f;
 constexpr float kPinHardWeightThreshold = 0.75f;
 constexpr int kAbi41PcgMaxIterations = 8;
 constexpr int kAbi41PcgReductionDAD = 0;
@@ -3397,7 +3398,7 @@ __global__ void abi41_pcg_advance_iteration_kernel(Abi41Solver solver) {
 }
 
 __device__ float abi41_pin_soft_relaxation(float weight, float pass_exponent) {
-    if (!isfinite(weight) || weight <= 0.0f) {
+    if (!isfinite(weight) || weight < kPinMinEffectiveWeight) {
         return 0.0f;
     }
     const float total_strength = clamp01(weight / kPinHardWeightThreshold);
@@ -3419,7 +3420,7 @@ __global__ void abi41_pin_project_kernel(Abi41Solver solver, float pass_exponent
         return;
     }
     float weight = solver.pin_weights ? solver.pin_weights[p] : 1.0f;
-    if (!isfinite(weight) || weight <= 0.0f) {
+    if (!isfinite(weight) || weight < kPinMinEffectiveWeight) {
         return;
     }
     Vec3 target = solver.pin_targets[p];
@@ -8819,6 +8820,16 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
                         return 0;
                     }
                 }
+            }
+            const bool run_final_pin_polish = solver->pin_count > 0
+                && (run_analytic_colliders
+                    || solver->static_sdf_ready != 0
+                    || run_dynamic_collision
+                    || run_self_collision
+                    || run_signed_dynamic_collision
+                    || (run_stretch_pcg && run_final_abi41_constraints));
+            if (run_final_pin_polish) {
+                abi41_pin_project_kernel<<<p_blocks, kThreads>>>(*solver, pin_pass_exponent, sub_dt);
             }
             if (!set_cuda_error(cudaGetLastError(), "launch ABI40 recon constraints")) {
                 return 0;

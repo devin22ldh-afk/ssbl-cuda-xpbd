@@ -1,5 +1,6 @@
 import json
 import math
+import os
 import sys
 
 import bpy
@@ -599,54 +600,69 @@ def main():
         pass
     ssbl.register()
     try:
-        results = {
-            "ground": _run_case("ground", _ground_case, _ground_metric),
-            "wall": _run_case("wall", _wall_case, _wall_metric),
-            "static_monkey": _run_case(
+        case_factories = {
+            "ground": lambda: _run_case("ground", _ground_case, _ground_metric),
+            "wall": lambda: _run_case("wall", _wall_case, _wall_metric),
+            "static_monkey": lambda: _run_case(
                 "static_monkey",
                 _static_monkey_case,
                 _static_monkey_metric,
                 expect_static_sdf=True,
             ),
-            "static_mesh": _run_case(
+            "static_mesh": lambda: _run_case(
                 "static_mesh",
                 _static_mesh_case,
                 _static_mesh_metric,
                 expect_static_sdf=True,
             ),
-            "large_static_mesh": _run_case(
+            "large_static_mesh": lambda: _run_case(
                 "large_static_mesh",
                 _large_static_mesh_case,
                 _static_mesh_metric,
                 expect_static_sdf=True,
                 min_static_triangles=4097,
             ),
-            "friction_ground": _run_friction_case(
+            "friction_ground": lambda: _run_friction_case(
                 "friction_ground",
                 _friction_ground_case,
                 0,
                 (6.0, 0.0, -6.0),
             ),
-            "friction_wall": _run_friction_case(
+            "friction_wall": lambda: _run_friction_case(
                 "friction_wall",
                 _friction_wall_case,
                 1,
                 (-6.0, 6.0, 0.0),
             ),
-            "friction_sphere": _run_friction_case(
+            "friction_sphere": lambda: _run_friction_case(
                 "friction_sphere",
                 _friction_sphere_case,
                 0,
                 (6.0, 0.0, -6.0),
             ),
-            "friction_static_mesh": _run_friction_case(
+            "friction_static_mesh": lambda: _run_friction_case(
                 "friction_static_mesh",
                 _friction_static_mesh_case,
                 0,
                 (6.0, 0.0, -6.0),
             ),
-            "unchanged_static_mesh": _run_static_sdf_unchanged_case(),
-            "moving_static_mesh": _run_moving_static_collider_case(),
+            "unchanged_static_mesh": _run_static_sdf_unchanged_case,
+            "moving_static_mesh": _run_moving_static_collider_case,
+        }
+        selected = {
+            name.strip()
+            for name in os.environ.get("SSBL_OBJECT_COLLISION_CASES", "").split(",")
+            if name.strip()
+        }
+        missing = sorted(selected.difference(case_factories))
+        if missing:
+            raise RuntimeError(f"unknown SSBL_OBJECT_COLLISION_CASES entries: {missing}")
+        case_names = list(case_factories)
+        if selected:
+            case_names = [name for name in case_names if name in selected]
+        results = {
+            name: case_factories[name]()
+            for name in case_names
         }
         print("SSBL_OBJECT_COLLISION_SMOKE", json.dumps(results, ensure_ascii=False))
     finally:

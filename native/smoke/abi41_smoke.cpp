@@ -1173,11 +1173,12 @@ int run_pin_weight_strength_smoke() {
         0.0f, 0.0f, 0.0f,
         1.0f, 0.0f, 0.0f,
         2.0f, 0.0f, 0.0f,
+        3.0f, 0.0f, 0.0f,
     };
-    std::vector<float> inv_mass = {1.0f, 1.0f, 1.0f};
+    std::vector<float> inv_mass = {1.0f, 1.0f, 1.0f, 1.0f};
 
     SsblXpbdConfig cfg{};
-    cfg.vertex_count = 3;
+    cfg.vertex_count = 4;
     cfg.dt = 1.0f / 60.0f;
     cfg.damping = 1.0f;
     cfg.gravity[0] = 0.0f;
@@ -1194,13 +1195,14 @@ int run_pin_weight_strength_smoke() {
         return 130;
     }
 
-    int pins[] = {0, 1};
+    int pins[] = {0, 1, 2};
     float pin_positions[] = {
         0.0f, 1.0f, 0.0f,
         1.0f, 1.0f, 0.0f,
+        2.0f, 1.0f, 0.0f,
     };
-    float pin_weights[] = {1.0f, 0.375f};
-    if (!ssbl_update_pin_targets(solver, pins, pin_positions, pin_weights, 2)) {
+    float pin_weights[] = {1.0f, 0.375f, 0.04f};
+    if (!ssbl_update_pin_targets(solver, pins, pin_positions, pin_weights, 3)) {
         std::fprintf(stderr, "SSBL_ABI41_PIN_WEIGHT_ERROR pins: %s\n", ssbl_last_error());
         ssbl_destroy_solver(solver);
         return 131;
@@ -1227,7 +1229,8 @@ int run_pin_weight_strength_smoke() {
 
     const float hard_y = out[1];
     const float soft_y = out[4];
-    const float free_y = out[7];
+    const float low_y = out[7];
+    const float free_y = out[10];
     if (!finite_positions(out) || !diag.finite_flag) {
         std::fprintf(stderr, "SSBL_ABI41_PIN_WEIGHT_ERROR non-finite output\n");
         return 135;
@@ -1245,8 +1248,23 @@ int run_pin_weight_strength_smoke() {
         );
         return 137;
     }
+    if (std::fabs(low_y - free_y) > 1.0e-6f) {
+        std::fprintf(
+            stderr,
+            "SSBL_ABI41_PIN_WEIGHT_ERROR low pin affected vertex low=%.6f free=%.6f\n",
+            low_y,
+            free_y
+        );
+        return 138;
+    }
 
-    std::printf("SSBL_ABI41_PIN_WEIGHT_OK hard_y=%.5f soft_y=%.5f free_y=%.5f\n", hard_y, soft_y, free_y);
+    std::printf(
+        "SSBL_ABI41_PIN_WEIGHT_OK hard_y=%.5f soft_y=%.5f low_y=%.5f free_y=%.5f\n",
+        hard_y,
+        soft_y,
+        low_y,
+        free_y
+    );
     return 0;
 }
 

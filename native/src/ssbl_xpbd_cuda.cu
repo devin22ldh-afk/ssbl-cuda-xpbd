@@ -25,6 +25,7 @@ constexpr float kFastSelfRecoveryProjectionRelaxation = 0.90f;
 constexpr float kSelfRecoveryVelocityDamping = 0.65f;
 constexpr float kSelfCorrectionMaxDisplacementScale = 0.45f;
 constexpr float kSelfRecoveryMaxDisplacementScale = 0.50f;
+constexpr float kPinMinEffectiveWeight = 0.05f;
 constexpr float kPinHardWeightThreshold = 0.75f;
 constexpr float kMaxSubstepMove = 0.35f;
 constexpr float kMaxVelocity = 35.0f;
@@ -2372,7 +2373,7 @@ __global__ void lra_project_kernel(Solver solver, float dt) {
 }
 
 __device__ float pin_soft_relaxation(float weight, float pass_exponent) {
-    if (!isfinite(weight) || weight <= 0.0f) {
+    if (!isfinite(weight) || weight < kPinMinEffectiveWeight) {
         return 0.0f;
     }
     float total_strength = clamp01(weight / kPinHardWeightThreshold);
@@ -2394,7 +2395,7 @@ __global__ void pin_project_kernel(Solver solver, float pass_exponent, float dt)
         return;
     }
     float weight = solver.pin_weights ? solver.pin_weights[p] : 1.0f;
-    if (!isfinite(weight) || weight <= 0.0f) {
+    if (!isfinite(weight) || weight < kPinMinEffectiveWeight) {
         return;
     }
     Vec3 target = solver.pin_targets[p];
