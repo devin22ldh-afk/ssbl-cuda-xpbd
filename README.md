@@ -227,6 +227,11 @@ tools/              Smoke tests, benchmarks, and preview recording scripts
 translation/        Blender translation resources for Chinese UI text
 ```
 
+## Contributors / 贡献者
+
+- [@devin22ldh-afk](https://github.com/devin22ldh-afk) — maintainer, core development, and releases. / 维护者、核心开发与版本发布。
+- Codex — AI-assisted contributor. / AI 辅助贡献者。
+
 ## License
 
 This project is licensed under `GPL-3.0-or-later`. See [`LICENSE`](LICENSE).

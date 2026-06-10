@@ -1,6 +1,6 @@
 bl_info = {
     "name": "SSBL CUDA XPBD",
-    "author": "OpenAI",
+    "author": "Devin (@devin22ldh-afk), with Codex assistance",
     "version": (0, 4, 3),
     "blender": (5, 0, 0),
     "location": "3D View > Sidebar > SSBL",
