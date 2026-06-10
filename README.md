@@ -64,6 +64,16 @@ SSBL CUDA XPBD is a native CUDA XPBD cloth add-on for Blender 5.0. It provides v
 
 ## 安装 / Installation
 
+### Quick Zip Install
+
+- Direct download: [`ssbl-official.zip`](https://github.com/devin22ldh-afk/ssbl-cuda-xpbd/releases/download/v0.4.3/ssbl-official.zip)
+- In Blender, open `Edit > Preferences > Add-ons > Install from Disk...` and install this zip.
+
+- 直接下载：[`ssbl-official.zip`](https://github.com/devin22ldh-afk/ssbl-cuda-xpbd/releases/download/v0.4.3/ssbl-official.zip)
+- Blender 中打开 `Edit > Preferences > Add-ons > Install from Disk...`，选择这个 zip 安装。
+- Direct download: [`ssbl-official.zip`](https://github.com/devin22ldh-afk/ssbl-cuda-xpbd/releases/download/v0.4.3/ssbl-official.zip)
+- In Blender, open `Edit > Preferences > Add-ons > Install from Disk...` and install this zip.
+
 将本目录放到 Blender 5.0 的用户插件目录，并确保目录名为 `ssbl`：
 
 Place this directory in the Blender 5.0 user add-ons folder and keep the directory name as `ssbl`:
