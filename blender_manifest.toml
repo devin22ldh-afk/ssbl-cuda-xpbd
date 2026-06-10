@@ -22,6 +22,7 @@ files = "Writes PC2 cache files and binds Mesh Cache modifiers"
 [build]
 paths_exclude_pattern = [
     "__pycache__/",
+    "*/__pycache__/",
     "tools/__pycache__/",
     ".*",
     "*.zip",

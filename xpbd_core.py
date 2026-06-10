@@ -8,6 +8,7 @@ import os
 import bmesh
 import bpy
 import numpy as np
+from bpy.app.translations import pgettext_tip as tip_
 
 from .force_fields import gravity_weight
 
@@ -163,9 +164,9 @@ def make_pin_attachment_batch(
     else:
         weights_arr = np.ascontiguousarray(pin_weights, dtype=np.float32).reshape((-1,))
     if len(pin_indices_arr) != len(targets_arr):
-        raise ValueError("Pin attachment indices and target positions must have matching lengths.")
+        raise ValueError(tip_("Pin attachment indices and target positions must have matching lengths."))
     if len(pin_indices_arr) != len(weights_arr):
-        raise ValueError("Pin attachment indices and weights must have matching lengths.")
+        raise ValueError(tip_("Pin attachment indices and weights must have matching lengths."))
     weights_arr = np.ascontiguousarray(np.clip(weights_arr, 0.0, 1.0), dtype=np.float32)
     if len(pin_indices_arr) == 0:
         return PinAttachmentBatch(
@@ -369,7 +370,7 @@ def _build_cloth_data_uncached(
     depsgraph: bpy.types.Depsgraph | None = None,
 ) -> ClothBuildData:
     if obj is None or obj.type != "MESH":
-        raise ValueError("当前活动对象必须是网格")
+        raise ValueError(tip_("A mesh object is required for cloth simulation."))
 
     derived = sync_hardness_settings(settings)
     use_evaluated_mesh = bool(getattr(settings, "use_evaluated_mesh", False))
@@ -382,7 +383,7 @@ def _build_cloth_data_uncached(
     world, _matrix_world = to_world(local, matrix_world)
     matrix_world_inv = np.array(matrix_world.inverted(), dtype=np.float32)
     if len(triangles) == 0:
-        raise ValueError("当前网格至少需要一个面")
+        raise ValueError(tip_("The cloth mesh needs at least one face."))
 
     pin_weights_by_vertex = effective_pin_weights_from_settings(obj, settings, len(local))
     pin_mask = pin_weights_by_vertex > 0.0
@@ -390,7 +391,7 @@ def _build_cloth_data_uncached(
     # All-hard-pin meshes are valid kinematic dynamic-collider slots.
     # Their inverse mass is zero, while pin targets keep them on evaluated animation.
     if np.all(hard_pin_mask) and not ALLOW_ALL_PINNED_KINEMATIC_SLOT:
-        raise ValueError("所有顶点都被固定了，没有可模拟的部分")
+        raise ValueError(tip_("All vertices are pinned; there is no simulated cloth region."))
     rest_volume = signed_mesh_volume(world, triangles)
 
     edges, edge_rest = edge_constraints(triangles, world)
@@ -438,7 +439,7 @@ def build_cloth_data(
     depsgraph: bpy.types.Depsgraph | None = None,
 ) -> ClothBuildData:
     if obj is None or obj.type != "MESH":
-        raise ValueError("A mesh object is required for cloth simulation.")
+        raise ValueError(tip_("A mesh object is required for cloth simulation."))
 
     derived = sync_hardness_settings(settings)
     use_evaluated_mesh = bool(getattr(settings, "use_evaluated_mesh", False))
@@ -459,7 +460,7 @@ def build_cloth_data(
     try:
         if len(mesh.vertices) != len(obj.data.vertices):
             raise ValueError(
-                "Evaluated cloth input must keep the same vertex count as the source mesh."
+                tip_("Evaluated cloth input must keep the same vertex count as the source mesh.")
             )
         return _build_cloth_data_from_mesh(
             obj,
@@ -533,11 +534,11 @@ def _build_cloth_data_from_mesh(
         )
 
     if len(triangles) == 0:
-        raise ValueError("The cloth mesh needs at least one face.")
+        raise ValueError(tip_("The cloth mesh needs at least one face."))
     # All-hard-pin meshes are valid kinematic dynamic-collider slots.
     # Their inverse mass is zero, while pin targets keep them on evaluated animation.
     if np.all(hard_pin_mask) and not ALLOW_ALL_PINNED_KINEMATIC_SLOT:
-        raise ValueError("All vertices are pinned; there is no simulated cloth region.")
+        raise ValueError(tip_("All vertices are pinned; there is no simulated cloth region."))
 
     rest_volume = signed_mesh_volume(world, triangles)
 
@@ -597,8 +598,10 @@ def mesh_input_data(
     try:
         if require_matching_vertex_count and len(mesh.vertices) != len(obj.data.vertices):
             raise ValueError(
-                "在 v1 中，求值后的布料输入必须与源网格保持相同顶点数；"
-                "暂不支持会改变拓扑的布料修改器。"
+                tip_(
+                    "In v1, the evaluated cloth input must keep the same vertex count as the source mesh; "
+                    "topology-changing cloth modifiers are not supported yet."
+                )
             )
         return (
             mesh_local_positions(mesh),
@@ -622,7 +625,9 @@ def world_positions_from_object(
         try:
             if expected_vertex_count is not None and len(mesh.vertices) != expected_vertex_count:
                 raise ValueError(
-                    "动画布料输入的顶点数发生了变化；求值后的布料输入必须保持固定拓扑。"
+                    tip_(
+                        "The animated cloth input changed vertex count; the evaluated cloth input must keep fixed topology."
+                    )
                 )
             local = mesh_local_positions(mesh)
             world, _matrix_world = to_world(local, eval_obj.matrix_world.copy())
@@ -632,7 +637,7 @@ def world_positions_from_object(
 
     local = mesh_local_positions(obj.data)
     if expected_vertex_count is not None and len(local) != expected_vertex_count:
-        raise ValueError("动画布料输入的顶点数发生了变化；必须保持固定的布料拓扑。")
+        raise ValueError(tip_("The animated cloth input changed vertex count; cloth topology must remain fixed."))
     world, _matrix_world = to_world(local, obj.matrix_world.copy())
     return world, obj.matrix_world.copy()
 

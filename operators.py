@@ -3,6 +3,7 @@ from __future__ import annotations
 import bpy
 import blf
 import time
+from bpy.app.translations import pgettext_iface as iface_
 from bpy_extras import view3d_utils
 from mathutils import Vector
 from bpy.app.handlers import persistent
@@ -99,13 +100,13 @@ def _draw_preview_fps(object_name: str) -> None:
         return
 
     fps = solver.session_fps(obj)
-    fps_text = "采样中" if fps <= 0.0 else f"{fps:.1f}"
+    fps_text = iface_("Sampling") if fps <= 0.0 else f"{fps:.1f}"
     diag = solver.session_diagnostics(obj)
     font_id = 0
     blf.position(font_id, 16, 52, 0)
     blf.size(font_id, 15)
     blf.color(font_id, 0.92, 0.97, 1.0, 1.0)
-    blf.draw(font_id, f"SSBL 预览 FPS：{fps_text}")
+    blf.draw(font_id, iface_("SSBL Preview FPS: {fps}").format(fps=fps_text))
     blf.position(font_id, 16, 32, 0)
     blf.size(font_id, 12)
     blf.color(font_id, 0.82, 0.90, 1.0, 1.0)
@@ -433,8 +434,8 @@ class SSBL_OT_interactive_pin_monitor(bpy.types.Operator):
 
 class SSBL_OT_start_preview(bpy.types.Operator):
     bl_idname = "ssbl.start_preview"
-    bl_label = "开始预览"
-    bl_description = "对当前活动的布料网格运行本地 CUDA XPBD 预览"
+    bl_label = "Start Preview"
+    bl_description = "Run a local CUDA XPBD preview on the active cloth mesh"
     bl_options = {"REGISTER"}
 
     _timer = None
@@ -447,7 +448,7 @@ class SSBL_OT_start_preview(bpy.types.Operator):
     def invoke(self, context: bpy.types.Context, event):
         obj = context.active_object
         if obj is None:
-            self.report({"ERROR"}, "请先选择一个网格对象")
+            self.report({"ERROR"}, iface_("Select a mesh object first."))
             return {"CANCELLED"}
 
         try:
@@ -463,8 +464,8 @@ class SSBL_OT_start_preview(bpy.types.Operator):
         wm.modal_handler_add(self)
         _ensure_interactive_pin_monitor(context)
         for warning in warnings[:3]:
-            self.report({"WARNING"}, warning)
-        self.report({"INFO"}, f"已开始 {obj.name} 的 CUDA XPBD 预览")
+            self.report({"WARNING"}, iface_(warning))
+        self.report({"INFO"}, iface_("Started CUDA XPBD preview for {object_name}.").format(object_name=obj.name))
         return {"RUNNING_MODAL"}
 
     def modal(self, context: bpy.types.Context, event):
@@ -493,14 +494,14 @@ class SSBL_OT_start_preview(bpy.types.Operator):
         if self._timer is not None:
             context.window_manager.event_timer_remove(self._timer)
             self._timer = None
-        self.report({"INFO"}, solver.session_status(obj))
+        self.report({"INFO"}, iface_(solver.session_status(obj)))
         return {"FINISHED"}
 
 
 class SSBL_OT_stop_preview(bpy.types.Operator):
     bl_idname = "ssbl.stop_preview"
-    bl_label = "停止预览"
-    bl_description = "停止本地 CUDA XPBD 预览并恢复源网格"
+    bl_label = "Stop Preview"
+    bl_description = "Stop the local CUDA XPBD preview and restore the source mesh"
     bl_options = {"REGISTER"}
 
     @classmethod
@@ -510,17 +511,17 @@ class SSBL_OT_stop_preview(bpy.types.Operator):
     def execute(self, context: bpy.types.Context):
         obj = context.active_object
         if obj is None or not solver.request_stop(obj):
-            self.report({"WARNING"}, "当前活动对象没有正在运行的预览")
+            self.report({"WARNING"}, iface_("The active object does not have a running preview."))
             return {"CANCELLED"}
         _tag_viewports(context)
-        self.report({"INFO"}, f"已停止 {obj.name} 的预览")
+        self.report({"INFO"}, iface_("Stopped preview for {object_name}.").format(object_name=obj.name))
         return {"FINISHED"}
 
 
 class SSBL_OT_reset_preview(bpy.types.Operator):
     bl_idname = "ssbl.reset_preview"
-    bl_label = "重置预览"
-    bl_description = "将活动对象从当前预览会话恢复到原始状态"
+    bl_label = "Reset Preview"
+    bl_description = "Restore the active object to its original state from the current preview session"
     bl_options = {"REGISTER"}
 
     @classmethod
@@ -530,20 +531,20 @@ class SSBL_OT_reset_preview(bpy.types.Operator):
     def execute(self, context: bpy.types.Context):
         obj = context.active_object
         if obj is None:
-            self.report({"WARNING"}, "当前没有活动对象")
+            self.report({"WARNING"}, iface_("No active object."))
             return {"CANCELLED"}
         if not solver.reset_preview_object(obj):
-            self.report({"WARNING"}, "当前活动对象没有缓存的预览状态")
+            self.report({"WARNING"}, iface_("The active object has no cached preview state."))
             return {"CANCELLED"}
         _tag_viewports(context)
-        self.report({"INFO"}, f"已重置 {obj.name} 的预览")
+        self.report({"INFO"}, iface_("Reset preview for {object_name}.").format(object_name=obj.name))
         return {"FINISHED"}
 
 
 class SSBL_OT_bake_xpbd_cache(bpy.types.Operator):
     bl_idname = "ssbl.bake_xpbd_cache"
-    bl_label = "烘焙 XPBD 缓存"
-    bl_description = "使用 CUDA XPBD 将当前活动布料网格烘焙到本地 PC2 缓存"
+    bl_label = "Bake XPBD Cache"
+    bl_description = "Bake the active cloth mesh to a local PC2 cache using CUDA XPBD"
     bl_options = {"REGISTER"}
 
     @classmethod
@@ -553,7 +554,7 @@ class SSBL_OT_bake_xpbd_cache(bpy.types.Operator):
     def execute(self, context: bpy.types.Context):
         obj = context.active_object
         if obj is None:
-            self.report({"ERROR"}, "请先选择一个网格对象")
+            self.report({"ERROR"}, iface_("Select a mesh object first."))
             return {"CANCELLED"}
         wm = context.window_manager
         workspace = getattr(context, "workspace", None)
@@ -570,7 +571,12 @@ class SSBL_OT_bake_xpbd_cache(bpy.types.Operator):
             if workspace is not None:
                 try:
                     workspace.status_text_set(
-                        f"SSBL 烘焙 {obj.name}: {current}/{total} ({(float(current) / float(total)) * 100.0:.0f}%)"
+                        iface_("SSBL Baking {object_name}: {current}/{total} ({percent:.0f}%)").format(
+                            object_name=obj.name,
+                            current=current,
+                            total=total,
+                            percent=(float(current) / float(total)) * 100.0,
+                        )
                     )
                 except Exception:
                     pass
@@ -590,14 +596,14 @@ class SSBL_OT_bake_xpbd_cache(bpy.types.Operator):
                     pass
             _tag_areas(context)
         _tag_viewports(context)
-        self.report({"INFO"}, f"已烘焙 XPBD 缓存：{path}")
+        self.report({"INFO"}, iface_("Baked XPBD cache: {path}").format(path=path))
         return {"FINISHED"}
 
 
 class SSBL_OT_clear_xpbd_cache(bpy.types.Operator):
     bl_idname = "ssbl.clear_xpbd_cache"
-    bl_label = "清除 XPBD 缓存"
-    bl_description = "移除活动对象上的 SSBL XPBD PC2 缓存绑定"
+    bl_label = "Clear XPBD Cache"
+    bl_description = "Remove the SSBL XPBD PC2 cache binding from the active object"
     bl_options = {"REGISTER"}
 
     @classmethod
@@ -607,11 +613,11 @@ class SSBL_OT_clear_xpbd_cache(bpy.types.Operator):
     def execute(self, context: bpy.types.Context):
         obj = context.active_object
         if obj is None:
-            self.report({"WARNING"}, "当前没有活动对象")
+            self.report({"WARNING"}, iface_("No active object."))
             return {"CANCELLED"}
         if not solver.clear_xpbd_cache(obj):
-            self.report({"WARNING"}, "当前活动对象没有 SSBL XPBD 缓存")
+            self.report({"WARNING"}, iface_("The active object has no SSBL XPBD cache."))
             return {"CANCELLED"}
         _tag_viewports(context)
-        self.report({"INFO"}, f"已清除 {obj.name} 上的 XPBD 缓存")
+        self.report({"INFO"}, iface_("Cleared XPBD cache from {object_name}.").format(object_name=obj.name))
         return {"FINISHED"}

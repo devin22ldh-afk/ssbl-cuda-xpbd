@@ -12,6 +12,7 @@ from pathlib import Path
 
 ADDON_ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ADDON_ROOT / "blender_manifest.toml"
+INIT_FILE = ADDON_ROOT / "__init__.py"
 FORBIDDEN_PARTS = {".git", "__MACOSX", "__pycache__", "recordings", "dist", "ssbl_cache"}
 FORBIDDEN_NAMES = {".gitignore", "findings.md", "progress.md", "task_plan.md"}
 FORBIDDEN_SUFFIXES = {
@@ -39,17 +40,39 @@ def _manifest_exclude_patterns(manifest: dict) -> list[str]:
     return [str(pattern).replace("\\", "/") for pattern in patterns]
 
 
+def _directory_probes(relative_path: str, is_dir: bool) -> list[str]:
+    parts = relative_path.split("/")
+    max_depth = len(parts) if is_dir else max(len(parts) - 1, 0)
+    return ["/".join(parts[:depth]) + "/" for depth in range(1, max_depth + 1)]
+
+
 def _excluded_by_manifest(relative_path: str, is_dir: bool, patterns: list[str]) -> bool:
     probe = relative_path.replace("\\", "/")
     probes = [probe]
+    dir_probes = _directory_probes(probe, is_dir)
     if is_dir and not probe.endswith("/"):
         probes.append(probe + "/")
     for pattern in patterns:
-        if pattern.endswith("/") and (probe + "/").startswith(pattern):
+        if pattern.endswith("/") and any(fnmatch.fnmatchcase(item, pattern) for item in dir_probes):
             return True
         if any(fnmatch.fnmatchcase(item, pattern) for item in probes):
             return True
     return False
+
+
+def _load_bl_info() -> dict:
+    source = INIT_FILE.read_text(encoding="utf-8-sig")
+    module = ast.parse(source, filename="__init__.py")
+    for node in module.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(isinstance(target, ast.Name) and target.id == "bl_info" for target in node.targets):
+            continue
+        value = ast.literal_eval(node.value)
+        if not isinstance(value, dict):
+            break
+        return value
+    raise AssertionError("Could not parse bl_info from __init__.py")
 
 
 def _iter_package_paths(manifest: dict) -> list[str]:
@@ -98,6 +121,28 @@ def check_manifest() -> dict:
     return manifest
 
 
+def check_version_alignment(manifest: dict) -> None:
+    manifest_version = str(manifest.get("version", "")).strip()
+    if not manifest_version:
+        raise AssertionError("manifest version must be a non-empty string")
+
+    version_parts = manifest_version.split(".")
+    try:
+        manifest_tuple = tuple(int(part) for part in version_parts)
+    except ValueError as exc:
+        raise AssertionError(f"manifest version must be numeric dotted semver, got {manifest_version!r}") from exc
+
+    bl_info = _load_bl_info()
+    bl_info_version = bl_info.get("version")
+    if not isinstance(bl_info_version, tuple) or not all(isinstance(item, int) for item in bl_info_version):
+        raise AssertionError("bl_info['version'] must be an integer tuple")
+    if tuple(bl_info_version) != manifest_tuple:
+        raise AssertionError(
+            f"Version mismatch: blender_manifest.toml has {manifest_version}, "
+            f"but __init__.py bl_info has {bl_info_version}"
+        )
+
+
 def check_operator_polls() -> None:
     source = (ADDON_ROOT / "operators.py").read_text(encoding="utf-8-sig")
     module = ast.parse(source, filename="operators.py")
@@ -142,9 +187,11 @@ def check_safe_cache_names() -> None:
 
 def check_package_paths() -> list[str]:
     manifest = check_manifest()
+    check_version_alignment(manifest)
     paths = _iter_package_paths(manifest)
     _assert_no_forbidden_paths(paths)
     required = {
+        "LICENSE",
         "__init__.py",
         "blender_manifest.toml",
         "cache_names.py",
@@ -152,6 +199,8 @@ def check_package_paths() -> list[str]:
         "native/include/ssbl_xpbd_cuda.h",
         "native/src/ssbl_xpbd_cuda_abi41.cu",
         "native/README.md",
+        "translation/__init__.py",
+        "translation/zh_CN.py",
     }
     missing = sorted(required.difference(paths))
     if missing:
@@ -173,7 +222,8 @@ def main() -> int:
     parser.add_argument("--build-zip", type=Path)
     args = parser.parse_args()
 
-    check_manifest()
+    manifest = check_manifest()
+    check_version_alignment(manifest)
     check_operator_polls()
     check_safe_cache_names()
     paths = check_package_paths()

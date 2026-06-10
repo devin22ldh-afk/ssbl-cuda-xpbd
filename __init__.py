@@ -1,10 +1,10 @@
 bl_info = {
     "name": "SSBL CUDA XPBD",
     "author": "OpenAI",
-    "version": (0, 4, 2),
+    "version": (0, 4, 3),
     "blender": (5, 0, 0),
-    "location": "3D 视图 > 侧边栏 > SSBL",
-    "description": "Blender 本地 CUDA XPBD 布料预览与 PC2 烘焙插件",
+    "location": "3D View > Sidebar > SSBL",
+    "description": "Native CUDA XPBD cloth preview and PC2 baking add-on for Blender",
     "category": "Animation",
 }
 
@@ -22,7 +22,7 @@ from bpy.props import (
 )
 from bpy.types import PropertyGroup
 
-from . import operators, solver, ui
+from . import operators, solver, translation, ui
 from .xpbd_core import DEFAULT_HARDNESS, sync_hardness_settings
 
 
@@ -202,61 +202,61 @@ def _restore_preview_source_before_save(_dummy=None):
 
 class SSBL_PreviewSettings(PropertyGroup):
     enabled: BoolProperty(
-        name="启用 SSBL 布料",
+        name="Enable SSBL Cloth Simulation",
         default=False,
         update=_apply_enabled,
-        description="启用后，按空格播放时间轴即可运行 SSBL CUDA XPBD 布料预览",
+        description="Enable SSBL CUDA XPBD cloth preview. Press Space to play the timeline and run the preview.",
     )
     object_settings_initialized: BoolProperty(
-        name="SSBL 对象设置已初始化",
+        name="SSBL Object Settings Initialized",
         default=False,
         options={"HIDDEN"},
-        description="内部标记：对象首次启用时从场景默认设置复制一次",
+        description="Internal flag: copy scene defaults the first time this object is enabled.",
     )
     runtime_mode: EnumProperty(
-        name="运行模式",
+        name="Run Mode",
         items=[
-            ("preview", "预览", "运行视口实时预览"),
-            ("bake", "烘焙", "烘焙为 PC2 缓存"),
+            ("preview", "Preview", "Run realtime viewport preview"),
+            ("bake", "Bake", "Bake to a PC2 cache"),
         ],
         default="preview",
         options={"HIDDEN"},
-        description="选择实时预览或 PC2 缓存烘焙模式",
+        description="Choose realtime preview or PC2 cache baking mode.",
     )
     hardness: FloatProperty(
-        name="硬度",
+        name="Bend Stiffness",
         default=DEFAULT_HARDNESS,
         min=0.0,
         max=1.0,
         precision=3,
         update=_apply_hardness,
-        description="布料材料硬度；0 为最柔软接近丝绸，1 为最硬接近皮革",
+        description="Overall cloth material hardness. 0 behaves like soft silk, 1 behaves like stiff leather.",
     )
     show_advanced_settings: BoolProperty(
-        name="显示高级设置",
+        name="Show Advanced Settings",
         default=False,
-        description="展开后显示诊断和高级解算参数",
+        description="Expand to show diagnostics and advanced solver settings.",
     )
     hardness_initialized: BoolProperty(
-        name="硬度已初始化",
+        name="Hardness Initialized",
         default=False,
         options={"HIDDEN"},
-        description="内部迁移标记，用于从旧场景参数推导硬度",
+        description="Internal migration flag used to infer hardness from legacy scene settings.",
     )
     frame_count: IntProperty(
-        name="预览帧数",
+        name="Preview Frame Count",
         default=120,
         min=1,
         soft_max=1000,
         options={"HIDDEN"},
-        description="预览计时器要模拟的帧数",
+        description="Frame count simulated by the preview timer.",
     )
     preview_target_fps: FloatProperty(
-        name="预览目标 FPS",
+        name="Target Preview FPS",
         default=30.0,
         min=1.0,
         soft_max=120.0,
-        description="预览时视口播放的目标频率",
+        description="Target playback rate for viewport preview.",
     )
     preview_writeback_interval: IntProperty(
         name="Preview writeback interval",
@@ -267,42 +267,42 @@ class SSBL_PreviewSettings(PropertyGroup):
         description="0 uses adaptive preview mesh writeback; values >= 1 force a fixed interval. Baking still writes every frame",
     )
     auto_cache_realtime: BoolProperty(
-        name="Realtime Auto Cache",
+        name="Auto-Cache Real-Time Simulation",
         default=False,
         description="Write a PC2 cache while realtime preview or timeline playback is running",
     )
     use_evaluated_mesh: BoolProperty(
-        name="动态网格",
+        name="Use Evaluated Mesh",
         default=False,
-        description="读取 Blender 修改器和绑定后的动态网格输入；顶点数和拓扑必须保持不变",
+        description="Read the mesh after Blender modifiers and bindings. Vertex count and topology must stay unchanged.",
     )
     multi_cloth_preview: BoolProperty(
         options={"HIDDEN"},
-        name="多布料预览",
+        name="Multi-Cloth Preview",
         default=False,
-        description="启用后，开始预览会同时解算当前选中的多个布料网格",
+        description="Solve multiple selected cloth meshes together when preview starts.",
     )
     cross_cloth_collision: EnumProperty(
         options={"HIDDEN"},
-        name="跨布料碰撞",
+        name="Cross-Cloth Collision",
         items=[
-            ("off", "关闭", "不使用其他布料作为动态碰撞体"),
-            ("lower_layers", "较低层级", "只接收碰撞层级更低的布料作为动态碰撞体"),
-            ("all_selected", "所有已选", "接收所有其他已选布料作为动态碰撞体"),
+            ("off", "Off", "Do not use other cloth objects as dynamic colliders"),
+            ("lower_layers", "Lower Layers", "Only accept cloth objects on lower collision layers as dynamic colliders"),
+            ("all_selected", "All Selected", "Accept all other selected cloth objects as dynamic colliders"),
         ],
         default="off",
-        description="多布料预览时如何收集动态布料碰撞体",
+        description="Choose how dynamic cloth colliders are collected during multi-cloth preview.",
     )
     bake_start: IntProperty(
-        name="烘焙开始帧",
+        name="Start Frame",
         default=1,
-        description="写入 PC2 缓存的第一帧",
+        description="First frame written to the PC2 cache.",
     )
     bake_end: IntProperty(
-        name="烘焙结束帧",
+        name="End Frame",
         default=120,
         min=1,
-        description="写入 PC2 缓存的最后一帧",
+        description="Last frame written to the PC2 cache.",
     )
     bake_in_progress: BoolProperty(
         name="Bake in progress",
@@ -335,80 +335,80 @@ class SSBL_PreviewSettings(PropertyGroup):
         description="Internal SSBL bake progress total samples",
     )
     dt: FloatProperty(
-        name="时间步长",
+        name="Time Step",
         default=0.02,
         min=1e-4,
         soft_max=0.1,
         subtype="TIME",
-        description="每个输出帧对应的模拟时间步长",
+        description="Simulation time represented by each output frame.",
     )
     substeps: IntProperty(
-        name="子步数",
+        name="Substeps",
         default=14,
         min=1,
         soft_max=32,
-        description="每帧的 XPBD 子步数量",
+        description="Number of XPBD substeps per frame.",
     )
     iterations: IntProperty(
-        name="迭代次数",
+        name="Constraint Iterations",
         default=2,
         min=1,
         soft_max=128,
-        description="每个子步的约束投影迭代次数",
+        description="Constraint projection iterations per substep.",
     )
     damping: FloatProperty(
-        name="速度阻尼",
+        name="Damping",
         default=1.0,
         min=0.0,
         max=1.0,
-        description="每个子步施加的速度阻尼",
+        description="Velocity damping applied each substep.",
     )
     density: FloatProperty(
-        name="密度",
+        name="Density",
         default=1.0,
         min=1e-4,
         soft_max=100.0,
-        description="布料顶点使用的面密度",
+        description="Surface density used for cloth vertex mass.",
     )
     stretch_compliance: FloatProperty(
-        name="拉伸柔顺度",
+        name="Stretch Compliance",
         default=1e-6,
         min=0.0,
         soft_max=1e-3,
         precision=6,
-        description="XPBD 拉伸柔顺度；值越小越硬",
+        description="XPBD stretch compliance. Lower values are stiffer.",
     )
     bend_compliance: FloatProperty(
-        name="弯曲柔顺度",
+        name="Bend Compliance",
         default=1e-4,
         min=0.0,
         soft_max=1e-2,
         precision=6,
-        description="XPBD 弯曲柔顺度；值越小越硬",
+        description="XPBD bend compliance. Lower values are stiffer.",
     )
     use_lra: BoolProperty(
-        name="旧版兼容开关",
+        name="Legacy Compatibility Toggle",
         default=False,
         options={"HIDDEN"},
-        description="内部隐藏字段；硬度会自动控制抗拉长 tether",
+        description="Hidden legacy field. Hardness now controls anti-stretch tethers automatically.",
     )
     lra_compliance: FloatProperty(
-        name="旧版兼容柔顺度",
+        name="Legacy Compatibility Compliance",
         default=0.0,
         min=0.0,
         soft_max=1e-3,
         precision=6,
         options={"HIDDEN"},
-        description="内部隐藏字段；硬度会自动控制抗拉长 tether",
+        description="Hidden legacy field. Hardness now controls anti-stretch tethers automatically.",
     )
     lra_slack: FloatProperty(
-        name="旧版兼容松弛系数",
+        name="Legacy Compatibility Slack",
         default=1.0,
         min=1.0,
         soft_max=2.0,
         precision=3,
         options={"HIDDEN"},
-        description="内部隐藏字段；硬度会自动控制抗拉长 tether",
+        description="Hidden legacy field. Hardness now controls anti-stretch tethers automatically.",
     )
     use_volume_pressure: BoolProperty(
         name="Inflation / Overpressure",
@@ -460,25 +460,25 @@ class SSBL_PreviewSettings(PropertyGroup):
         description="Legacy proxy to Blender scene gravity; SSBL now reads scene gravity automatically",
     )
     use_blender_force_fields: BoolProperty(
-        name="使用 Blender 力场",
+        name="Use Blender Force Fields",
         default=True,
-        description="读取场景中的 Blender Force Field，并作为 SSBL 布料外力参与解算",
+        description="Sample Blender force fields from the scene and apply them as external forces to SSBL cloth.",
     )
     force_field_collection: PointerProperty(
-        name="力场集合",
+        name="Effector Collection",
         type=bpy.types.Collection,
-        description="为空时读取当前场景全部 Force Field；指定后只读取该集合内的 Force Field",
+        description="Read all force fields from the current scene when empty, or only read force fields from this collection.",
     )
     force_field_strength_scale: FloatProperty(
-        name="力场强度倍率",
+        name="Force Field Strength Scale",
         default=1.0,
         min=0.0,
         soft_max=10.0,
         precision=3,
-        description="SSBL 接收 Blender 力场时使用的整体强度倍率",
+        description="Global strength multiplier applied when SSBL samples Blender force fields.",
     )
     force_field_weight_gravity: FloatProperty(
-        name="重力",
+        name="Gravity",
         default=1.0,
         min=0.0,
         max=1.0,
@@ -486,7 +486,7 @@ class SSBL_PreviewSettings(PropertyGroup):
         description="Scale scene gravity for SSBL cloth",
     )
     force_field_weight_all: FloatProperty(
-        name="全部",
+        name="All",
         default=1.0,
         min=0.0,
         max=1.0,
@@ -494,7 +494,7 @@ class SSBL_PreviewSettings(PropertyGroup):
         description="Scale all non-gravity Blender force fields for SSBL cloth",
     )
     force_field_weight_force: FloatProperty(
-        name="常力",
+        name="Force",
         default=1.0,
         min=0.0,
         max=1.0,
@@ -502,7 +502,7 @@ class SSBL_PreviewSettings(PropertyGroup):
         description="Scale Force effector influence for SSBL cloth",
     )
     force_field_weight_vortex: FloatProperty(
-        name="涡流",
+        name="Vortex",
         default=1.0,
         min=0.0,
         max=1.0,
@@ -510,7 +510,7 @@ class SSBL_PreviewSettings(PropertyGroup):
         description="Scale Vortex effector influence for SSBL cloth",
     )
     force_field_weight_magnetic: FloatProperty(
-        name="磁力",
+        name="Magnetic",
         default=1.0,
         min=0.0,
         max=1.0,
@@ -518,7 +518,7 @@ class SSBL_PreviewSettings(PropertyGroup):
         description="Scale Magnetic effector influence for SSBL cloth",
     )
     force_field_weight_harmonic: FloatProperty(
-        name="谐振",
+        name="Harmonic",
         default=1.0,
         min=0.0,
         max=1.0,
@@ -526,7 +526,7 @@ class SSBL_PreviewSettings(PropertyGroup):
         description="Scale Harmonic effector influence for SSBL cloth",
     )
     force_field_weight_charge: FloatProperty(
-        name="电荷",
+        name="Charge",
         default=1.0,
         min=0.0,
         max=1.0,
@@ -534,7 +534,7 @@ class SSBL_PreviewSettings(PropertyGroup):
         description="Scale Charge effector influence for SSBL cloth",
     )
     force_field_weight_lennardjones: FloatProperty(
-        name="兰纳琼斯分子力",
+        name="Lennard-Jones",
         default=1.0,
         min=0.0,
         max=1.0,
@@ -542,7 +542,7 @@ class SSBL_PreviewSettings(PropertyGroup):
         description="Scale Lennard-Jones effector influence for SSBL cloth",
     )
     force_field_weight_wind: FloatProperty(
-        name="风力",
+        name="Wind",
         default=1.0,
         min=0.0,
         max=1.0,
@@ -550,7 +550,7 @@ class SSBL_PreviewSettings(PropertyGroup):
         description="Scale Wind effector influence for SSBL cloth",
     )
     force_field_weight_texture: FloatProperty(
-        name="纹理",
+        name="Texture",
         default=1.0,
         min=0.0,
         max=1.0,
@@ -558,7 +558,7 @@ class SSBL_PreviewSettings(PropertyGroup):
         description="Scale Texture effector influence for SSBL cloth",
     )
     force_field_weight_turbulence: FloatProperty(
-        name="紊流",
+        name="Turbulence",
         default=1.0,
         min=0.0,
         max=1.0,
@@ -566,7 +566,7 @@ class SSBL_PreviewSettings(PropertyGroup):
         description="Scale Turbulence effector influence for SSBL cloth",
     )
     force_field_weight_drag: FloatProperty(
-        name="拖拽",
+        name="Drag",
         default=1.0,
         min=0.0,
         max=1.0,
@@ -574,52 +574,52 @@ class SSBL_PreviewSettings(PropertyGroup):
         description="Scale Drag effector influence for SSBL cloth",
     )
     pin_vertex_group: StringProperty(
-        name="固定点组",
+        name="Pin Vertex Group",
         default="ssbl_pin",
-        description="该顶点组中的顶点会保持在静止位置",
+        description="Vertices in this vertex group stay fixed in place.",
     )
     pin_hardness: FloatProperty(
-        name="钉固硬度",
+        name="Pin Stiffness",
         default=1.0,
         min=0.0,
         max=1.0,
         precision=3,
-        description="全局缩放钉固顶点组权重；0 关闭钉固，1 保持顶点组权重",
+        description="Global multiplier for pin vertex-group weights. 0 disables pins, 1 keeps the original weights.",
     )
     collision_margin: FloatProperty(
-        name="碰撞边距",
+        name="Collision Margin",
         default=0.005,
         min=0.0,
         soft_max=0.2,
         precision=4,
-        description="碰撞投影时保持的最小分离距离",
+        description="Minimum separation distance preserved during collision projection.",
     )
     self_collision: BoolProperty(
         update=_apply_self_collision_toggle,
-        name="自碰撞",
+        name="Self Collision",
         default=True,
-        description="兼容旧选项；启用后会映射到“快速”自碰撞",
+        description="Legacy-compatible toggle. When enabled, it maps to the fast self-collision mode.",
     )
     self_collision_mode: EnumProperty(
-        name="自碰撞模式",
+        name="Mode",
         items=[
-            ("fast", "快速", "使用预览优先的自碰撞快速路径"),
-            ("strict", "严格", "使用完整 probe/recovery 的零相交优先自碰撞路径"),
+            ("fast", "Fast", "Use the preview-first self-collision fast path"),
+            ("strict", "Strict", "Use the full probe/recovery self-collision path with zero-intersection priority"),
         ],
         default="fast",
         update=_apply_self_collision_mode,
-        description="面向大规模布料网格调优的自碰撞模式",
+        description="Self-collision mode tuned for large cloth meshes.",
     )
     cloth_thickness: FloatProperty(
-        name="布料厚度",
+        name="Cloth Thickness",
         default=0.02,
         min=0.001,
         soft_max=0.1,
         precision=4,
-        description="自碰撞时布料表面之间保持的最小分离距离；值越大布料看起来越厚、不会重叠",
+        description="Minimum separation distance between cloth surfaces during self collision. Larger values make cloth appear thicker and reduce overlap.",
     )
     self_collision_distance: FloatProperty(
-        name="自碰撞距离",
+        name="Self-Collision Distance",
         default=0.0,
         min=0.0,
         soft_max=0.1,
@@ -627,26 +627,26 @@ class SSBL_PreviewSettings(PropertyGroup):
         description="0 means automatic; positive values override the self-collision contact distance",
     )
     self_collision_interval: IntProperty(
-        name="自碰撞间隔",
+        name="Self-Collision Interval",
         default=1,
         min=1,
         soft_max=8,
-        description="每 N 个子步运行一次自碰撞；快速模式通常用 2 即可",
+        description="Run self collision every N substeps. Fast mode usually works well at 2.",
     )
     max_self_collision_neighbors: IntProperty(
-        name="最大自碰撞邻居数",
+        name="Max Neighbor Checks",
         default=64,
         min=4,
         soft_max=256,
-        description="每个顶点或边在自碰撞中允许处理的最大邻居候选数",
+        description="Maximum candidate neighbor count handled per vertex or edge during self collision.",
     )
     fast_self_collision_passes: IntProperty(
-        name="快速自碰撞步数",
+        name="Fast Passes",
         default=4,
         min=1,
         max=8,
         soft_max=8,
-        description="仅用于 fast 自碰撞模式的 native 自碰撞 pass 数；strict 模式不受影响",
+        description="Native self-collision pass count used only by fast mode. Strict mode is unaffected.",
     )
     self_probe_interval: IntProperty(
         name="Self probe interval",
@@ -720,51 +720,51 @@ class SSBL_PreviewSettings(PropertyGroup):
         description="Maximum grid resolution per axis for CUDA static mesh SDF rebuilds",
     )
     use_ground: BoolProperty(
-        name="地面平面",
+        name="Infinite Ground Plane",
         default=True,
-        description="启用简单的世界空间地面平面碰撞",
+        description="Enable a simple world-space ground plane collider.",
     )
     ground_height: FloatProperty(
-        name="地面 Z",
+        name="Ground Height",
         default=0.0,
-        description="地面平面在世界空间中的 Z 高度",
+        description="World-space Z height of the ground plane.",
     )
     use_wall: BoolProperty(
-        name="墙面平面",
+        name="Wall Plane",
         default=False,
-        description="启用与无限平面的碰撞",
+        description="Enable collision against an infinite plane.",
     )
     wall_origin: FloatVectorProperty(
-        name="墙面原点",
+        name="Wall Origin",
         default=(0.0, 0.0, 0.0),
         size=3,
         subtype="XYZ",
-        description="墙面平面在世界空间中的一个点",
+        description="A point on the wall plane in world space.",
     )
     wall_normal: FloatVectorProperty(
-        name="墙面法线",
+        name="Wall Normal",
         default=(0.0, 0.0, 1.0),
         size=3,
         subtype="DIRECTION",
-        description="墙面平面在世界空间中的法线方向",
+        description="Normal direction of the wall plane in world space.",
     )
     use_sphere: BoolProperty(
-        name="球体碰撞器",
+        name="Sphere Collider",
         default=False,
-        description="启用与球体对象的碰撞",
+        description="Enable collision with a sphere object.",
     )
     sphere_object: PointerProperty(
-        name="球体对象",
+        name="Sphere Object",
         type=bpy.types.Object,
-        description="其世界位置和尺寸用于定义球体碰撞器的对象",
+        description="Object whose world position and scale define the sphere collider.",
     )
     static_collider_collection: PointerProperty(
-        name="静态碰撞集合",
+        name="Static Collider Collection",
         type=bpy.types.Collection,
-        description="该集合中的网格对象会被用作静态三角形碰撞体",
+        description="Mesh objects in this collection are used as static triangle colliders.",
     )
     dynamic_collider_collection: PointerProperty(
-        name="动画碰撞体集合",
+        name="Dynamic Collider Collection",
         type=bpy.types.Collection,
         description="Collection of animated mesh objects used as one-way evaluated dynamic collision sources for this cloth",
     )
@@ -782,6 +782,7 @@ CLASSES = (
 
 
 def register():
+    translation.register(__name__)
     for cls in CLASSES:
         bpy.utils.register_class(cls)
     bpy.types.Scene.ssbl_preview = PointerProperty(type=SSBL_PreviewSettings)
@@ -802,21 +803,25 @@ def register():
     )
     bpy.types.Object.ssbl_collision_layer = IntProperty(
         options={"HIDDEN"},
-        name="碰撞层级",
+        name="Collision Layer",
         default=1,
         min=0,
         soft_max=4,
-        description="多布料分层碰撞中的层级；数值越小越靠内并先解算",
+        description="Layer index used by layered multi-cloth collision. Lower values are more internal and solve first.",
     )
     bpy.types.Object.ssbl_enable_cross_cloth_collision = BoolProperty(
         options={"HIDDEN"},
-        name="跨布料碰撞体",
+        name="Cross-Cloth Collider",
         default=True,
-        description="启用后，该对象会在多布料预览中作为其他布料的动态碰撞体",
+        description="When enabled, this object can act as a dynamic collider for other cloth objects during multi-cloth preview.",
     )
 
 
 def unregister():
+    try:
+        translation.unregister(__name__)
+    except Exception:
+        pass
     try:
         operators.cleanup_fps_overlays()
     except Exception:
