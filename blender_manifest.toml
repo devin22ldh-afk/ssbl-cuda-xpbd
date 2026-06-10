@@ -5,13 +5,13 @@ name = "SSBL CUDA XPBD"
 tagline = "CUDA XPBD cloth preview and PC2 baking from the Physics panel"
 type = "add-on"
 tags = ["Animation", "Physics", "Bake"]
-version = "0.4.2"
+version = "0.4.3"
 blender_version_min = "5.0.0"
 maintainer = "Devin <devin22ldh@gmail.com>"
 license = [
     "SPDX:GPL-3.0-or-later",
 ]
-website = "TODO: replace with the GitHub Issues URL before Ready for Review"
+website = "https://github.com/devin22ldh-afk/ssbl-cuda-xpbd/issues"
 copyright = [
     "2026 Devin",
 ]
