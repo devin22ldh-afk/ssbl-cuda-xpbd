@@ -4,6 +4,11 @@ SSBL CUDA XPBD 是一个面向 Blender 5.0 的本地 CUDA XPBD 布料插件，�
 
 SSBL CUDA XPBD is a native CUDA XPBD cloth add-on for Blender 5.0. It provides viewport cloth preview and can bake simulation results to PC2 point-cache files.
 
+## Download
+
+- Direct download: [`ssbl-official.zip`](https://github.com/devin22ldh-afk/ssbl-cuda-xpbd/releases/download/v0.4.3/ssbl-official.zip)
+- Release page: [v0.4.3](https://github.com/devin22ldh-afk/ssbl-cuda-xpbd/releases/tag/v0.4.3)
+
 ## 主要功能 / Features
 
 - 实时布料预览：启用后播放 Blender 时间轴即可驱动 XPBD 布料模拟。
