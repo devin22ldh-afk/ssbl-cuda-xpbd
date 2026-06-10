@@ -45,8 +45,8 @@ SSBL CUDA XPBD is a native CUDA XPBD cloth add-on for Blender 5.0. It provides v
 ### 4. Walk Dynamic Collider
 ![Walk Dynamic Collider](.github/demo-gifs/04_walk_dynamic_collider_realtime.gif)
 
-### 5. T-Shirt Drape
-![T-Shirt Drape](.github/demo-gifs/05_tshirt_drape_realtime.gif)
+### 5. Spiral Cloth Drop
+![Spiral Cloth Drop](.github/demo-gifs/05_spiral_cloth_drop.gif)
 
 ## 环境要求 / Requirements
 
