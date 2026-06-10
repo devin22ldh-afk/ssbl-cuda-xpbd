@@ -499,7 +499,7 @@ class NativeStepDiagnostics:
 
 _LIB = None
 _LOAD_ERROR = ""
-_ABI41_DLL_NAMES = ("ssbl_xpbd_cuda_abi41.dll", "ssbl_xpbd_cuda_abi40.dll")
+_ABI41_DLL_NAMES = ("ssbl_xpbd_cuda_abi41.dll",)
 _CAP_STRETCH_OPTIMIZATION = 1 << 0
 _CAP_PIN_WEIGHTS = 1 << 1
 _CAP_GLOBAL_DYNAMIC_SCENE = 1 << 2
@@ -540,7 +540,7 @@ def _load_library():
     path = dll_path()
     if not os.path.exists(path):
         raise NativeBackendUnavailable(
-            "Missing ABI41/ABI40 CUDA solver DLL. Install CUDA Toolkit, CMake, and VS Build Tools, then run native/build_recon.ps1."
+            "Missing ABI41 CUDA solver DLL. Install CUDA Toolkit, CMake, and VS Build Tools, then run native/build_recon.ps1."
         )
 
     try:
@@ -903,18 +903,18 @@ class NativeXpbdSolver:
     def __init__(self, cloth: ClothBuildData, options: SolverOptions, static_triangles: np.ndarray):
         self._lib = _load_library()
         dll_name = os.path.basename(dll_path()).lower()
-        self._is_abi41_abi40 = "abi40" in dll_name or "abi41" in dll_name
+        self._is_abi41_abi41 = "abi41" in dll_name
         self._supports_global_dynamic_scene = supports_global_dynamic_scene()
         if bool(getattr(options, "stretch_optimization_enabled", False)):
             if (_capabilities(self._lib) & _CAP_STRETCH_OPTIMIZATION) == 0:
                 raise NativeSolverError(
                     "Loaded CUDA solver DLL does not support hard stretch optimization. "
-                    "Rebuild native/build_recon.ps1 to generate the ABI41/ABI40 DLL."
+                    "Rebuild native/build_recon.ps1 to generate the ABI41 DLL."
                 )
         if (_capabilities(self._lib) & _CAP_PIN_WEIGHTS) == 0:
             raise NativeSolverError(
                 "Loaded CUDA solver DLL does not support vertex-group pin weights. "
-                "Rebuild native/build_recon.ps1 to generate the ABI41/ABI40 DLL."
+                "Rebuild native/build_recon.ps1 to generate the ABI41 DLL."
             )
         self._vertex_count = int(len(cloth.positions_world))
         self._positions_out = np.empty((self._vertex_count, 3), dtype=np.float32)
@@ -1104,7 +1104,7 @@ class NativeXpbdSolver:
         )
         use_indexed_dynamic = bool(
             update_dynamic
-            and self._is_abi41_abi40
+            and self._is_abi41_abi41
             and dynamic_triangle_vertices is not None
             and dynamic_triangle_indices is not None
         )
@@ -1132,7 +1132,7 @@ class NativeXpbdSolver:
             (dynamic_particles or {}).get("radii", np.empty(0, dtype=np.float32)),
             dtype=np.float32,
         ).reshape((-1,))
-        needs_particle_extras = dynamic_particle_count > 0 and not bool(getattr(self, "_is_abi41_abi40", False))
+        needs_particle_extras = dynamic_particle_count > 0 and not bool(getattr(self, "_is_abi41_abi41", False))
         if needs_particle_extras:
             particle_inv_mass = np.ascontiguousarray(
                 (dynamic_particles or {}).get("inv_mass", np.ones(dynamic_particle_count, dtype=np.float32)),

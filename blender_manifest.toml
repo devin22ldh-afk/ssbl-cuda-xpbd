@@ -36,7 +36,7 @@ paths_exclude_pattern = [
     "native/bin/*.txt",
     "native/bin/*.jsonl",
     "native/bin/*_abi36.dll",
-    "native/bin/*_abi41.dll",
+    "native/bin/*_abi40.dll",
     "native/bin/*_candidate.dll",
     "dist/",
     "ssbl_cache/",

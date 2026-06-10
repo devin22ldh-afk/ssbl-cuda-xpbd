@@ -20,8 +20,8 @@ This is documentation only. It does not change any public API, Python code, CUDA
 - `xpbd_core.py` converts Blender mesh/settings data into `ClothBuildData` and `SolverOptions`, including topology constraints, pin weights, hidden tethers, inverse mass, rest volume, and topology cache data.
 - `collision.py` collects static collider triangles and maintains static collider cache data plus runtime signatures.
 - `force_fields.py` samples Blender force-field objects into native-uploadable force-field batches.
-- `native_backend.py` loads the ABI40 CUDA DLL through ctypes, mirrors C ABI structs in Python, and exposes the owning `NativeXpbdSolver` wrapper.
-- `native/include/ssbl_xpbd_cuda.h` defines the C ABI structs and exported functions. `native/src/ssbl_xpbd_cuda_abi41.cu` is the main current reconstructed ABI40 CUDA solver implementation.
+- `native_backend.py` loads the ABI41 CUDA DLL through ctypes, mirrors C ABI structs in Python, and exposes the owning `NativeXpbdSolver` wrapper.
+- `native/include/ssbl_xpbd_cuda.h` defines the C ABI structs and exported functions. `native/src/ssbl_xpbd_cuda_abi41.cu` is the main current ABI41 CUDA solver implementation.
 
 ## Data Flow
 
@@ -34,7 +34,7 @@ flowchart TD
     Inputs["collision.py and force_fields.py<br/>static colliders and force fields"]
     Bridge["native_backend.py<br/>ctypes NativeXpbdSolver"]
     ABI["ssbl_xpbd_cuda.h<br/>C ABI structs and functions"]
-    CUDA["CUDA XPBD solver DLL<br/>native/bin/ssbl_xpbd_cuda_abi40.dll"]
+    CUDA["CUDA XPBD solver DLL<br/>native/bin/ssbl_xpbd_cuda_abi41.dll"]
     Output["Preview mesh or PC2 cache<br/>viewport writeback or bake output"]
     Diag["NativeStepDiagnostics<br/>UI status and performance fields"]
 
@@ -140,11 +140,11 @@ The normal native call order is:
 4. `ssbl_download_positions()` and/or `ssbl_get_diagnostics()`
 5. `ssbl_destroy_solver()`
 
-ABI capability checks currently cover hard stretch optimization and vertex-group pin weights. If the loaded DLL lacks a required capability, Python raises `NativeSolverError` and asks the user to rebuild the ABI40 DLL.
+ABI capability checks currently cover hard stretch optimization and vertex-group pin weights. If the loaded DLL lacks a required capability, Python raises `NativeSolverError` and asks the user to rebuild the ABI41 DLL.
 
 ## Contact and Pin Stability
 
-The ABI40 ABI41 solver applies weighted pin projection through `abi41_pin_project_kernel()`. Effective pin weights below `0.05` are intentionally ignored on the native side, while weights at or above `0.75` align with the Python hard-pin classification used for inverse mass and hidden tether setup.
+The ABI41 ABI41 solver applies weighted pin projection through `abi41_pin_project_kernel()`. Effective pin weights below `0.05` are intentionally ignored on the native side, while weights at or above `0.75` align with the Python hard-pin classification used for inverse mass and hidden tether setup.
 
 Contact-heavy substeps can move cloth after the normal constraint passes. When analytic colliders, static SDF, dynamic cloth collision, self collision, signed dynamic collision, or final recon stretch constraints run, the native solver performs a final pin projection polish so pins remain anchored after contact resolution.
 
@@ -254,8 +254,8 @@ Native rebuild smoke should print `SSBL_ABI41_NATIVE_OK`, `SSBL_ABI41_STATIC_SDF
 - `xpbd_core.py` 把 Blender mesh/settings 数据转成 `ClothBuildData` 和 `SolverOptions`，包括拓扑约束、pin weights、hidden tethers、inverse mass、rest volume 和 topology cache 数据。
 - `collision.py` 收集 static collider triangles，并维护 static collider cache 数据和 runtime signatures。
 - `force_fields.py` 把 Blender force-field objects 采样成可上传到 native solver 的 force-field batches。
-- `native_backend.py` 通过 ctypes 加载 ABI40 CUDA DLL，在 Python 中镜像 C ABI structs，并暴露拥有 native handle 的 `NativeXpbdSolver` wrapper。
-- `native/include/ssbl_xpbd_cuda.h` 定义 C ABI structs 和 exported functions。`native/src/ssbl_xpbd_cuda_abi41.cu` 是当前重建 ABI40 CUDA solver 的主要实现。
+- `native_backend.py` 通过 ctypes 加载 ABI41 CUDA DLL，在 Python 中镜像 C ABI structs，并暴露拥有 native handle 的 `NativeXpbdSolver` wrapper。
+- `native/include/ssbl_xpbd_cuda.h` 定义 C ABI structs 和 exported functions。`native/src/ssbl_xpbd_cuda_abi41.cu` 是当前重建 ABI41 CUDA solver 的主要实现。
 
 ## 数据流
 
@@ -268,7 +268,7 @@ flowchart TD
     Inputs["collision.py 和 force_fields.py<br/>静态碰撞体和力场"]
     Bridge["native_backend.py<br/>ctypes NativeXpbdSolver"]
     ABI["ssbl_xpbd_cuda.h<br/>C ABI structs 和 functions"]
-    CUDA["CUDA XPBD solver DLL<br/>native/bin/ssbl_xpbd_cuda_abi40.dll"]
+    CUDA["CUDA XPBD solver DLL<br/>native/bin/ssbl_xpbd_cuda_abi41.dll"]
     Output["Preview mesh 或 PC2 cache<br/>视口写回或 bake 输出"]
     Diag["NativeStepDiagnostics<br/>UI 状态和性能字段"]
 
@@ -374,11 +374,11 @@ pin targets 会携带每个 pin 的权重，权重来源是顶点组权重乘以
 4. `ssbl_download_positions()` 和/或 `ssbl_get_diagnostics()`
 5. `ssbl_destroy_solver()`
 
-ABI capability checks 目前至少覆盖 hard stretch optimization 和 vertex-group pin weights。如果加载的 DLL 缺少必要 capability，Python 会抛出 `NativeSolverError` 并要求用户重建 ABI40 DLL。
+ABI capability checks 目前至少覆盖 hard stretch optimization 和 vertex-group pin weights。如果加载的 DLL 缺少必要 capability，Python 会抛出 `NativeSolverError` 并要求用户重建 ABI41 DLL。
 
 ## 接触与 Pin 稳定性
 
-ABI40 recon 解算器通过 `abi41_pin_project_kernel()` 执行加权 pin projection。native 侧会有意忽略低于 `0.05` 的有效 pin 权重；`0.75` 或更高权重则与 Python 侧用于 inverse mass 和 hidden tether 设置的 hard-pin 分类一致。
+ABI41 recon 解算器通过 `abi41_pin_project_kernel()` 执行加权 pin projection。native 侧会有意忽略低于 `0.05` 的有效 pin 权重；`0.75` 或更高权重则与 Python 侧用于 inverse mass 和 hidden tether 设置的 hard-pin 分类一致。
 
 接触较多的 substep 可能会在普通约束之后再次移动布料。当解析碰撞体、静态 SDF、动态布料碰撞、自碰撞、signed dynamic collision 或最终 recon stretch 约束运行时，native 解算器会执行一次 final pin projection polish，确保 contact resolution 之后 pin 仍保持锚定。
 

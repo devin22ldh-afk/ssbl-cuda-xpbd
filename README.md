@@ -14,7 +14,7 @@ SSBL CUDA XPBD is a native CUDA XPBD cloth add-on for Blender 5.0. It provides v
 - 多布料预览：支持多对象布料会话、跨布料动态碰撞和碰撞层级。
 - 材质与约束：支持硬度、布料厚度、密度、阻尼、接触摩擦、加权 pin 顶点组和体积气压。
 - Blender 力场：可从力场集合采样并上传到 native 解算器，同时支持按类型设置权重。
-- Native 后端：通过 `native/bin/ssbl_xpbd_cuda_abi40.dll` 使用 ABI40 CUDA 解算器。
+- Native 后端：通过 `native/bin/ssbl_xpbd_cuda_abi41.dll` 使用 ABI41 CUDA 解算器。
 
 - Real-time cloth preview: play the Blender timeline to drive XPBD cloth simulation.
 - Timeline integration: preview sessions are managed through playback and frame-change handlers.
@@ -24,20 +24,20 @@ SSBL CUDA XPBD is a native CUDA XPBD cloth add-on for Blender 5.0. It provides v
 - Multi-cloth preview: multi-object cloth sessions, cross-cloth dynamic collision, and collision layers.
 - Material and constraints: hardness, cloth thickness, density, damping, contact friction, weighted pin vertex groups, and volume pressure.
 - Blender force fields: force-field collections can be sampled and uploaded to the native solver with per-type weights.
-- Native backend: uses the ABI40 CUDA solver DLL at `native/bin/ssbl_xpbd_cuda_abi40.dll`.
+- Native backend: uses the ABI41 CUDA solver DLL at `native/bin/ssbl_xpbd_cuda_abi41.dll`.
 
 ## 环境要求 / Requirements
 
 - Blender 5.0。
 - Windows。
 - NVIDIA GPU 和支持 CUDA 的显卡驱动。
-- 已存在或可构建的 ABI40 native DLL：`native/bin/ssbl_xpbd_cuda_abi40.dll`。
+- 已存在或可构建的 ABI41 native DLL：`native/bin/ssbl_xpbd_cuda_abi41.dll`。
 - 如果需要重新构建 native 后端，还需要 CUDA Toolkit 12.6+、Visual Studio Build Tools 2022 x64 C++ 工具链和 CMake 3.25+。
 
 - Blender 5.0.
 - Windows.
 - NVIDIA GPU with a CUDA-capable driver.
-- A prebuilt or locally built ABI40 native DLL at `native/bin/ssbl_xpbd_cuda_abi40.dll`.
+- A prebuilt or locally built ABI41 native DLL at `native/bin/ssbl_xpbd_cuda_abi41.dll`.
 - To rebuild the native backend, install CUDA Toolkit 12.6+, Visual Studio Build Tools 2022 with the x64 C++ toolchain, and CMake 3.25+.
 
 ## 安装 / Installation
@@ -88,7 +88,7 @@ Then enable the add-on in Blender:
 The add-on loads this DLL by default:
 
 ```text
-native/bin/ssbl_xpbd_cuda_abi40.dll
+native/bin/ssbl_xpbd_cuda_abi41.dll
 ```
 
 如果 DLL 缺失，插件会报告 native CUDA solver 不可用。更多构建说明见 `native/README.md`。
@@ -105,9 +105,9 @@ Push-Location .\native
 Pop-Location
 ```
 
-构建 ABI40 后端并运行 native smoke：
+构建 ABI41 后端并运行 native smoke：
 
-Build the ABI40 backend and run the native smoke check:
+Build the ABI41 backend and run the native smoke check:
 
 ```powershell
 Push-Location .\native
@@ -115,12 +115,12 @@ Push-Location .\native
 Pop-Location
 ```
 
-如果需要指定其他 ABI40 兼容 DLL：
+如果需要指定其他 ABI41 兼容 DLL：
 
-To load another ABI40-compatible DLL:
+To load another ABI41-compatible DLL:
 
 ```powershell
-$env:SSBL_NATIVE_DLL_PATH = "C:\path\to\ssbl_xpbd_cuda_abi40.dll"
+$env:SSBL_NATIVE_DLL_PATH = "C:\path\to\ssbl_xpbd_cuda_abi41.dll"
 ```
 
 ## 验证 / Validation
@@ -180,9 +180,9 @@ Successful output should include `SSBL_ABI41_NATIVE_OK`, `SSBL_ABI41_STATIC_SDF_
 
 ### 缺少 CUDA DLL / Missing CUDA DLL
 
-确认 `native/bin/ssbl_xpbd_cuda_abi40.dll` 存在。也可以通过 `SSBL_NATIVE_DLL_PATH` 指向其他 ABI40 兼容 DLL。
+确认 `native/bin/ssbl_xpbd_cuda_abi41.dll` 存在。也可以通过 `SSBL_NATIVE_DLL_PATH` 指向其他 ABI41 兼容 DLL。
 
-Make sure `native/bin/ssbl_xpbd_cuda_abi40.dll` exists. You can also point `SSBL_NATIVE_DLL_PATH` to another ABI40-compatible DLL.
+Make sure `native/bin/ssbl_xpbd_cuda_abi41.dll` exists. You can also point `SSBL_NATIVE_DLL_PATH` to another ABI41-compatible DLL.
 
 ### 工具链检查失败 / Toolchain Check Fails
 

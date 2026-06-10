@@ -75,7 +75,7 @@ def _assert_no_forbidden_paths(paths: list[str]) -> None:
             offenders.append(rel)
         elif path.suffix.lower() in FORBIDDEN_SUFFIXES:
             offenders.append(rel)
-        elif path.parts[:2] == ("native", "bin") and rel != "native/bin/ssbl_xpbd_cuda_abi40.dll":
+        elif path.parts[:2] == ("native", "bin") and rel != "native/bin/ssbl_xpbd_cuda_abi41.dll":
             offenders.append(rel)
     if offenders:
         formatted = "\n".join(f"  - {item}" for item in offenders[:40])
@@ -148,7 +148,7 @@ def check_package_paths() -> list[str]:
         "__init__.py",
         "blender_manifest.toml",
         "cache_names.py",
-        "native/bin/ssbl_xpbd_cuda_abi40.dll",
+        "native/bin/ssbl_xpbd_cuda_abi41.dll",
         "native/include/ssbl_xpbd_cuda.h",
         "native/src/ssbl_xpbd_cuda_abi41.cu",
         "native/README.md",
