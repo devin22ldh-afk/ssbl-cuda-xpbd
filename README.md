@@ -26,6 +26,23 @@ SSBL CUDA XPBD is a native CUDA XPBD cloth add-on for Blender 5.0. It provides v
 - Blender force fields: force-field collections can be sampled and uploaded to the native solver with per-type weights.
 - Native backend: uses the ABI41 CUDA solver DLL at `native/bin/ssbl_xpbd_cuda_abi41.dll`.
 
+## 演示 GIF / Demo GIFs
+
+### 1. Brand Flag Wind
+![Brand Flag Wind](.github/demo-gifs/01_brand_flag_wind_realtime.gif)
+
+### 2. Wring Towel
+![Wring Towel](.github/demo-gifs/02_wring_towel_realtime.gif)
+
+### 3. Clothesline Multicloth
+![Clothesline Multicloth](.github/demo-gifs/03_clothesline_multicloth_realtime.gif)
+
+### 4. Walk Dynamic Collider
+![Walk Dynamic Collider](.github/demo-gifs/04_walk_dynamic_collider_realtime.gif)
+
+### 5. T-Shirt Drape
+![T-Shirt Drape](.github/demo-gifs/05_tshirt_drape_realtime.gif)
+
 ## 环境要求 / Requirements
 
 - Blender 5.0。
