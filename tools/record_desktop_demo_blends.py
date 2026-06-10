@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import sys
 import time
 from pathlib import Path
 
 import bpy
-import numpy as np
 
 
 TOOLS_DIR = Path(__file__).resolve().parent
@@ -20,7 +20,6 @@ if str(TOOLS_DIR) not in sys.path:
 
 import record_realtime_demo_pack as demo
 import ssbl
-from ssbl.session_manager import _apply_world_positions
 
 
 DESKTOP_BLEND_DIR = Path(r"C:\Users\Administrator\Desktop\演示视频")
@@ -29,7 +28,7 @@ KEYWORDS = {
     "01_brand_flag_wind_realtime": ["Realtime Wind", "Turbulent Gusts", "Live Tuning"],
     "02_wring_towel_realtime": ["Hook Driven Wring", "Stable Self-Collision", "Twist Deformation"],
     "03_clothesline_multicloth_realtime": ["Remeshed Suzanne", "Inflated Multi-Cloth", "Closed-Shell Collision"],
-    "04_tablecloth_pull_collision_realtime": ["Pinned Corner Pull", "Rigid Edge Collision", "Stable Drape"],
+    "04_walk_dynamic_collider_realtime": ["Animated Character Collider", "Full Evaluated Mesh", "Skirt Follow-Through"],
     "05_tshirt_drape_realtime": ["Spiral Cloth Drop", "Ground Contact", "Stable Floor Pile"],
 }
 
@@ -37,13 +36,12 @@ SOURCE_REPOS = {
     "01_brand_flag_wind_realtime": demo.SOURCE_FLAGWAVER,
     "02_wring_towel_realtime": demo.SOURCE_BINROOT,
     "03_clothesline_multicloth_realtime": "",
-    "04_tablecloth_pull_collision_realtime": demo.SOURCE_GARMENTLAB,
+    "04_walk_dynamic_collider_realtime": "",
     "05_tshirt_drape_realtime": demo.SOURCE_DIFFCLOTH,
 }
 
-
-def _open_demo_blend(name: str) -> Path:
-    path = DESKTOP_BLEND_DIR / f"{name}.blend"
+def _open_demo_blend(name: str, *, blend_name: str | None = None) -> Path:
+    path = DESKTOP_BLEND_DIR / f"{blend_name or name}.blend"
     if not path.exists():
         raise RuntimeError(f"Missing desktop demo blend: {path}")
     try:
@@ -63,9 +61,57 @@ def _open_demo_blend(name: str) -> Path:
     return path
 
 
+def _simulated_triangle_count(session) -> int:
+    total = 0
+    for slot in getattr(session, "slots", {}).values():
+        cloth = getattr(slot, "cloth", None)
+        triangles = getattr(cloth, "triangles", None)
+        if triangles is not None:
+            total += int(len(triangles))
+    return int(total)
+
+
+def _assign_walk_dynamic_collider_collection(scene: bpy.types.Scene) -> None:
+    skirt = bpy.data.objects.get("Codex_Skirt_Pleated")
+    beta = bpy.data.objects.get("Beta_Surface")
+    if skirt is None or skirt.type != "MESH":
+        raise RuntimeError("walk demo is missing Codex_Skirt_Pleated")
+    if beta is None or beta.type != "MESH":
+        raise RuntimeError("walk demo is missing Beta_Surface")
+    collection = bpy.data.collections.get("SSBL_Runtime_Dynamic_Colliders")
+    if collection is None:
+        collection = bpy.data.collections.new("SSBL_Runtime_Dynamic_Colliders")
+    if not any(child.name == collection.name for child in scene.collection.children):
+        scene.collection.children.link(collection)
+    if not any(obj.name == beta.name for obj in collection.objects):
+        collection.objects.link(beta)
+    scene.ssbl_preview.dynamic_collider_collection = collection
+    for obj in scene.objects:
+        if obj.type == "MESH" and hasattr(obj, "ssbl_cloth") and bool(obj.ssbl_cloth.enabled):
+            obj.ssbl_cloth.dynamic_collider_collection = collection
+    beta["ssbl_enable_cross_cloth_collision"] = True
+
+
+def _configure_multicloth_demo_runtime(scene: bpy.types.Scene) -> None:
+    scene.ssbl_preview.cross_cloth_collision = "all_selected"
+
+
 def _frame_count(scene: bpy.types.Scene, fallback: int) -> int:
     value = int(scene.get("ssbl_demo_frame_count", int(fallback) + 1))
     return max(value - 1, 1)
+
+
+def _forced_frame_count(frame_count: int) -> int:
+    return max(int(frame_count), 1)
+
+
+def _extend_preview_duration(scene: bpy.types.Scene, cloth: bpy.types.Object, frame_count: int) -> None:
+    frame_count = _forced_frame_count(frame_count)
+    scene.frame_end = max(int(scene.frame_end), int(scene.frame_start) + frame_count)
+    if hasattr(scene, "ssbl_preview"):
+        scene.ssbl_preview.frame_count = frame_count
+    if cloth is not None and hasattr(cloth, "ssbl_cloth"):
+        cloth.ssbl_cloth.frame_count = frame_count
 
 
 def _title(scene: bpy.types.Scene, fallback: str) -> str:
@@ -77,7 +123,15 @@ def _source_scene(scene: bpy.types.Scene, blend_path: Path) -> str:
     return f"{source}; source_blend={blend_path}"
 
 
-def _overlay(scene: bpy.types.Scene) -> demo.Overlay:
+def _overlay(scene: bpy.types.Scene, title: str) -> demo.Overlay:
+    if not all(
+        bpy.data.objects.get(name) is not None
+        for name in ("SSBL_Demo_Overlay_Title", "SSBL_Demo_Overlay_Metrics", "SSBL_Demo_Overlay_Notes")
+    ):
+        camera = scene.camera
+        if camera is None:
+            raise RuntimeError("Desktop demo blend has no camera for overlay creation")
+        return demo._create_overlay(scene, camera, title)
     return demo.Overlay(
         title=bpy.data.objects["SSBL_Demo_Overlay_Title"],
         metrics=bpy.data.objects["SSBL_Demo_Overlay_Metrics"],
@@ -181,6 +235,7 @@ def _probe_flag_viewport_fps(frame_count: int) -> list[float]:
     cloth = _active_mesh_or_named("SSBL_Demo_Force_Field_Flag")
     wind = bpy.data.objects["SSBL_Demo_Wind_Field"]
     turbulence = bpy.data.objects["SSBL_Demo_Turbulence_Field"]
+    _extend_preview_duration(scene, cloth, frame_count)
     _select_active(cloth)
     ssbl.solver.start_preview(bpy.context, cloth)
     samples: list[float] = []
@@ -248,9 +303,17 @@ def _render_case_frame(
     frame_count: int,
     last_ms: float,
     native_ms: float,
-    viewport_fps: float,
+    viewport_fps: float | None,
+    simulated_faces: int,
 ) -> None:
-    metrics_line = demo._format_metrics_line(frame, frame_count, last_ms, native_ms, viewport_fps)
+    metrics_line = demo._format_metrics_line(
+        frame,
+        frame_count,
+        last_ms,
+        native_ms,
+        viewport_fps,
+        simulated_faces=simulated_faces,
+    )
     note = demo._keyword_line(*keywords)
     demo._update_overlay(overlay, metrics_line=metrics_line, note=note)
     overlay_text_frames.append(demo._compose_overlay_text(title, metrics_line, note))
@@ -299,7 +362,7 @@ def _record_flag() -> demo.DemoResult:
     name = "01_brand_flag_wind_realtime"
     blend_path = _open_demo_blend(name)
     scene = bpy.context.scene
-    frame_count = _frame_count(scene, 112)
+    frame_count = _forced_frame_count(199)
     title = _title(scene, "SSBL realtime flag - live wind control")
     keywords = KEYWORDS[name]
     viewport_fps_samples = _probe_flag_viewport_fps(frame_count)
@@ -308,13 +371,15 @@ def _record_flag() -> demo.DemoResult:
     scene = bpy.context.scene
     title = _title(scene, title)
     _case_dir, frames_dir, video_path = demo._ensure_output_dir(name)
-    overlay = _overlay(scene)
+    overlay = _overlay(scene, title)
     cloth = _active_mesh_or_named("SSBL_Demo_Force_Field_Flag")
     wind = bpy.data.objects["SSBL_Demo_Wind_Field"]
     turbulence = bpy.data.objects["SSBL_Demo_Turbulence_Field"]
+    _extend_preview_duration(scene, cloth, frame_count)
     _select_active(cloth)
     before = demo._mesh_snapshot(cloth)
     session = ssbl.solver.start_preview(bpy.context, cloth)
+    simulated_faces = _simulated_triangle_count(session)
     step_ms_samples: list[float] = []
     frame_paths: list[str] = []
     _OVERLAY_TEXT[name] = []
@@ -374,6 +439,7 @@ def _record_flag() -> demo.DemoResult:
             last_ms,
             native_ms,
             demo._sample_fps_for_frame(viewport_fps_samples, frame),
+            simulated_faces,
         )
 
     ssbl.solver.request_stop(cloth)
@@ -393,6 +459,7 @@ def _record_flag() -> demo.DemoResult:
         viewport_fps_samples=viewport_fps_samples,
         metrics={
             "slots": len(session.slots),
+            "simulated_triangle_count": simulated_faces,
             "max_force_field_count": max(force_field_counts) if force_field_counts else 0,
             "max_turbulence_strength": max_turbulence_strength,
             "final_wind_strength": float(wind.field.strength),
@@ -413,18 +480,19 @@ def _record_wring() -> demo.DemoResult:
     frame_count = _frame_count(scene, demo.WRING_FRAME_COUNT)
     title = _title(scene, "SSBL realtime wring towel - hook driven twist")
     keywords = KEYWORDS[name]
-    viewport_fps_samples = _constant_viewport_fps_samples(frame_count, _single_preview_interval_s())
+    viewport_fps_samples = _probe_wring_viewport_fps(frame_count)
 
     blend_path = _open_demo_blend(name)
     scene = bpy.context.scene
     title = _title(scene, title)
     _case_dir, frames_dir, video_path = demo._ensure_output_dir(name)
-    overlay = _overlay(scene)
+    overlay = _overlay(scene, title)
     towel = _active_mesh_or_named("SSBL_Wring_Towel")
     _select_active(towel)
     source_mesh = towel.data
     source_before = demo._snapshot_coords(source_mesh)
     session = ssbl.solver.start_preview(bpy.context, towel)
+    simulated_faces = _simulated_triangle_count(session)
     step_ms_samples: list[float] = []
     frame_paths: list[str] = []
     _OVERLAY_TEXT[name] = []
@@ -461,6 +529,7 @@ def _record_wring() -> demo.DemoResult:
             last_ms,
             native_ms,
             demo._sample_fps_for_frame(viewport_fps_samples, frame),
+            simulated_faces,
         )
 
     tethers = len(session.cloth.lra_edges)
@@ -484,6 +553,7 @@ def _record_wring() -> demo.DemoResult:
         metrics={
             "vertices": len(towel.data.vertices),
             "triangles": len(session.cloth.triangles),
+            "simulated_triangle_count": simulated_faces,
             "tethers": tethers,
             "min_z": min_z,
             "max_twist_radius": max_radius,
@@ -493,20 +563,35 @@ def _record_wring() -> demo.DemoResult:
     )
 
 
-def _record_timeline(name: str) -> demo.DemoResult:
-    blend_path = _open_demo_blend(name)
+def _record_timeline(
+    name: str,
+    *,
+    blend_name: str | None = None,
+    fallback_frame_count: int | None = None,
+    forced_frame_count: int | None = None,
+    fallback_title: str | None = None,
+) -> demo.DemoResult:
+    blend_path = _open_demo_blend(name, blend_name=blend_name)
     scene = bpy.context.scene
-    fallback = 112 if name != "05_tshirt_drape_realtime" else 144
-    frame_count = _frame_count(scene, fallback)
-    title = _title(scene, name)
+    if name == "03_clothesline_multicloth_realtime":
+        _configure_multicloth_demo_runtime(scene)
+    if name == "04_walk_dynamic_collider_realtime":
+        _assign_walk_dynamic_collider_collection(scene)
+    fallback = int(fallback_frame_count) if fallback_frame_count is not None else (112 if name != "05_tshirt_drape_realtime" else 144)
+    frame_count = _forced_frame_count(forced_frame_count) if forced_frame_count is not None else _frame_count(scene, fallback)
+    title = _title(scene, fallback_title or name)
     keywords = KEYWORDS[name]
     viewport_fps_samples = _probe_timeline_viewport_fps(frame_count)
 
-    blend_path = _open_demo_blend(name)
+    blend_path = _open_demo_blend(name, blend_name=blend_name)
     scene = bpy.context.scene
+    if name == "03_clothesline_multicloth_realtime":
+        _configure_multicloth_demo_runtime(scene)
+    if name == "04_walk_dynamic_collider_realtime":
+        _assign_walk_dynamic_collider_collection(scene)
     title = _title(scene, title)
     _case_dir, frames_dir, video_path = demo._ensure_output_dir(name)
-    overlay = _overlay(scene)
+    overlay = _overlay(scene, title)
     scene.frame_set(int(scene.frame_start))
     before: dict[str, list[tuple[float, float, float]]] = {
         obj.name: demo._mesh_snapshot(obj)
@@ -516,6 +601,7 @@ def _record_timeline(name: str) -> demo.DemoResult:
     session = ssbl.solver.start_timeline_preview(bpy.context, scene)
     if session is None:
         raise RuntimeError(f"{name}: no enabled cloth objects in desktop blend")
+    simulated_faces = _simulated_triangle_count(session)
 
     step_ms_samples: list[float] = []
     frame_paths: list[str] = []
@@ -553,6 +639,7 @@ def _record_timeline(name: str) -> demo.DemoResult:
             original = before.get(slot_name)
             if original is not None and len(original) == len(obj.data.vertices):
                 max_displacement = max(max_displacement, demo._mesh_delta(obj, original))
+        viewport_fps = demo._sample_fps_for_frame(viewport_fps_samples, frame)
         _render_case_frame(
             scene,
             frames_dir,
@@ -565,7 +652,8 @@ def _record_timeline(name: str) -> demo.DemoResult:
             frame_count,
             last_ms,
             native_ms,
-            demo._sample_fps_for_frame(viewport_fps_samples, frame),
+            viewport_fps,
+            simulated_faces,
         )
 
     stopper = bpy.data.objects.get(session.object_name)
@@ -577,6 +665,7 @@ def _record_timeline(name: str) -> demo.DemoResult:
     )
     metrics = {
         "slots": len(session.slots),
+        "simulated_triangle_count": simulated_faces,
         "cross_mode": str(session.cross_cloth_mode),
         "max_penetration_depth": max_penetration,
         "max_static_collision_ms": max_static_collision_ms,
@@ -610,13 +699,19 @@ def main() -> None:
     demo.OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     results: list[demo.DemoResult] = []
     started = time.perf_counter()
+    completed = False
     try:
         recorders = [
             _record_flag,
             _record_wring,
             lambda: _record_timeline("03_clothesline_multicloth_realtime"),
-            lambda: _record_timeline("04_tablecloth_pull_collision_realtime"),
-            lambda: _record_timeline("05_tshirt_drape_realtime"),
+            lambda: _record_timeline(
+                "04_walk_dynamic_collider_realtime",
+                blend_name="walk",
+                fallback_frame_count=249,
+                fallback_title="SSBL realtime walk - animated character collider",
+            ),
+            lambda: _record_timeline("05_tshirt_drape_realtime", forced_frame_count=259),
         ]
         for recorder in recorders:
             result = recorder()
@@ -635,12 +730,17 @@ def main() -> None:
         print("SSBL_DESKTOP_BLEND_DEMO_PACK", json.dumps(summary, ensure_ascii=False, sort_keys=True))
         if len(results) != 5 or not all(result.validation_passed for result in results):
             raise RuntimeError("Desktop blend demo pack did not generate all five validated videos")
+        completed = True
     finally:
         try:
             ssbl.solver.cleanup_all_sessions()
         except Exception:
             pass
         ssbl.unregister()
+        if completed and bpy.app.background:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(0)
 
 
 if __name__ == "__main__":

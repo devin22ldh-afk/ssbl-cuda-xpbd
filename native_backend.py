@@ -169,6 +169,23 @@ class _NativeFrameInputs(ctypes.Structure):
     ]
 
 
+class _NativeGlobalDynamicSceneInputs(ctypes.Structure):
+    _fields_ = [
+        ("particle_positions", ctypes.POINTER(ctypes.c_float)),
+        ("particle_prev_positions", ctypes.POINTER(ctypes.c_float)),
+        ("particle_radii", ctypes.POINTER(ctypes.c_float)),
+        ("particle_source_ids", ctypes.POINTER(ctypes.c_int)),
+        ("particle_collision_layers", ctypes.POINTER(ctypes.c_int)),
+        ("particle_count", ctypes.c_int),
+        ("triangle_vertices", ctypes.POINTER(ctypes.c_float)),
+        ("triangle_source_ids", ctypes.POINTER(ctypes.c_int)),
+        ("triangle_collision_layers", ctypes.POINTER(ctypes.c_int)),
+        ("triangle_count", ctypes.c_int),
+        ("collision_margin", ctypes.c_float),
+        ("cloth_thickness", ctypes.c_float),
+    ]
+
+
 class _NativeDiagnostics(ctypes.Structure):
     _fields_ = [
         ("step_ms", ctypes.c_float),
@@ -301,6 +318,12 @@ class _NativeDiagnostics(ctypes.Structure):
         ("dynamic_triangle_large_primitive_count", ctypes.c_longlong),
         ("dynamic_triangle_aabb_reject_count", ctypes.c_longlong),
         ("dynamic_triangle_max_bucket_occupancy", ctypes.c_longlong),
+        ("global_dynamic_scene_pack_ms", ctypes.c_float),
+        ("global_dynamic_scene_upload_ms", ctypes.c_float),
+        ("global_dynamic_hash_ms", ctypes.c_float),
+        ("global_dynamic_particle_count", ctypes.c_longlong),
+        ("global_dynamic_triangle_count", ctypes.c_longlong),
+        ("global_dynamic_hash_overflow", ctypes.c_longlong),
     ]
 
 
@@ -443,6 +466,12 @@ class NativeStepDiagnostics:
     dynamic_triangle_large_primitive_count: int = 0
     dynamic_triangle_aabb_reject_count: int = 0
     dynamic_triangle_max_bucket_occupancy: int = 0
+    global_dynamic_scene_pack_ms: float = 0.0
+    global_dynamic_scene_upload_ms: float = 0.0
+    global_dynamic_hash_ms: float = 0.0
+    global_dynamic_particle_count: int = 0
+    global_dynamic_triangle_count: int = 0
+    global_dynamic_hash_overflow: int = 0
     frame_ms: float = 0.0
     frame_set_ms: float = 0.0
     input_refresh_ms: float = 0.0
@@ -470,9 +499,13 @@ class NativeStepDiagnostics:
 
 _LIB = None
 _LOAD_ERROR = ""
-_ABI41_DLL_NAME = "ssbl_xpbd_cuda_abi40.dll"
+_ABI41_DLL_NAMES = ("ssbl_xpbd_cuda_abi41.dll", "ssbl_xpbd_cuda_abi40.dll")
 _CAP_STRETCH_OPTIMIZATION = 1 << 0
 _CAP_PIN_WEIGHTS = 1 << 1
+_CAP_GLOBAL_DYNAMIC_SCENE = 1 << 2
+_CROSS_MODE_OFF = 0
+_CROSS_MODE_ALL_SELECTED = 1
+_CROSS_MODE_LOWER_LAYERS = 2
 
 
 def dll_path() -> str:
@@ -481,7 +514,11 @@ def dll_path() -> str:
         return override
     root = os.path.dirname(os.path.abspath(__file__))
     native_bin = os.path.join(root, "native", "bin")
-    return os.path.join(native_bin, _ABI41_DLL_NAME)
+    for name in _ABI41_DLL_NAMES:
+        candidate = os.path.join(native_bin, name)
+        if os.path.exists(candidate):
+            return candidate
+    return os.path.join(native_bin, _ABI41_DLL_NAMES[0])
 
 
 def status() -> NativeStatus:
@@ -503,7 +540,7 @@ def _load_library():
     path = dll_path()
     if not os.path.exists(path):
         raise NativeBackendUnavailable(
-            "Missing ABI40 CUDA solver DLL. Install CUDA Toolkit, CMake, and VS Build Tools, then run native/build_recon.ps1."
+            "Missing ABI41/ABI40 CUDA solver DLL. Install CUDA Toolkit, CMake, and VS Build Tools, then run native/build_recon.ps1."
         )
 
     try:
@@ -544,6 +581,27 @@ def _load_library():
     if hasattr(lib, "ssbl_update_frame_inputs"):
         lib.ssbl_update_frame_inputs.argtypes = [ctypes.c_void_p, ctypes.POINTER(_NativeFrameInputs)]
         lib.ssbl_update_frame_inputs.restype = ctypes.c_int
+    if hasattr(lib, "ssbl_create_global_dynamic_scene"):
+        lib.ssbl_create_global_dynamic_scene.argtypes = []
+        lib.ssbl_create_global_dynamic_scene.restype = ctypes.c_void_p
+    if hasattr(lib, "ssbl_destroy_global_dynamic_scene"):
+        lib.ssbl_destroy_global_dynamic_scene.argtypes = [ctypes.c_void_p]
+        lib.ssbl_destroy_global_dynamic_scene.restype = ctypes.c_int
+    if hasattr(lib, "ssbl_update_global_dynamic_scene"):
+        lib.ssbl_update_global_dynamic_scene.argtypes = [ctypes.c_void_p, ctypes.POINTER(_NativeGlobalDynamicSceneInputs)]
+        lib.ssbl_update_global_dynamic_scene.restype = ctypes.c_int
+    if hasattr(lib, "ssbl_attach_global_dynamic_scene"):
+        lib.ssbl_attach_global_dynamic_scene.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
+        lib.ssbl_attach_global_dynamic_scene.restype = ctypes.c_int
+    if hasattr(lib, "ssbl_clear_global_dynamic_scene"):
+        lib.ssbl_clear_global_dynamic_scene.argtypes = [ctypes.c_void_p]
+        lib.ssbl_clear_global_dynamic_scene.restype = ctypes.c_int
     lib.ssbl_step_solver.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
     lib.ssbl_step_solver.restype = ctypes.c_int
     lib.ssbl_step_solver_ex.argtypes = [
@@ -630,6 +688,25 @@ def _capabilities(lib) -> int:
     if hasattr(lib, "ssbl_capabilities"):
         return int(lib.ssbl_capabilities())
     return 0
+
+
+def supports_global_dynamic_scene() -> bool:
+    try:
+        lib = _load_library()
+    except NativeBackendUnavailable:
+        return False
+    required = (
+        "ssbl_create_global_dynamic_scene",
+        "ssbl_destroy_global_dynamic_scene",
+        "ssbl_update_global_dynamic_scene",
+        "ssbl_attach_global_dynamic_scene",
+        "ssbl_clear_global_dynamic_scene",
+    )
+    return (
+        (_capabilities(lib) & _CAP_GLOBAL_DYNAMIC_SCENE) != 0
+        and all(hasattr(lib, name) for name in required)
+        and os.environ.get("SSBL_DISABLE_GLOBAL_DYNAMIC_SCENE", "").lower() not in {"1", "true", "yes", "on"}
+    )
 
 
 def _config_from_options(
@@ -744,20 +821,100 @@ def _as_force_field_ptr(arr):
     return ctypes.cast(arr, ctypes.POINTER(_NativeForceField))
 
 
+class NativeGlobalDynamicScene:
+    def __init__(self):
+        self._lib = _load_library()
+        if not supports_global_dynamic_scene():
+            raise NativeSolverError("Loaded CUDA solver DLL does not support ABI41 global dynamic scenes.")
+        self._handle = self._lib.ssbl_create_global_dynamic_scene()
+        if not self._handle:
+            raise NativeSolverError(_last_error(self._lib))
+
+    @property
+    def handle(self):
+        return self._handle
+
+    def update(
+        self,
+        *,
+        particle_positions: np.ndarray,
+        particle_prev_positions: np.ndarray,
+        particle_radii: np.ndarray,
+        particle_source_ids: np.ndarray,
+        particle_collision_layers: np.ndarray,
+        triangle_vertices: np.ndarray,
+        triangle_source_ids: np.ndarray,
+        triangle_collision_layers: np.ndarray,
+        collision_margin: float,
+        cloth_thickness: float,
+    ) -> None:
+        if not getattr(self, "_handle", None):
+            raise NativeSolverError("Global dynamic scene has been closed.")
+        particle_positions = np.ascontiguousarray(particle_positions, dtype=np.float32).reshape((-1, 3))
+        particle_prev_positions = np.ascontiguousarray(particle_prev_positions, dtype=np.float32).reshape((-1, 3))
+        particle_radii = np.ascontiguousarray(particle_radii, dtype=np.float32).reshape((-1,))
+        particle_source_ids = np.ascontiguousarray(particle_source_ids, dtype=np.int32).reshape((-1,))
+        particle_collision_layers = np.ascontiguousarray(particle_collision_layers, dtype=np.int32).reshape((-1,))
+        triangle_vertices = np.ascontiguousarray(triangle_vertices, dtype=np.float32).reshape((-1, 3, 3))
+        triangle_source_ids = np.ascontiguousarray(triangle_source_ids, dtype=np.int32).reshape((-1,))
+        triangle_collision_layers = np.ascontiguousarray(triangle_collision_layers, dtype=np.int32).reshape((-1,))
+        particle_count = int(len(particle_positions))
+        triangle_count = int(len(triangle_vertices))
+        if not (
+            len(particle_prev_positions) == particle_count
+            and len(particle_radii) == particle_count
+            and len(particle_source_ids) == particle_count
+            and len(particle_collision_layers) == particle_count
+        ):
+            raise NativeSolverError("Global dynamic particle arrays must have matching lengths.")
+        if not (len(triangle_source_ids) == triangle_count and len(triangle_collision_layers) == triangle_count):
+            raise NativeSolverError("Global dynamic triangle arrays must have matching lengths.")
+        flat_triangles = triangle_vertices.reshape((-1, 3))
+        inputs = _NativeGlobalDynamicSceneInputs(
+            particle_positions=_as_float_ptr(particle_positions),
+            particle_prev_positions=_as_float_ptr(particle_prev_positions),
+            particle_radii=_as_float_ptr(particle_radii),
+            particle_source_ids=_as_int_ptr(particle_source_ids),
+            particle_collision_layers=_as_int_ptr(particle_collision_layers),
+            particle_count=particle_count,
+            triangle_vertices=_as_float_ptr(flat_triangles),
+            triangle_source_ids=_as_int_ptr(triangle_source_ids),
+            triangle_collision_layers=_as_int_ptr(triangle_collision_layers),
+            triangle_count=triangle_count,
+            collision_margin=float(collision_margin),
+            cloth_thickness=float(cloth_thickness),
+        )
+        if not self._lib.ssbl_update_global_dynamic_scene(self._handle, ctypes.byref(inputs)):
+            raise NativeSolverError(_last_error(self._lib))
+
+    def close(self) -> None:
+        if getattr(self, "_handle", None):
+            self._lib.ssbl_destroy_global_dynamic_scene(self._handle)
+            self._handle = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
 class NativeXpbdSolver:
     def __init__(self, cloth: ClothBuildData, options: SolverOptions, static_triangles: np.ndarray):
         self._lib = _load_library()
-        self._is_abi41_abi40 = "abi40" in os.path.basename(dll_path()).lower()
+        dll_name = os.path.basename(dll_path()).lower()
+        self._is_abi41_abi40 = "abi40" in dll_name or "abi41" in dll_name
+        self._supports_global_dynamic_scene = supports_global_dynamic_scene()
         if bool(getattr(options, "stretch_optimization_enabled", False)):
             if (_capabilities(self._lib) & _CAP_STRETCH_OPTIMIZATION) == 0:
                 raise NativeSolverError(
                     "Loaded CUDA solver DLL does not support hard stretch optimization. "
-                    "Rebuild native/build_recon.ps1 to generate the ABI40 DLL."
+                    "Rebuild native/build_recon.ps1 to generate the ABI41/ABI40 DLL."
                 )
         if (_capabilities(self._lib) & _CAP_PIN_WEIGHTS) == 0:
             raise NativeSolverError(
                 "Loaded CUDA solver DLL does not support vertex-group pin weights. "
-                "Rebuild native/build_recon.ps1 to generate the ABI40 DLL."
+                "Rebuild native/build_recon.ps1 to generate the ABI41/ABI40 DLL."
             )
         self._vertex_count = int(len(cloth.positions_world))
         self._positions_out = np.empty((self._vertex_count, 3), dtype=np.float32)
@@ -792,12 +949,49 @@ class NativeXpbdSolver:
 
     def close(self) -> None:
         if getattr(self, "_handle", None):
+            if hasattr(self._lib, "ssbl_clear_global_dynamic_scene"):
+                self._lib.ssbl_clear_global_dynamic_scene(self._handle)
             self._lib.ssbl_destroy_solver(self._handle)
             self._handle = None
 
     def reset(self) -> None:
         if not self._lib.ssbl_reset_solver(self._handle):
             raise NativeSolverError(_last_error(self._lib))
+
+    @property
+    def supports_global_dynamic_scene(self) -> bool:
+        return bool(self._supports_global_dynamic_scene)
+
+    def attach_global_dynamic_scene(
+        self,
+        scene: NativeGlobalDynamicScene,
+        *,
+        target_source_id: int,
+        target_collision_layer: int,
+        cross_mode: str,
+    ) -> None:
+        if not self.supports_global_dynamic_scene:
+            return
+        normalized = str(cross_mode or "off").lower()
+        if normalized == "all_selected":
+            mode = _CROSS_MODE_ALL_SELECTED
+        elif normalized == "lower_layers":
+            mode = _CROSS_MODE_LOWER_LAYERS
+        else:
+            mode = _CROSS_MODE_OFF
+        if not self._lib.ssbl_attach_global_dynamic_scene(
+            self._handle,
+            scene.handle,
+            int(target_source_id),
+            int(target_collision_layer),
+            int(mode),
+        ):
+            raise NativeSolverError(_last_error(self._lib))
+
+    def clear_global_dynamic_scene(self) -> None:
+        if hasattr(self._lib, "ssbl_clear_global_dynamic_scene") and getattr(self, "_handle", None):
+            if not self._lib.ssbl_clear_global_dynamic_scene(self._handle):
+                raise NativeSolverError(_last_error(self._lib))
 
     def update_pin_targets(
         self,
@@ -1252,6 +1446,12 @@ class NativeXpbdSolver:
             dynamic_triangle_large_primitive_count=int(raw.dynamic_triangle_large_primitive_count),
             dynamic_triangle_aabb_reject_count=int(raw.dynamic_triangle_aabb_reject_count),
             dynamic_triangle_max_bucket_occupancy=int(raw.dynamic_triangle_max_bucket_occupancy),
+            global_dynamic_scene_pack_ms=float(raw.global_dynamic_scene_pack_ms),
+            global_dynamic_scene_upload_ms=float(raw.global_dynamic_scene_upload_ms),
+            global_dynamic_hash_ms=float(raw.global_dynamic_hash_ms),
+            global_dynamic_particle_count=int(raw.global_dynamic_particle_count),
+            global_dynamic_triangle_count=int(raw.global_dynamic_triangle_count),
+            global_dynamic_hash_overflow=int(raw.global_dynamic_hash_overflow),
         )
         self._last_diagnostics = diag
         return diag

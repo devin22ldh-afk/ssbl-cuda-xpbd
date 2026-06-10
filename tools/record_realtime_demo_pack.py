@@ -345,9 +345,13 @@ def _format_metrics_line(
     last_step_ms: float,
     native_ms: float,
     viewport_fps: float | None = None,
+    simulated_faces: int | None = None,
 ) -> str:
     fps = float(viewport_fps) if _valid_fps(viewport_fps) else _current_sim_fps(last_step_ms, native_ms)
-    return f"Viewport FPS: {fps:5.1f}"
+    line = f"Viewport FPS: {fps:5.1f}"
+    if simulated_faces is not None and int(simulated_faces) > 0:
+        line = f"{line} | Sim faces: {int(simulated_faces):,}"
+    return line
 
 
 def _compose_overlay_text(title: str, metrics_line: str, note_line: str) -> str:

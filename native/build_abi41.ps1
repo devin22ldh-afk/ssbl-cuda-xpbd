@@ -3,7 +3,7 @@ param(
     [string]$Config = "Release",
     [string]$CudaRoot = "",
     [string]$BuildDir = "",
-    [string]$OutputName = "ssbl_xpbd_cuda_abi40",
+    [string]$OutputName = "ssbl_xpbd_cuda_abi41",
     [switch]$Clean,
     [switch]$NoRun
 )
@@ -150,7 +150,7 @@ try {
     Set-Content -LiteralPath $tempCmd -Value $lines -Encoding ASCII
     & cmd.exe /d /s /c """$tempCmd"""
     if ($LASTEXITCODE -ne 0) {
-        throw "ABI40 recon build failed with exit code $LASTEXITCODE."
+        throw "ABI41 recon build failed with exit code $LASTEXITCODE."
     }
 } finally {
     Remove-Item -LiteralPath $tempCmd -Force -ErrorAction SilentlyContinue
@@ -158,6 +158,6 @@ try {
 
 $dllPath = Join-Path $outputDirPath ("{0}.dll" -f $OutputName)
 if (-not (Test-Path -LiteralPath $dllPath)) {
-    throw "Build completed but ABI40 DLL was not found at $dllPath."
+    throw "Build completed but ABI41 DLL was not found at $dllPath."
 }
 Write-Host "Built $dllPath"

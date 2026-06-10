@@ -47,6 +47,16 @@ def _finite_object(obj: bpy.types.Object) -> bool:
     )
 
 
+def _dynamic_path_active(diagnostics) -> bool:
+    return (
+        float(getattr(diagnostics, "dynamic_upload_ms", 0.0)) > 0.0
+        or float(getattr(diagnostics, "global_dynamic_scene_upload_ms", 0.0)) > 0.0
+        or float(getattr(diagnostics, "global_dynamic_hash_ms", 0.0)) > 0.0
+        or int(getattr(diagnostics, "global_dynamic_triangle_count", 0)) > 0
+        or int(getattr(diagnostics, "global_dynamic_particle_count", 0)) > 0
+    )
+
+
 def _make_cloth(name: str, location: tuple[float, float, float]) -> bpy.types.Object:
     bpy.ops.mesh.primitive_grid_add(x_subdivisions=13, y_subdivisions=13, size=1.2, location=location)
     obj = bpy.context.object
@@ -112,6 +122,11 @@ def _run_multi(scene: bpy.types.Scene) -> dict[str, object]:
         "slots": len(session.slots) if session else 0,
         "cross_mode": cross_mode,
         "dynamic_upload_ms": float(diagnostics.dynamic_upload_ms),
+        "dynamic_path_active": _dynamic_path_active(diagnostics),
+        "global_dynamic_scene_upload_ms": float(getattr(diagnostics, "global_dynamic_scene_upload_ms", 0.0)),
+        "global_dynamic_hash_ms": float(getattr(diagnostics, "global_dynamic_hash_ms", 0.0)),
+        "global_dynamic_particle_count": int(getattr(diagnostics, "global_dynamic_particle_count", 0)),
+        "global_dynamic_triangle_count": int(getattr(diagnostics, "global_dynamic_triangle_count", 0)),
         "dynamic_collision_ms": float(diagnostics.dynamic_collision_ms),
         "finite": bool(finite),
         "restore_delta_first": _max_source_delta(first, before_first),
@@ -139,6 +154,11 @@ def _run_manual_multi(scene: bpy.types.Scene) -> dict[str, object]:
         "slots": len(session.slots) if session else 0,
         "cross_mode": cross_mode,
         "dynamic_upload_ms": float(diagnostics.dynamic_upload_ms),
+        "dynamic_path_active": _dynamic_path_active(diagnostics),
+        "global_dynamic_scene_upload_ms": float(getattr(diagnostics, "global_dynamic_scene_upload_ms", 0.0)),
+        "global_dynamic_hash_ms": float(getattr(diagnostics, "global_dynamic_hash_ms", 0.0)),
+        "global_dynamic_particle_count": int(getattr(diagnostics, "global_dynamic_particle_count", 0)),
+        "global_dynamic_triangle_count": int(getattr(diagnostics, "global_dynamic_triangle_count", 0)),
         "dynamic_collision_ms": float(diagnostics.dynamic_collision_ms),
         "finite": bool(finite),
         "restore_delta_first": _max_source_delta(first, before_first),
@@ -232,13 +252,13 @@ def main() -> None:
             and single["finite"]
             and multi["slots"] == 2
             and multi["cross_mode"] == "all_selected"
-            and multi["dynamic_upload_ms"] > 0.0
+            and multi["dynamic_path_active"]
             and multi["finite"]
             and multi["restore_delta_first"] == 0.0
             and multi["restore_delta_second"] == 0.0
             and manual_multi["slots"] == 2
             and manual_multi["cross_mode"] == "all_selected"
-            and manual_multi["dynamic_upload_ms"] > 0.0
+            and manual_multi["dynamic_path_active"]
             and manual_multi["finite"]
             and manual_multi["restore_delta_first"] == 0.0
             and manual_multi["restore_delta_second"] == 0.0

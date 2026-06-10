@@ -12,7 +12,7 @@ SSBL CUDA XPBD is a native CUDA XPBD cloth add-on for Blender 5.0. It provides v
 - 碰撞支持：支持地面平面、球体碰撞器、静态碰撞集合，以及基于 CUDA 的静态 SDF 碰撞。
 - 自碰撞：提供 `fast` 预览优先模式和 `strict` 质量优先模式。
 - 多布料预览：支持多对象布料会话、跨布料动态碰撞和碰撞层级。
-- 材质与约束：支持硬度、布料厚度、密度、阻尼、接触摩擦、pin 顶点组和体积气压。
+- 材质与约束：支持硬度、布料厚度、密度、阻尼、接触摩擦、加权 pin 顶点组和体积气压。
 - Blender 力场：可从力场集合采样并上传到 native 解算器，同时支持按类型设置权重。
 - Native 后端：通过 `native/bin/ssbl_xpbd_cuda_abi40.dll` 使用 ABI40 CUDA 解算器。
 
@@ -22,7 +22,7 @@ SSBL CUDA XPBD is a native CUDA XPBD cloth add-on for Blender 5.0. It provides v
 - Collision support: ground plane, sphere collider, static collider collections, and CUDA static SDF collision.
 - Self collision: `fast` preview-oriented mode and `strict` quality-oriented mode.
 - Multi-cloth preview: multi-object cloth sessions, cross-cloth dynamic collision, and collision layers.
-- Material and constraints: hardness, cloth thickness, density, damping, contact friction, pin vertex groups, and volume pressure.
+- Material and constraints: hardness, cloth thickness, density, damping, contact friction, weighted pin vertex groups, and volume pressure.
 - Blender force fields: force-field collections can be sampled and uploaded to the native solver with per-type weights.
 - Native backend: uses the ABI40 CUDA solver DLL at `native/bin/ssbl_xpbd_cuda_abi40.dll`.
 
@@ -68,7 +68,7 @@ Then enable the add-on in Blender:
 1. 在场景中选择一个 Mesh 对象。
 2. 打开 `Properties > Physics > SSBL CUDA XPBD`。
 3. 启用 `SSBL` 布料模拟。
-4. 可选：创建名为 `ssbl_pin` 的顶点组，用于固定布料上的点。
+4. 可选：创建名为 `ssbl_pin` 的顶点组，用于固定布料上的点。顶点组权重会驱动软 pin 强度；native 解算器会把低于 `0.05` 的有效权重视为未 pin。
 5. 根据需要设置硬度、布料厚度、碰撞、力场、自碰撞和多布料选项。
 6. 播放 Blender 时间轴，插件会在视口中更新布料预览。
 7. 在 Cache & Bake 区域设置起止帧并执行 Bake，将结果写入 PC2 缓存。
@@ -76,7 +76,7 @@ Then enable the add-on in Blender:
 1. Select a Mesh object in the scene.
 2. Open `Properties > Physics > SSBL CUDA XPBD`.
 3. Enable SSBL cloth simulation.
-4. Optional: create a vertex group named `ssbl_pin` to pin cloth vertices.
+4. Optional: create a vertex group named `ssbl_pin` to pin cloth vertices. Vertex-group weights drive soft pin strength; effective weights below `0.05` are treated as unpinned by the native solver.
 5. Configure hardness, cloth thickness, collision, force fields, self collision, and multi-cloth options as needed.
 6. Play the Blender timeline to update the cloth preview in the viewport.
 7. Use the Cache & Bake section to set frame range and bake the result to a PC2 cache.
@@ -145,6 +145,23 @@ On success, this prints `SSBL_ANIMATED_INPUTS_SMOKE` and validates animated inpu
 
 On success, this prints `SSBL_V2_BENCHMARK` and covers 10k cloth, self collision, multi-cloth, and static collider collection scenarios.
 
+```powershell
+& "C:\Program Files\Blender Foundation\Blender 5.0\blender.exe" --background --python ".\tools\object_collision_smoke.py"
+```
+
+成功时会打印 `SSBL_OBJECT_COLLISION_SMOKE`，并验证解析地面/墙体接触、静态 SDF、静态碰撞体更新和摩擦行为。需要缩短本地检查时，可将 `SSBL_OBJECT_COLLISION_CASES` 设为逗号分隔的子集，例如 `ground,wall,static_mesh,moving_static_mesh`。
+
+On success, this prints `SSBL_OBJECT_COLLISION_SMOKE` and validates analytic ground/wall contacts, static SDF cases, static collider updates, and friction behavior. To run a shorter subset locally, set `SSBL_OBJECT_COLLISION_CASES` to a comma-separated list such as `ground,wall,static_mesh,moving_static_mesh`.
+
+```powershell
+& "C:\Program Files\Blender Foundation\Blender 5.0\blender.exe" --background --python ".\tools\native_contact_group_probe.py" -- --case analytic_ground
+& "C:\Program Files\Blender Foundation\Blender 5.0\blender.exe" --background --python ".\tools\native_contact_group_probe.py" -- --case self_vv
+```
+
+成功时每个 probe 会打印 `SSBL_NATIVE_CONTACT_GROUP_PROBE`。可用 case 包括 `analytic_ground`、`analytic_wall`、`analytic_sphere`、`analytic_corner`、`static_sdf` 和 `self_vv`；它们适合在不搭建完整 Blender 场景时隔离验证 native contact grouping、摩擦或自接触变化。
+
+On success, each probe prints `SSBL_NATIVE_CONTACT_GROUP_PROBE`. Available cases are `analytic_ground`, `analytic_wall`, `analytic_sphere`, `analytic_corner`, `static_sdf`, and `self_vv`; use these when isolating native contact grouping, friction, or self-contact changes without building a full Blender scene.
+
 Native 后端 smoke 可通过：
 
 Run the native backend smoke through:
@@ -155,9 +172,9 @@ Push-Location .\native
 Pop-Location
 ```
 
-成功输出应包含 `SSBL_ABI41_NATIVE_OK` 和 `SSBL_ABI41_STATIC_SDF_OK`。
+成功输出应包含 `SSBL_ABI41_NATIVE_OK`、`SSBL_ABI41_STATIC_SDF_OK` 和 `SSBL_ABI41_PIN_WEIGHT_OK`。
 
-Successful output should include `SSBL_ABI41_NATIVE_OK` and `SSBL_ABI41_STATIC_SDF_OK`.
+Successful output should include `SSBL_ABI41_NATIVE_OK`, `SSBL_ABI41_STATIC_SDF_OK`, and `SSBL_ABI41_PIN_WEIGHT_OK`.
 
 ## 常见问题 / Troubleshooting
 
@@ -181,9 +198,9 @@ Select a Mesh object. The SSBL panel is under `Properties > Physics > SSBL CUDA 
 
 ### Pin 顶点组不起作用 / Pin Vertex Group Does Not Work
 
-默认 pin 顶点组名为 `ssbl_pin`。如果使用其他名称，请在 SSBL 材质与约束设置中填写对应顶点组。
+默认 pin 顶点组名为 `ssbl_pin`。如果使用其他名称，请在 SSBL 材质与约束设置中填写对应顶点组。顶点组权重会乘以全局 pin 硬度；软 pin 的有效权重至少需要 `0.05`，硬 pin 行为通常使用 `0.75` 或更高权重。
 
-The default pin vertex group is `ssbl_pin`. If you use another name, set it in the SSBL material and constraint settings.
+The default pin vertex group is `ssbl_pin`. If you use another name, set it in the SSBL material and constraint settings. Vertex-group weights are multiplied by the global pin hardness; use effective weights of at least `0.05` for soft pins and `0.75` or higher for hard pin behavior.
 
 ### 自碰撞较慢 / Self Collision Is Slow
 
@@ -203,7 +220,7 @@ xpbd_core.py        Cloth build data and XPBD settings helpers
 collision.py        Static collider collection helpers
 force_fields.py     Blender force-field sampling
 native_backend.py   ctypes bridge to the CUDA DLL
+parameters.md       User-facing guide for visible SSBL panel parameters
 native/             CUDA source, ABI headers, build scripts, native README
 tools/              Smoke tests, benchmarks, and preview recording scripts
 ```
-

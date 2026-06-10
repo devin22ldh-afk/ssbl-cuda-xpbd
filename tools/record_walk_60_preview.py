@@ -24,12 +24,12 @@ import record_realtime_demo_pack as demo
 
 
 BLEND_PATH = Path(os.environ.get("SSBL_WALK_BLEND", r"C:\Users\Administrator\Desktop\演示视频\walk.blend"))
-FRAME_COUNT = max(int(os.environ.get("SSBL_WALK_RECORD_FRAMES", "60")), 1)
+FRAME_COUNT = max(int(os.environ.get("SSBL_WALK_RECORD_FRAMES", "250")), 1)
 WARMUP_FRAME_COUNT = max(int(os.environ.get("SSBL_WALK_RECORD_WARMUP_FRAMES", "1")), 0)
 SKIRT_NAME = os.environ.get("SSBL_WALK_SKIRT_OBJECT", "Codex_Skirt_Pleated")
 BETA_NAME = os.environ.get("SSBL_WALK_BETA_OBJECT", "Beta_Surface")
 DYNAMIC_COLLECTION_NAME = os.environ.get("SSBL_WALK_DYNAMIC_COLLIDER_COLLECTION", "SSBL_Runtime_Dynamic_Colliders")
-CASE_NAME = os.environ.get("SSBL_WALK_RECORD_NAME", "walk_60_dynamic_collision")
+CASE_NAME = os.environ.get("SSBL_WALK_RECORD_NAME", "walk_250_dynamic_collision")
 SUBSTEPS_OVERRIDE = int(os.environ.get("SSBL_WALK_RECORD_SUBSTEPS", "0") or "0")
 ITERATIONS_OVERRIDE = int(os.environ.get("SSBL_WALK_RECORD_ITERATIONS", "0") or "0")
 
@@ -178,6 +178,7 @@ def main() -> None:
     session = ssbl.solver.start_timeline_preview(bpy.context, scene)
     if session is None:
         raise RuntimeError("walk timeline preview did not start")
+    simulated_faces = int(sum(len(slot.cloth.triangles) for slot in session.slots.values()))
     finite = True
     max_dynamic_triangles = 0
     max_cuda_ms = 0.0
@@ -246,7 +247,15 @@ def main() -> None:
             step_ms_samples.append(step_ms)
             fps = 1000.0 / max(step_ms, 1.0e-6)
             viewport_fps_samples.append(fps)
-            overlay_text_frames.append(demo._compose_overlay_text("Walk Dynamic Collider", f"Viewport FPS: {fps:5.1f}", ""))
+            metrics_line = demo._format_metrics_line(
+                index + 1,
+                FRAME_COUNT,
+                step_ms,
+                float(getattr(diag, "step_ms", 0.0)),
+                fps,
+                simulated_faces=simulated_faces,
+            )
+            overlay_text_frames.append(demo._compose_overlay_text("Walk Dynamic Collider", metrics_line, ""))
             frame_paths.append(demo._render_frame(scene, frames_dir, index + 1))
     finally:
         ssbl.solver.stop_timeline_preview(scene)
@@ -267,6 +276,7 @@ def main() -> None:
         "average_overlay_fps": float(demo._average_fps(viewport_fps_samples)),
         "finite": bool(finite),
         "slot_names": list(session.solve_order),
+        "simulated_triangle_count": int(simulated_faces),
         "dynamic_collision_source_names": sorted(session.dynamic_collision_sources.keys()),
         "max_dynamic_triangle_count": int(max_dynamic_triangles),
         "max_cuda_step_call_ms": float(max_cuda_ms),
@@ -288,7 +298,7 @@ def main() -> None:
     }
     summary_path = case_dir / "summary.json"
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    print("SSBL_WALK_60_RECORD", json.dumps(summary, ensure_ascii=False, sort_keys=True))
+    print("SSBL_WALK_RECORD", json.dumps(summary, ensure_ascii=False, sort_keys=True))
     if not finite or not video_path.exists() or video_path.stat().st_size <= 0:
         raise RuntimeError(f"walk recording failed: {summary}")
     if bpy.app.background:

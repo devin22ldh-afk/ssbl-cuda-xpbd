@@ -38,6 +38,8 @@ def main() -> None:
     bpy.ops.wm.open_mainfile(filepath=str(BLEND_PATH), load_ui=False)
     perf_helpers = _load_perf_module()
     ssbl = perf_helpers._register_addon()
+    from ssbl import native_backend
+
     cs2 = perf_helpers._load_cs2_regression_module()
 
     active = perf_helpers._mesh_object(os.environ.get("SSBL_CS2_ACTIVE_OBJECT", "Cube"))
@@ -65,9 +67,18 @@ def main() -> None:
     max_dynamic_upload_ms = 0.0
     max_dynamic_triangle_count = 0
     max_dynamic_particle_count = 0
-    max_candidates = 0
+    max_triangle_candidates = 0
+    max_particle_candidates = 0
+    max_particle_contacts = 0
     max_resolved_contacts = 0
+    max_global_pack_ms = 0.0
+    max_global_upload_ms = 0.0
+    max_global_hash_ms = 0.0
+    max_global_particle_count = 0
+    max_global_triangle_count = 0
+    max_global_hash_overflow = 0
     finite = True
+    session_snapshot: dict[str, object] = {}
 
     try:
         for index in range(STEPS):
@@ -82,8 +93,22 @@ def main() -> None:
             max_dynamic_upload_ms = max(max_dynamic_upload_ms, float(getattr(diag, "dynamic_upload_ms", 0.0)))
             max_dynamic_triangle_count = max(max_dynamic_triangle_count, int(getattr(diag, "dynamic_triangle_count", 0)))
             max_dynamic_particle_count = max(max_dynamic_particle_count, int(getattr(diag, "dynamic_particle_count", 0)))
-            max_candidates = max(max_candidates, int(getattr(diag, "dynamic_triangle_candidate_count", 0)))
+            max_triangle_candidates = max(max_triangle_candidates, int(getattr(diag, "dynamic_triangle_candidate_count", 0)))
+            max_particle_candidates = max(max_particle_candidates, int(getattr(diag, "dynamic_particle_candidate_count", 0)))
+            max_particle_contacts = max(max_particle_contacts, int(getattr(diag, "dynamic_particle_contacts", 0)))
             max_resolved_contacts = max(max_resolved_contacts, int(getattr(diag, "resolved_contacts", 0)))
+            max_global_pack_ms = max(max_global_pack_ms, float(getattr(diag, "global_dynamic_scene_pack_ms", 0.0)))
+            max_global_upload_ms = max(max_global_upload_ms, float(getattr(diag, "global_dynamic_scene_upload_ms", 0.0)))
+            max_global_hash_ms = max(max_global_hash_ms, float(getattr(diag, "global_dynamic_hash_ms", 0.0)))
+            max_global_particle_count = max(max_global_particle_count, int(getattr(diag, "global_dynamic_particle_count", 0)))
+            max_global_triangle_count = max(max_global_triangle_count, int(getattr(diag, "global_dynamic_triangle_count", 0)))
+            max_global_hash_overflow = max(max_global_hash_overflow, int(getattr(diag, "global_dynamic_hash_overflow", 0)))
+        session_snapshot = {
+            "slot_names": list(session.slots.keys()),
+            "solve_order": list(session.solve_order),
+            "cross_mode": str(session.cross_cloth_mode),
+            "global_scene_enabled": bool(getattr(session, "global_dynamic_scene_enabled", False)),
+        }
     finally:
         ssbl.solver.request_stop(active)
 
@@ -91,16 +116,32 @@ def main() -> None:
     after_active = perf_helpers._snapshot(active)
     after_other = perf_helpers._snapshot(other)
     average_step_ms = sum(step_times) / len(step_times) if step_times else 0.0
+    p95_step_ms = perf_helpers._p95(step_times)
+    abi_path = native_backend.dll_path()
+    abi_name = Path(abi_path).name
+    observed_global_scene = bool(
+        session_snapshot.get("global_scene_enabled", False)
+        or max_global_upload_ms > 0.0
+        or max_global_hash_ms > 0.0
+        or max_global_particle_count > 0
+        or max_global_triangle_count > 0
+    )
     summary = {
+        "abi": "ABI41" if "abi41" in abi_name.lower() else ("ABI40" if "abi40" in abi_name.lower() else abi_name),
+        "abi_path": abi_path,
         "blend_file": bpy.data.filepath,
         "steps": int(STEPS),
         "elapsed_s": float(elapsed),
         "average_wall_step_ms": float(average_step_ms),
         "sim_fps_wall": float(1000.0 / average_step_ms) if average_step_ms > 0.0 else 0.0,
-        "p95_wall_step_ms": perf_helpers._p95(step_times),
-        "slot_names": list(session.slots.keys()),
-        "solve_order": list(session.solve_order),
-        "cross_mode": str(session.cross_cloth_mode),
+        "p95_wall_step_ms": float(p95_step_ms),
+        "p95_fps_wall": float(1000.0 / p95_step_ms) if p95_step_ms > 0.0 else 0.0,
+        "slot_names": list(session_snapshot.get("slot_names", [])),
+        "solve_order": list(session_snapshot.get("solve_order", [])),
+        "cross_mode": str(session_snapshot.get("cross_mode", "")),
+        "global_scene_enabled": observed_global_scene,
+        "global_scene_session_flag": bool(session_snapshot.get("global_scene_enabled", False)),
+        "native_supports_global_scene": bool(native_backend.supports_global_dynamic_scene()),
         "finite": bool(finite and perf_helpers._finite_mesh(active) and perf_helpers._finite_mesh(other)),
         "restore_delta_active": float(perf_helpers._max_delta(before_active, after_active)),
         "restore_delta_other": float(perf_helpers._max_delta(before_other, after_other)),
@@ -109,10 +150,38 @@ def main() -> None:
         "max_dynamic_upload_ms": float(max_dynamic_upload_ms),
         "max_dynamic_triangle_count": int(max_dynamic_triangle_count),
         "max_dynamic_particle_count": int(max_dynamic_particle_count),
-        "max_dynamic_triangle_candidate_count": int(max_candidates),
+        "max_dynamic_triangle_candidate_count": int(max_triangle_candidates),
+        "max_dynamic_particle_candidate_count": int(max_particle_candidates),
+        "max_dynamic_particle_contacts": int(max_particle_contacts),
         "max_resolved_contacts": int(max_resolved_contacts),
+        "max_global_dynamic_scene_pack_ms": float(max_global_pack_ms),
+        "max_global_dynamic_scene_upload_ms": float(max_global_upload_ms),
+        "max_global_dynamic_hash_ms": float(max_global_hash_ms),
+        "max_global_dynamic_particle_count": int(max_global_particle_count),
+        "max_global_dynamic_triangle_count": int(max_global_triangle_count),
+        "max_global_dynamic_hash_overflow": int(max_global_hash_overflow),
     }
+    summary["accepted"] = bool(
+        summary["abi"] == "ABI41"
+        and summary["global_scene_enabled"]
+        and summary["cross_mode"] == "all_selected"
+        and summary["finite"]
+        and summary["restore_delta_active"] == 0.0
+        and summary["restore_delta_other"] == 0.0
+        and summary["max_global_dynamic_triangle_count"] > 0
+        and summary["max_global_dynamic_particle_count"] > 0
+        and (
+            summary["max_dynamic_triangle_candidate_count"] > 0
+            or summary["max_dynamic_particle_candidate_count"] > 0
+        )
+        and (
+            summary["max_dynamic_particle_contacts"] > 0
+            or summary["max_resolved_contacts"] > 0
+        )
+    )
     print("SSBL_CS2_TIMELINE_PERF_PROBE", json.dumps(summary, ensure_ascii=False, sort_keys=True))
+    if not summary["accepted"]:
+        raise RuntimeError(f"CS2 timeline perf probe failed: {summary}")
 
 
 if __name__ == "__main__":

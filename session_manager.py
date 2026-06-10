@@ -16,7 +16,7 @@ import numpy as np
 from .collision import clear_static_collision_cache, collect_static_triangles
 from .cache_names import safe_cache_stem
 from .force_fields import EMPTY_FORCE_FIELD_BATCH, ForceFieldBatch, collect_force_fields, has_force_field_sources
-from .native_backend import NativeStepDiagnostics, NativeXpbdSolver, status as native_status
+from .native_backend import NativeGlobalDynamicScene, NativeStepDiagnostics, NativeXpbdSolver, status as native_status
 from .xpbd_core import (
     ClothBuildData,
     PIN_HARD_WEIGHT_THRESHOLD,
@@ -213,6 +213,7 @@ class ClothSlot:
     auto_cache_realtime: bool = False
     realtime_cache: RealtimeCacheWriter | None = None
     pin_settings_signature: tuple = ()
+    runtime_refresh_signature: tuple = ()
     force_next_writeback: bool = False
     interactive_pin: InteractivePinState | None = None
     dynamic_collider_cache: CrossClothColliderCache = field(default_factory=CrossClothColliderCache)
@@ -260,6 +261,9 @@ class SceneSession:
     paused: bool = False
     last_scene_frame: int = 0
     dynamic_collision_sources: dict[str, DynamicCollisionSource] = field(default_factory=dict)
+    global_dynamic_scene: NativeGlobalDynamicScene | None = None
+    global_dynamic_source_ids: dict[str, int] = field(default_factory=dict)
+    global_dynamic_scene_enabled: bool = False
 
     @property
     def cloth(self) -> ClothBuildData:
@@ -350,6 +354,12 @@ def record_viewport_tag_ms(object_name: str, elapsed_ms: float) -> None:
         dynamic_triangle_large_primitive_count=diag.dynamic_triangle_large_primitive_count,
         dynamic_triangle_aabb_reject_count=diag.dynamic_triangle_aabb_reject_count,
         dynamic_triangle_max_bucket_occupancy=diag.dynamic_triangle_max_bucket_occupancy,
+        global_dynamic_scene_pack_ms=diag.global_dynamic_scene_pack_ms,
+        global_dynamic_scene_upload_ms=diag.global_dynamic_scene_upload_ms,
+        global_dynamic_hash_ms=diag.global_dynamic_hash_ms,
+        global_dynamic_particle_count=diag.global_dynamic_particle_count,
+        global_dynamic_triangle_count=diag.global_dynamic_triangle_count,
+        global_dynamic_hash_overflow=diag.global_dynamic_hash_overflow,
         static_triangle_count=diag.static_triangle_count,
         finite=diag.finite,
         fast_exact_vt_candidates=diag.fast_exact_vt_candidates,
@@ -898,6 +908,15 @@ def _auto_cross_cloth_mode(slot_count: int) -> str:
     return "all_selected" if int(slot_count) > 1 else "off"
 
 
+def _cross_cloth_mode_from_settings(settings, slot_count: int) -> str:
+    if int(slot_count) <= 1:
+        return "off"
+    configured = str(getattr(settings, "cross_cloth_collision", "off") or "off").lower()
+    if configured in {"all_selected", "lower_layers"}:
+        return configured
+    return _auto_cross_cloth_mode(slot_count)
+
+
 def start_preview(context: bpy.types.Context, obj: bpy.types.Object) -> SceneSession:
     try:
         if context.mode != "OBJECT":
@@ -948,7 +967,7 @@ def start_preview(context: bpy.types.Context, obj: bpy.types.Object) -> SceneSes
             substeps=max(int(settings.substeps), 1),
             iterations=max(int(settings.iterations), 1),
             writeback_interval=_preview_writeback_interval(settings),
-            cross_cloth_mode=_auto_cross_cloth_mode(len(slots)),
+            cross_cloth_mode=_cross_cloth_mode_from_settings(settings, len(slots)),
             last_fps_time=time.perf_counter(),
             fps_sample_frames=0,
             actual_fps=0.0,
@@ -1029,7 +1048,7 @@ def start_timeline_preview(context: bpy.types.Context, scene: bpy.types.Scene | 
         substeps=max(slot.substeps for slot in slots.values()),
         iterations=max(slot.iterations for slot in slots.values()),
         writeback_interval=min(slot.writeback_interval for slot in slots.values()),
-        cross_cloth_mode=_auto_cross_cloth_mode(len(slots)),
+        cross_cloth_mode=_cross_cloth_mode_from_settings(scene.ssbl_preview, len(slots)),
         last_fps_time=time.perf_counter(),
         fps_sample_frames=0,
         actual_fps=0.0,
@@ -1440,6 +1459,102 @@ def _preview_writeback_interval(settings) -> int:
 
 def _target_fps_from_settings(settings) -> float:
     return max(float(getattr(settings, "preview_target_fps", 30.0)), 1.0)
+
+
+def _raw_preview_options_signature(settings, preview_slot_count: int) -> tuple:
+    return (
+        int(preview_slot_count),
+        os.environ.get("SSBL_PREVIEW_SELF_COLLISION_BUDGET", ""),
+        os.environ.get("SSBL_JITTER_STABILIZER_ENABLED", ""),
+        int(getattr(settings, "substeps", 1)),
+        int(getattr(settings, "iterations", 1)),
+        round(float(getattr(settings, "dt", 1.0 / 60.0)), 8),
+        round(float(getattr(settings, "damping", 0.0)), 6),
+        _vector_signature(getattr(settings, "gravity", (0.0, 0.0, -9.81))),
+        round(float(getattr(settings, "hardness", 0.5)), 6),
+        bool(getattr(settings, "hardness_initialized", False)),
+        round(float(getattr(settings, "stretch_compliance", 0.0)), 12),
+        round(float(getattr(settings, "bend_compliance", 0.0)), 12),
+        bool(getattr(settings, "use_lra", False)),
+        round(float(getattr(settings, "lra_compliance", 0.0)), 12),
+        round(float(getattr(settings, "lra_slack", 0.0)), 6),
+        round(float(getattr(settings, "density", 1.0)), 6),
+        round(float(getattr(settings, "pin_hardness", 1.0)), 6),
+        str(getattr(settings, "pin_vertex_group", "")),
+        round(float(getattr(settings, "collision_margin", 0.0)), 6),
+        bool(getattr(settings, "use_ground", False)),
+        round(float(getattr(settings, "ground_height", 0.0)), 6),
+        bool(getattr(settings, "use_wall", False)),
+        _vector_signature(getattr(settings, "wall_origin", (0.0, 0.0, 0.0))),
+        _vector_signature(getattr(settings, "wall_normal", (0.0, 0.0, 1.0))),
+        bool(getattr(settings, "use_sphere", False)),
+        bool(getattr(settings, "self_collision", False)),
+        str(getattr(settings, "self_collision_mode", "fast")),
+        round(float(getattr(settings, "cloth_thickness", 0.02)), 6),
+        round(float(getattr(settings, "self_collision_distance", 0.0)), 6),
+        int(getattr(settings, "self_collision_interval", 2)),
+        int(getattr(settings, "max_self_collision_neighbors", 32)),
+        int(getattr(settings, "fast_self_collision_passes", 4)),
+        bool(getattr(settings, "use_volume_pressure", False)),
+        round(float(getattr(settings, "volume_compliance", 1.0e-6)), 12),
+        round(float(getattr(settings, "pressure_strength", 0.02)), 6),
+        round(float(getattr(settings, "volume_target_scale", 1.0)), 6),
+        int(getattr(settings, "volume_solve_interval", 1)),
+        int(getattr(settings, "self_probe_interval", 1)),
+        int(getattr(settings, "self_surface_pair_interval", 1)),
+        bool(getattr(settings, "jitter_stabilizer_enabled", True)),
+        round(float(getattr(settings, "contact_friction", 0.35)), 6),
+        round(float(getattr(settings, "contact_tangent_damping", 0.2)), 6),
+        round(float(getattr(settings, "contact_compliance", 0.0)), 12),
+        round(float(getattr(settings, "static_sdf_voxel_size", 0.0)), 6),
+        int(getattr(settings, "static_sdf_band_voxels", 4)),
+        int(getattr(settings, "static_sdf_max_resolution", 160)),
+    )
+
+
+def _static_slot_refresh_validation_interval() -> int:
+    try:
+        return max(int(os.environ.get("SSBL_STATIC_SLOT_REFRESH_VALIDATE_INTERVAL", "30")), 1)
+    except ValueError:
+        return 30
+
+
+def _static_slot_refresh_signature(
+    context: bpy.types.Context,
+    session: SceneSession,
+    slot: ClothSlot,
+    obj: bpy.types.Object,
+    settings,
+    auto_sphere_object: bpy.types.Object | None,
+) -> tuple | None:
+    if not _env_enabled("SSBL_STATIC_SLOT_REFRESH_FAST_PATH", False):
+        return None
+    if slot.use_evaluated_mesh or slot.interactive_pin is not None:
+        return None
+    if len(slot.cloth.pin_indices) > 0:
+        return None
+
+    matrix_signature = _matrix_signature(obj.matrix_world)
+    cached_signature = slot.runtime_refresh_signature
+    should_validate = (
+        not cached_signature
+        or int(session.frame_index) % _static_slot_refresh_validation_interval() == 0
+    )
+    if not should_validate:
+        return (matrix_signature, cached_signature[1])
+
+    if getattr(settings, "static_collider_collection", None) is not None:
+        return None
+    if getattr(settings, "dynamic_collider_collection", None) is not None:
+        return None
+    if has_force_field_sources(context.scene, settings):
+        return None
+    if bool(getattr(settings, "use_sphere", False)) or auto_sphere_object is not None:
+        return None
+    return (
+        matrix_signature,
+        _raw_preview_options_signature(settings, len(session.slots)),
+    )
 
 
 def _env_enabled(name: str, default: bool = True) -> bool:
@@ -2170,7 +2285,7 @@ def _refresh_session_live_settings(
         key=lambda name: (session.slots[name].collision_layer, name.casefold()),
     )
     previous_mode = str(session.cross_cloth_mode or "off")
-    session.cross_cloth_mode = _auto_cross_cloth_mode(len(session.slots))
+    session.cross_cloth_mode = _cross_cloth_mode_from_settings(context.scene.ssbl_preview, len(session.slots))
     if tuple(session.solve_order) != previous_order or str(session.cross_cloth_mode or "off") != previous_mode:
         for slot in session.slots.values():
             slot.force_next_writeback = True
@@ -2237,6 +2352,7 @@ def _rebuild_slot_native(
         slot.current_positions_world = current_positions
         slot.runtime_options_signature = _runtime_options_signature(options)
         slot.solver_options_signature = solver_signature
+        slot.runtime_refresh_signature = ()
         slot.pin_attachment_pairs = np.array(cloth.pin_attachment_pairs, dtype=np.int32, copy=True)
         slot.pin_targets_world = np.empty((0, 3), dtype=np.float32)
         slot.pin_settings_signature = _pin_settings_signature(obj, settings, len(cloth.positions_world))
@@ -2276,6 +2392,29 @@ def _refresh_session_runtime_inputs(context: bpy.types.Context, session: SceneSe
                 if slot.auto_sphere_object_name
                 else None
             )
+            fast_refresh_signature = _static_slot_refresh_signature(
+                context,
+                session,
+                slot,
+                obj,
+                settings,
+                auto_sphere_object,
+            )
+            if fast_refresh_signature is not None:
+                cached_signature = slot.runtime_refresh_signature
+                raw_signature_unchanged = (
+                    cached_signature == fast_refresh_signature
+                    or (
+                        bool(cached_signature)
+                        and len(cached_signature) == len(fast_refresh_signature)
+                        and cached_signature[1:] == fast_refresh_signature[1:]
+                    )
+                )
+                if raw_signature_unchanged:
+                    if cached_signature != fast_refresh_signature:
+                        slot.cloth.matrix_world_inv = np.array(obj.matrix_world.inverted(), dtype=np.float32)
+                    slot.runtime_refresh_signature = fast_refresh_signature
+                    continue
             options = _options_from_settings(
                 settings,
                 runtime_mode_override="preview",
@@ -2350,6 +2489,7 @@ def _refresh_session_runtime_inputs(context: bpy.types.Context, session: SceneSe
                 force_fields_enabled,
                 perf,
             )
+            slot.runtime_refresh_signature = fast_refresh_signature or ()
         _sync_session_dynamic_collision_sources(context, session, depsgraph, slot_settings)
         _refresh_session_live_settings(context, session, slot_settings)
     if perf is not None:
@@ -2362,14 +2502,33 @@ def _slot_should_download(download_positions, slot_name: str) -> bool:
     return bool(download_positions)
 
 
+def _download_slot_positions(slot: ClothSlot, perf: FramePerf | None = None) -> None:
+    started = time.perf_counter()
+    downloaded_positions = np.asarray(slot.native.download_positions(), dtype=np.float32)
+    if slot.previous_positions_world.shape == slot.current_positions_world.shape:
+        np.copyto(slot.previous_positions_world, slot.current_positions_world, casting="unsafe")
+    else:
+        slot.previous_positions_world = np.array(slot.current_positions_world, dtype=np.float32, copy=True)
+    if slot.current_positions_world.shape == downloaded_positions.shape:
+        np.copyto(slot.current_positions_world, downloaded_positions, casting="unsafe")
+    else:
+        slot.current_positions_world = np.array(downloaded_positions, dtype=np.float32, copy=True)
+    if perf is not None:
+        perf.download_ms += _elapsed_ms(started)
+
+
 def _step_session_slots(session: SceneSession, download_positions, perf: FramePerf | None = None) -> None:
     dynamic_colliders_enabled = _session_dynamic_colliders_enabled(session)
+    sample_all_dynamic_slot_diagnostics = _env_enabled("SSBL_DYNAMIC_SLOT_DIAGNOSTICS_ALL", False)
+    global_dynamic_scene_enabled = False
     if dynamic_colliders_enabled:
         _prepare_cross_cloth_collider_caches(session, perf)
+        global_dynamic_scene_enabled = _update_global_dynamic_scene(session, perf)
+    deferred_download_slots: list[ClothSlot] = []
     for slot_name in session.solve_order:
         slot = session.slots[slot_name]
         should_download = _slot_should_download(download_positions, slot_name)
-        if dynamic_colliders_enabled:
+        if dynamic_colliders_enabled and not global_dynamic_scene_enabled:
             started = time.perf_counter()
             pack_started = time.perf_counter()
             dynamic_triangles, dynamic_indexed_triangles, dynamic_particles = _collect_cross_cloth_colliders(session, slot, perf)
@@ -2411,7 +2570,10 @@ def _step_session_slots(session: SceneSession, download_positions, perf: FramePe
                 perf.frame_input_upload_ms += elapsed
         started = time.perf_counter()
         is_last_slot = slot_name == session.solve_order[-1]
-        sample_diagnostics = bool(should_download or (dynamic_colliders_enabled and is_last_slot))
+        sample_diagnostics = bool(
+            should_download
+            and (not dynamic_colliders_enabled or sample_all_dynamic_slot_diagnostics)
+        ) or bool(dynamic_colliders_enabled and is_last_slot)
         slot.native.step(
             slot.substeps,
             slot.iterations,
@@ -2421,18 +2583,12 @@ def _step_session_slots(session: SceneSession, download_positions, perf: FramePe
         if perf is not None:
             perf.cuda_step_call_ms += _elapsed_ms(started)
         if should_download or dynamic_colliders_enabled:
-            started = time.perf_counter()
-            downloaded_positions = np.asarray(slot.native.download_positions(), dtype=np.float32)
-            if slot.previous_positions_world.shape == slot.current_positions_world.shape:
-                np.copyto(slot.previous_positions_world, slot.current_positions_world, casting="unsafe")
+            if dynamic_colliders_enabled:
+                deferred_download_slots.append(slot)
             else:
-                slot.previous_positions_world = np.array(slot.current_positions_world, dtype=np.float32, copy=True)
-            if slot.current_positions_world.shape == downloaded_positions.shape:
-                np.copyto(slot.current_positions_world, downloaded_positions, casting="unsafe")
-            else:
-                slot.current_positions_world = np.array(downloaded_positions, dtype=np.float32, copy=True)
-            if perf is not None:
-                perf.download_ms += _elapsed_ms(started)
+                _download_slot_positions(slot, perf)
+    for slot in deferred_download_slots:
+        _download_slot_positions(slot, perf)
 
 
 def _empty_dynamic_particles() -> dict[str, np.ndarray]:
@@ -3050,6 +3206,123 @@ def _cross_cloth_slots_enabled(session: SceneSession) -> bool:
 
 def _session_dynamic_colliders_enabled(session: SceneSession) -> bool:
     return _session_has_dynamic_collision_sources(session) or _cross_cloth_slots_enabled(session)
+
+
+def _session_can_use_global_dynamic_scene(session: SceneSession) -> bool:
+    if not _cross_cloth_slots_enabled(session):
+        return False
+    if _session_has_dynamic_collision_sources(session):
+        return False
+    if os.environ.get("SSBL_DISABLE_GLOBAL_DYNAMIC_SCENE", "").lower() in {"1", "true", "yes", "on"}:
+        return False
+    return all(bool(getattr(slot.native, "supports_global_dynamic_scene", False)) for slot in session.slots.values())
+
+
+def _ensure_global_dynamic_scene(session: SceneSession) -> NativeGlobalDynamicScene | None:
+    if not _session_can_use_global_dynamic_scene(session):
+        if session.global_dynamic_scene is not None:
+            try:
+                session.global_dynamic_scene.close()
+            except Exception:
+                pass
+        session.global_dynamic_scene = None
+        session.global_dynamic_scene_enabled = False
+        return None
+    if session.global_dynamic_scene is None:
+        session.global_dynamic_scene = NativeGlobalDynamicScene()
+    if not session.global_dynamic_source_ids or set(session.global_dynamic_source_ids.keys()) != set(session.solve_order):
+        session.global_dynamic_source_ids = {
+            name: index + 1
+            for index, name in enumerate(session.solve_order)
+        }
+    session.global_dynamic_scene_enabled = True
+    return session.global_dynamic_scene
+
+
+def _update_global_dynamic_scene(session: SceneSession, perf: FramePerf | None = None) -> bool:
+    scene = _ensure_global_dynamic_scene(session)
+    if scene is None:
+        for slot in session.slots.values():
+            slot.native.clear_global_dynamic_scene()
+        return False
+    started = time.perf_counter()
+    positions_list: list[np.ndarray] = []
+    previous_list: list[np.ndarray] = []
+    radii_list: list[np.ndarray] = []
+    source_id_list: list[np.ndarray] = []
+    layer_list: list[np.ndarray] = []
+    triangle_list: list[np.ndarray] = []
+    triangle_source_id_list: list[np.ndarray] = []
+    triangle_layer_list: list[np.ndarray] = []
+    collision_margin = 0.0
+    cloth_thickness = 0.0
+    for slot_name in session.solve_order:
+        slot = session.slots[slot_name]
+        cache = slot.dynamic_collider_cache
+        positions = np.ascontiguousarray(cache.particle_positions, dtype=np.float32).reshape((-1, 3))
+        if len(positions) == 0:
+            continue
+        previous = np.ascontiguousarray(slot.previous_positions_world, dtype=np.float32).reshape((-1, 3))
+        if previous.shape != positions.shape:
+            previous = positions
+        source_id = int(session.global_dynamic_source_ids.get(slot_name, 0))
+        layer = int(slot.collision_layer)
+        positions_list.append(positions)
+        previous_list.append(previous)
+        radii_list.append(np.ascontiguousarray(cache.particle_radii, dtype=np.float32).reshape((-1,)))
+        source_id_list.append(np.full(len(positions), source_id, dtype=np.int32))
+        layer_list.append(np.full(len(positions), layer, dtype=np.int32))
+        triangles = np.ascontiguousarray(cache.triangles, dtype=np.float32).reshape((-1, 3, 3))
+        if len(triangles) > 0:
+            triangle_list.append(triangles)
+            triangle_source_id_list.append(np.full(len(triangles), source_id, dtype=np.int32))
+            triangle_layer_list.append(np.full(len(triangles), layer, dtype=np.int32))
+        collision_margin = max(collision_margin, float(slot.external_contact_distance))
+        cloth_thickness = max(cloth_thickness, float(getattr(slot.native.cached_diagnostics(), "min_gap", 0.0) or 0.0))
+    if positions_list:
+        particle_positions = _single_or_concat_float32(positions_list, (0, 3))
+        particle_previous = _single_or_concat_float32(previous_list, (0, 3))
+        particle_radii = _single_or_concat_float32(radii_list, (0,)).reshape((-1,))
+        particle_source_ids = _single_or_concat_int32(source_id_list)
+        particle_layers = _single_or_concat_int32(layer_list)
+    else:
+        particle_positions = np.empty((0, 3), dtype=np.float32)
+        particle_previous = np.empty((0, 3), dtype=np.float32)
+        particle_radii = np.empty(0, dtype=np.float32)
+        particle_source_ids = np.empty(0, dtype=np.int32)
+        particle_layers = np.empty(0, dtype=np.int32)
+    if triangle_list:
+        triangle_vertices = _single_or_concat_float32(triangle_list, (0, 3, 3))
+        triangle_source_ids = _single_or_concat_int32(triangle_source_id_list)
+        triangle_layers = _single_or_concat_int32(triangle_layer_list)
+    else:
+        triangle_vertices = np.empty((0, 3, 3), dtype=np.float32)
+        triangle_source_ids = np.empty(0, dtype=np.int32)
+        triangle_layers = np.empty(0, dtype=np.int32)
+    scene.update(
+        particle_positions=particle_positions,
+        particle_prev_positions=particle_previous,
+        particle_radii=particle_radii,
+        particle_source_ids=particle_source_ids,
+        particle_collision_layers=particle_layers,
+        triangle_vertices=triangle_vertices,
+        triangle_source_ids=triangle_source_ids,
+        triangle_collision_layers=triangle_layers,
+        collision_margin=collision_margin,
+        cloth_thickness=collision_margin,
+    )
+    if perf is not None:
+        perf.dynamic_collider_pack_ms += _elapsed_ms(started)
+        perf.dynamic_triangle_count += int(len(triangle_vertices))
+        perf.dynamic_particle_count += int(len(particle_positions))
+    for slot_name, slot in session.slots.items():
+        slot.native.attach_global_dynamic_scene(
+            scene,
+            target_source_id=int(session.global_dynamic_source_ids.get(slot_name, 0)),
+            target_collision_layer=int(slot.collision_layer),
+            cross_mode=session.cross_cloth_mode,
+        )
+    return True
 
 
 def _prepare_cross_cloth_collider_caches(session: SceneSession, perf: FramePerf | None = None) -> None:
@@ -3675,6 +3948,18 @@ def _finish_session(session: SceneSession, status: str, *, finalize_realtime_cac
         _LAST_DIAGNOSTICS[source_name] = session.last_diagnostics
         if _STATUS.get(source_name) == STATUS_PREVIEW_RUNNING:
             _STATUS[source_name] = status
+    if session.global_dynamic_scene is not None:
+        for slot in session.slots.values():
+            try:
+                slot.native.clear_global_dynamic_scene()
+            except Exception:
+                pass
+        try:
+            session.global_dynamic_scene.close()
+        except Exception:
+            pass
+        session.global_dynamic_scene = None
+        session.global_dynamic_scene_enabled = False
 
     for slot in list(session.slots.values()):
         _LAST_DIAGNOSTICS[slot.object_name] = session.last_diagnostics
@@ -3904,6 +4189,12 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
     dynamic_triangle_large_primitive_count = 0
     dynamic_triangle_aabb_reject_count = 0
     dynamic_triangle_max_bucket_occupancy = 0
+    global_dynamic_scene_pack_ms = 0.0
+    global_dynamic_scene_upload_ms = 0.0
+    global_dynamic_hash_ms = 0.0
+    global_dynamic_particle_count = 0
+    global_dynamic_triangle_count = 0
+    global_dynamic_hash_overflow = 0
     static_triangle_count = 0
     fast_exact_vt_candidates = 0
     fast_exact_vt_projected = 0
@@ -4041,6 +4332,12 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
             dynamic_triangle_max_bucket_occupancy,
             int(diag.dynamic_triangle_max_bucket_occupancy)
         )
+        global_dynamic_scene_pack_ms = max(global_dynamic_scene_pack_ms, float(diag.global_dynamic_scene_pack_ms))
+        global_dynamic_scene_upload_ms = max(global_dynamic_scene_upload_ms, float(diag.global_dynamic_scene_upload_ms))
+        global_dynamic_hash_ms = max(global_dynamic_hash_ms, float(diag.global_dynamic_hash_ms))
+        global_dynamic_particle_count = max(global_dynamic_particle_count, int(diag.global_dynamic_particle_count))
+        global_dynamic_triangle_count = max(global_dynamic_triangle_count, int(diag.global_dynamic_triangle_count))
+        global_dynamic_hash_overflow = max(global_dynamic_hash_overflow, int(diag.global_dynamic_hash_overflow))
         static_triangle_count += int(diag.static_triangle_count)
         fast_exact_vt_candidates += int(diag.fast_exact_vt_candidates)
         fast_exact_vt_projected += int(diag.fast_exact_vt_projected)
@@ -4182,6 +4479,16 @@ def _aggregate_session_diagnostics(session: SceneSession, perf: FramePerf | None
         dynamic_triangle_large_primitive_count=dynamic_triangle_large_primitive_count,
         dynamic_triangle_aabb_reject_count=dynamic_triangle_aabb_reject_count,
         dynamic_triangle_max_bucket_occupancy=dynamic_triangle_max_bucket_occupancy,
+        global_dynamic_scene_pack_ms=(
+            perf.dynamic_collider_pack_ms
+            if perf is not None and session.global_dynamic_scene_enabled
+            else global_dynamic_scene_pack_ms
+        ),
+        global_dynamic_scene_upload_ms=global_dynamic_scene_upload_ms,
+        global_dynamic_hash_ms=global_dynamic_hash_ms,
+        global_dynamic_particle_count=global_dynamic_particle_count,
+        global_dynamic_triangle_count=global_dynamic_triangle_count,
+        global_dynamic_hash_overflow=global_dynamic_hash_overflow,
         static_triangle_count=static_triangle_count,
         fast_exact_vt_candidates=fast_exact_vt_candidates,
         fast_exact_vt_projected=fast_exact_vt_projected,

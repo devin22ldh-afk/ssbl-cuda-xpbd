@@ -164,6 +164,9 @@ constexpr float kAbi41PcgStatusZeroResidual = 2.0f;
 constexpr float kAbi41PcgStatusBadDAD = 3.0f;
 constexpr float kAbi41PcgStatusBadAlpha = 4.0f;
 constexpr int kAbi41MaxForceFields = 64;
+constexpr int kAbi41CrossModeOff = 0;
+constexpr int kAbi41CrossModeAllSelected = 1;
+constexpr int kAbi41CrossModeLowerLayers = 2;
 constexpr int kAbi41ForceFieldWind = 1;
 constexpr int kAbi41ForceFieldForce = 2;
 constexpr int kAbi41ForceFieldVortex = 3;
@@ -302,6 +305,61 @@ struct ReconPair {
 };
 
 static_assert(sizeof(ReconPair) == 8, "ReconPair must match ABI int2 stride.");
+
+struct ReconGlobalDynamicScene {
+    Vec3* particle_positions = nullptr;
+    Vec3* particle_prev_positions = nullptr;
+    float* particle_radii = nullptr;
+    int* particle_source_ids = nullptr;
+    int* particle_collision_layers = nullptr;
+    int* particle_bucket_counts = nullptr;
+    int* particle_bucket_indices = nullptr;
+    int* particle_cell_coords = nullptr;
+    int particle_count = 0;
+    int particle_capacity = 0;
+    int particle_cell_capacity = 0;
+    int particle_hash_bucket_count = 0;
+    int particle_hash_ready = 0;
+    float particle_hash_cell_size = 0.0f;
+    int particle_hash_cell_count = 0;
+    std::uint64_t particle_radius_signature = 0;
+    int particle_motion_valid = 0;
+
+    Vec3* triangle_vertices = nullptr;
+    int* triangle_source_ids = nullptr;
+    int* triangle_collision_layers = nullptr;
+    Vec3* triangle_aabb_min = nullptr;
+    Vec3* triangle_aabb_max = nullptr;
+    Vec3* triangle_center = nullptr;
+    Vec3* triangle_prev_center = nullptr;
+    float* triangle_radius = nullptr;
+    int* triangle_bucket_counts = nullptr;
+    int* triangle_bucket_indices = nullptr;
+    int* triangle_bucket_offsets = nullptr;
+    int* triangle_bucket_cursors = nullptr;
+    int* triangle_cell_coords = nullptr;
+    int* triangle_cell_max_coords = nullptr;
+    int* triangle_large_indices = nullptr;
+    int* triangle_large_count = nullptr;
+    int* triangle_max_bucket_occupancy = nullptr;
+    int triangle_count = 0;
+    int triangle_capacity = 0;
+    int triangle_bounds_capacity = 0;
+    int triangle_cell_capacity = 0;
+    int triangle_bucket_index_capacity = 0;
+    int triangle_hash_bucket_count = 0;
+    int triangle_hash_ready = 0;
+    float triangle_hash_cell_size = 0.0f;
+    int triangle_hash_cell_count = 0;
+    int triangle_motion_valid = 0;
+
+    float collision_margin = 0.0f;
+    float cloth_thickness = 0.0f;
+    float pending_upload_ms = 0.0f;
+    float pending_hash_ms = 0.0f;
+    long long hash_overflow = 0ll;
+    unsigned long long* counts = nullptr;
+};
 
 struct ReconCSRTextureObject {
     cudaTextureObject_t tex = 0;
@@ -450,6 +508,14 @@ struct Abi41Solver {
     int dynamic_particle_hash_cell_count = 0;
     std::uint64_t dynamic_particle_radius_signature = 0;
     float pending_dynamic_particle_upload_ms = 0.0f;
+    int* dynamic_particle_source_ids = nullptr;
+    int* dynamic_particle_collision_layers = nullptr;
+    int* dynamic_triangle_source_ids = nullptr;
+    int* dynamic_triangle_collision_layers = nullptr;
+    ReconGlobalDynamicScene* global_dynamic_scene = nullptr;
+    int global_dynamic_target_source_id = 0;
+    int global_dynamic_target_collision_layer = 0;
+    int global_dynamic_cross_mode = kAbi41CrossModeOff;
     SsblXpbdForceField* force_fields = nullptr;
     int force_field_capacity = 0;
     int force_field_count = 0;
@@ -3556,7 +3622,7 @@ __device__ float dynamic_triangle_query_margin(Abi41Solver solver, float contact
 
 __device__ int dynamic_triangle_query_cell_radius(Abi41Solver solver, float query_margin, int signed_inside_only) {
     if (solver.dynamic_triangle_signed_collision == 0) {
-        return 1;
+        return 0;
     }
     if (signed_inside_only == 0) {
         return 1;
@@ -3915,6 +3981,21 @@ __device__ bool dynamic_triangle_candidate_matches_query_cell(
     return query_cx == canonical_x && query_cy == canonical_y && query_cz == canonical_z;
 }
 
+__device__ bool dynamic_source_enabled_for_target(Abi41Solver solver, int source_id, int source_layer) {
+    const int mode = solver.global_dynamic_cross_mode;
+    if (mode == kAbi41CrossModeOff) {
+        return true;
+    }
+    if (solver.global_dynamic_target_source_id != 0
+        && source_id == solver.global_dynamic_target_source_id) {
+        return false;
+    }
+    if (mode == kAbi41CrossModeLowerLayers) {
+        return source_layer < solver.global_dynamic_target_collision_layer;
+    }
+    return true;
+}
+
 __device__ void consider_dynamic_triangle_candidate(
     Abi41Solver solver,
     int triangle,
@@ -3935,6 +4016,13 @@ __device__ void consider_dynamic_triangle_candidate(
 ) {
     if (triangle < 0 || triangle >= solver.dynamic_triangle_count) {
         return;
+    }
+    if (solver.dynamic_triangle_source_ids) {
+        const int source_id = solver.dynamic_triangle_source_ids[triangle];
+        const int source_layer = solver.dynamic_triangle_collision_layers ? solver.dynamic_triangle_collision_layers[triangle] : 0;
+        if (!dynamic_source_enabled_for_target(solver, source_id, source_layer)) {
+            return;
+        }
     }
     if (candidate_count) {
         *candidate_count += 1u;
@@ -4277,6 +4365,13 @@ __device__ void consider_dynamic_particle_candidate(
 ) {
     if (particle < 0 || particle >= solver.dynamic_particle_count) {
         return;
+    }
+    if (solver.dynamic_particle_source_ids) {
+        const int source_id = solver.dynamic_particle_source_ids[particle];
+        const int source_layer = solver.dynamic_particle_collision_layers ? solver.dynamic_particle_collision_layers[particle] : 0;
+        if (!dynamic_source_enabled_for_target(solver, source_id, source_layer)) {
+            return;
+        }
     }
     Vec3 center = solver.dynamic_particle_positions[particle];
     float radius = fmaxf(solver.dynamic_particle_radii[particle], 0.0f) + margin;
@@ -6353,6 +6448,339 @@ bool build_dynamic_particle_hash(Abi41Solver* solver) {
     return set_cuda_error(cudaGetLastError(), "build dynamic particle hash");
 }
 
+void bind_global_scene_to_proxy(ReconGlobalDynamicScene* scene, Abi41Solver* proxy) {
+    if (!scene || !proxy) {
+        return;
+    }
+    proxy->dynamic_triangles = scene->triangle_vertices;
+    proxy->dynamic_triangle_count = scene->triangle_count;
+    proxy->dynamic_triangle_capacity = scene->triangle_capacity;
+    proxy->dynamic_triangle_aabb_min = scene->triangle_aabb_min;
+    proxy->dynamic_triangle_aabb_max = scene->triangle_aabb_max;
+    proxy->dynamic_triangle_center = scene->triangle_center;
+    proxy->dynamic_triangle_prev_center = scene->triangle_prev_center;
+    proxy->dynamic_triangle_radius = scene->triangle_radius;
+    proxy->dynamic_triangle_bounds_capacity = scene->triangle_bounds_capacity;
+    proxy->dynamic_triangle_bucket_counts = scene->triangle_bucket_counts;
+    proxy->dynamic_triangle_bucket_indices = scene->triangle_bucket_indices;
+    proxy->dynamic_triangle_bucket_offsets = scene->triangle_bucket_offsets;
+    proxy->dynamic_triangle_bucket_cursors = scene->triangle_bucket_cursors;
+    proxy->dynamic_triangle_cell_coords = scene->triangle_cell_coords;
+    proxy->dynamic_triangle_cell_max_coords = scene->triangle_cell_max_coords;
+    proxy->dynamic_triangle_cell_capacity = scene->triangle_cell_capacity;
+    proxy->dynamic_triangle_bucket_index_capacity = scene->triangle_bucket_index_capacity;
+    proxy->dynamic_triangle_hash_bucket_count = scene->triangle_hash_bucket_count;
+    proxy->dynamic_triangle_hash_ready = scene->triangle_hash_ready;
+    proxy->dynamic_triangle_hash_cell_size = scene->triangle_hash_cell_size;
+    proxy->dynamic_triangle_hash_cell_count = scene->triangle_hash_cell_count;
+    proxy->dynamic_triangle_large_indices = scene->triangle_large_indices;
+    proxy->dynamic_triangle_large_count = scene->triangle_large_count;
+    proxy->dynamic_triangle_max_bucket_occupancy = scene->triangle_max_bucket_occupancy;
+    proxy->dynamic_triangle_motion_valid = scene->triangle_motion_valid;
+    proxy->dynamic_triangle_signed_collision = 0;
+    proxy->dynamic_triangle_source_ids = scene->triangle_source_ids;
+    proxy->dynamic_triangle_collision_layers = scene->triangle_collision_layers;
+
+    proxy->dynamic_particle_positions = scene->particle_positions;
+    proxy->dynamic_particle_prev_positions = scene->particle_prev_positions;
+    proxy->dynamic_particle_radii = scene->particle_radii;
+    proxy->dynamic_particle_count = scene->particle_count;
+    proxy->dynamic_particle_capacity = scene->particle_capacity;
+    proxy->dynamic_particle_cell_coords = scene->particle_cell_coords;
+    proxy->dynamic_particle_cell_capacity = scene->particle_cell_capacity;
+    proxy->dynamic_particle_bucket_counts = scene->particle_bucket_counts;
+    proxy->dynamic_particle_bucket_indices = scene->particle_bucket_indices;
+    proxy->dynamic_particle_hash_bucket_count = scene->particle_hash_bucket_count;
+    proxy->dynamic_particle_hash_ready = scene->particle_hash_ready;
+    proxy->dynamic_particle_hash_cell_size = scene->particle_hash_cell_size;
+    proxy->dynamic_particle_hash_cell_count = scene->particle_hash_cell_count;
+    proxy->dynamic_particle_motion_valid = scene->particle_motion_valid;
+    proxy->dynamic_particle_radius_signature = scene->particle_radius_signature;
+    proxy->dynamic_particle_source_ids = scene->particle_source_ids;
+    proxy->dynamic_particle_collision_layers = scene->particle_collision_layers;
+
+    proxy->abi41_counts = scene->counts;
+}
+
+void store_proxy_to_global_scene(Abi41Solver* proxy, ReconGlobalDynamicScene* scene) {
+    if (!scene || !proxy) {
+        return;
+    }
+    scene->triangle_vertices = proxy->dynamic_triangles;
+    scene->triangle_count = proxy->dynamic_triangle_count;
+    scene->triangle_capacity = proxy->dynamic_triangle_capacity;
+    scene->triangle_aabb_min = proxy->dynamic_triangle_aabb_min;
+    scene->triangle_aabb_max = proxy->dynamic_triangle_aabb_max;
+    scene->triangle_center = proxy->dynamic_triangle_center;
+    scene->triangle_prev_center = proxy->dynamic_triangle_prev_center;
+    scene->triangle_radius = proxy->dynamic_triangle_radius;
+    scene->triangle_bounds_capacity = proxy->dynamic_triangle_bounds_capacity;
+    scene->triangle_bucket_counts = proxy->dynamic_triangle_bucket_counts;
+    scene->triangle_bucket_indices = proxy->dynamic_triangle_bucket_indices;
+    scene->triangle_bucket_offsets = proxy->dynamic_triangle_bucket_offsets;
+    scene->triangle_bucket_cursors = proxy->dynamic_triangle_bucket_cursors;
+    scene->triangle_cell_coords = proxy->dynamic_triangle_cell_coords;
+    scene->triangle_cell_max_coords = proxy->dynamic_triangle_cell_max_coords;
+    scene->triangle_cell_capacity = proxy->dynamic_triangle_cell_capacity;
+    scene->triangle_bucket_index_capacity = proxy->dynamic_triangle_bucket_index_capacity;
+    scene->triangle_hash_bucket_count = proxy->dynamic_triangle_hash_bucket_count;
+    scene->triangle_hash_ready = proxy->dynamic_triangle_hash_ready;
+    scene->triangle_hash_cell_size = proxy->dynamic_triangle_hash_cell_size;
+    scene->triangle_hash_cell_count = proxy->dynamic_triangle_hash_cell_count;
+    scene->triangle_large_indices = proxy->dynamic_triangle_large_indices;
+    scene->triangle_large_count = proxy->dynamic_triangle_large_count;
+    scene->triangle_max_bucket_occupancy = proxy->dynamic_triangle_max_bucket_occupancy;
+    scene->triangle_motion_valid = proxy->dynamic_triangle_motion_valid;
+
+    scene->particle_positions = proxy->dynamic_particle_positions;
+    scene->particle_prev_positions = proxy->dynamic_particle_prev_positions;
+    scene->particle_radii = proxy->dynamic_particle_radii;
+    scene->particle_count = proxy->dynamic_particle_count;
+    scene->particle_capacity = proxy->dynamic_particle_capacity;
+    scene->particle_cell_coords = proxy->dynamic_particle_cell_coords;
+    scene->particle_cell_capacity = proxy->dynamic_particle_cell_capacity;
+    scene->particle_bucket_counts = proxy->dynamic_particle_bucket_counts;
+    scene->particle_bucket_indices = proxy->dynamic_particle_bucket_indices;
+    scene->particle_hash_bucket_count = proxy->dynamic_particle_hash_bucket_count;
+    scene->particle_hash_ready = proxy->dynamic_particle_hash_ready;
+    scene->particle_hash_cell_size = proxy->dynamic_particle_hash_cell_size;
+    scene->particle_hash_cell_count = proxy->dynamic_particle_hash_cell_count;
+    scene->particle_motion_valid = proxy->dynamic_particle_motion_valid;
+    scene->particle_radius_signature = proxy->dynamic_particle_radius_signature;
+}
+
+Abi41Solver global_dynamic_launch_solver(const Abi41Solver* solver) {
+    Abi41Solver launch = *solver;
+    if (solver && solver->global_dynamic_scene) {
+        bind_global_scene_to_proxy(solver->global_dynamic_scene, &launch);
+        launch.abi41_counts = solver->abi41_counts;
+        launch.global_dynamic_scene = solver->global_dynamic_scene;
+        launch.global_dynamic_target_source_id = solver->global_dynamic_target_source_id;
+        launch.global_dynamic_target_collision_layer = solver->global_dynamic_target_collision_layer;
+        launch.global_dynamic_cross_mode = solver->global_dynamic_cross_mode;
+        launch.dynamic_triangle_signed_collision = 0;
+    }
+    return launch;
+}
+
+float max_dynamic_triangle_extent(const float* triangles, int triangle_count) {
+    float max_extent = 0.0f;
+    const Vec3* triangle_vecs = reinterpret_cast<const Vec3*>(triangles);
+    if (!triangle_vecs) {
+        return max_extent;
+    }
+    for (int t = 0; t < triangle_count; ++t) {
+        const Vec3 a = triangle_vecs[t * 3 + 0];
+        const Vec3 b = triangle_vecs[t * 3 + 1];
+        const Vec3 c = triangle_vecs[t * 3 + 2];
+        const float min_x = std::min(a.x, std::min(b.x, c.x));
+        const float min_y = std::min(a.y, std::min(b.y, c.y));
+        const float min_z = std::min(a.z, std::min(b.z, c.z));
+        const float max_x = std::max(a.x, std::max(b.x, c.x));
+        const float max_y = std::max(a.y, std::max(b.y, c.y));
+        const float max_z = std::max(a.z, std::max(b.z, c.z));
+        const float extent = std::max(max_x - min_x, std::max(max_y - min_y, max_z - min_z));
+        if (std::isfinite(extent) && extent >= 0.0f) {
+            max_extent = std::max(max_extent, extent);
+        }
+    }
+    return max_extent;
+}
+
+float dynamic_triangle_hash_cell_size_for_source(
+    float max_extent,
+    float margin,
+    float thickness,
+    bool indexed_dynamic_source
+);
+
+bool update_global_dynamic_scene(ReconGlobalDynamicScene* scene, const SsblXpbdGlobalDynamicSceneInputs* inputs) {
+    const auto started = std::chrono::high_resolution_clock::now();
+    if (!scene || !inputs) {
+        return set_error("invalid global dynamic scene update");
+    }
+    const int particle_count = std::max(inputs->particle_count, 0);
+    const int triangle_count = std::max(inputs->triangle_count, 0);
+    if (particle_count > 0 && (!inputs->particle_positions || !inputs->particle_radii || !inputs->particle_source_ids || !inputs->particle_collision_layers)) {
+        return set_error("global dynamic particle arrays are incomplete");
+    }
+    if (triangle_count > 0 && (!inputs->triangle_vertices || !inputs->triangle_source_ids || !inputs->triangle_collision_layers)) {
+        return set_error("global dynamic triangle arrays are incomplete");
+    }
+    scene->collision_margin = std::max(inputs->collision_margin, 0.0f);
+    scene->cloth_thickness = std::max(inputs->cloth_thickness, 0.0f);
+    scene->pending_upload_ms = 0.0f;
+    scene->pending_hash_ms = 0.0f;
+    scene->hash_overflow = 0ll;
+
+    if (!scene->counts
+        && !alloc_and_copy(&scene->counts, static_cast<const unsigned long long*>(nullptr), kAbi41CountSlots, "global dynamic scene counts allocation")) {
+        return false;
+    }
+    if (!set_cuda_error(cudaMemset(scene->counts, 0, sizeof(unsigned long long) * kAbi41CountSlots), "reset global dynamic scene counts")) {
+        return false;
+    }
+
+    if (particle_count == 0) {
+        scene->particle_count = 0;
+        scene->particle_hash_ready = 0;
+        scene->particle_hash_cell_count = 0;
+        scene->particle_motion_valid = 0;
+    } else {
+        float max_radius = 0.0f;
+        const std::uint64_t radius_signature = hash_dynamic_particle_radii(inputs->particle_radii, particle_count, &max_radius);
+        const bool radii_changed = (
+            scene->particle_radius_signature != radius_signature
+            || scene->particle_hash_cell_count != particle_count
+            || !scene->particle_radii
+        );
+        if (scene->particle_hash_cell_size <= 0.0f || radii_changed) {
+            scene->particle_hash_cell_size = std::max(std::max(max_radius + scene->collision_margin, scene->cloth_thickness), 1.0e-3f);
+            scene->particle_hash_cell_count = particle_count;
+            scene->particle_radius_signature = radius_signature;
+        }
+        const bool had_previous = scene->particle_positions
+            && scene->particle_prev_positions
+            && scene->particle_count == particle_count;
+        if (particle_count > scene->particle_capacity) {
+            cudaFree(scene->particle_positions);
+            cudaFree(scene->particle_prev_positions);
+            cudaFree(scene->particle_radii);
+            cudaFree(scene->particle_source_ids);
+            cudaFree(scene->particle_collision_layers);
+            scene->particle_positions = nullptr;
+            scene->particle_prev_positions = nullptr;
+            scene->particle_radii = nullptr;
+            scene->particle_source_ids = nullptr;
+            scene->particle_collision_layers = nullptr;
+            scene->particle_capacity = 0;
+            if (!alloc_and_copy(&scene->particle_positions, reinterpret_cast<const Vec3*>(inputs->particle_positions), particle_count, "global dynamic particle positions")
+                || !alloc_and_copy(&scene->particle_prev_positions, reinterpret_cast<const Vec3*>(inputs->particle_prev_positions ? inputs->particle_prev_positions : inputs->particle_positions), particle_count, "global dynamic particle previous positions")
+                || !alloc_and_copy(&scene->particle_radii, inputs->particle_radii, particle_count, "global dynamic particle radii")
+                || !alloc_and_copy(&scene->particle_source_ids, inputs->particle_source_ids, particle_count, "global dynamic particle source ids")
+                || !alloc_and_copy(&scene->particle_collision_layers, inputs->particle_collision_layers, particle_count, "global dynamic particle layers")) {
+                return false;
+            }
+            scene->particle_capacity = particle_count;
+        } else {
+            if (!set_cuda_error(cudaMemcpy(scene->particle_positions, inputs->particle_positions, sizeof(Vec3) * particle_count, cudaMemcpyHostToDevice), "global dynamic particle position upload")
+                || !set_cuda_error(cudaMemcpy(scene->particle_prev_positions, inputs->particle_prev_positions ? inputs->particle_prev_positions : inputs->particle_positions, sizeof(Vec3) * particle_count, cudaMemcpyHostToDevice), "global dynamic particle previous upload")
+                || (radii_changed && !set_cuda_error(cudaMemcpy(scene->particle_radii, inputs->particle_radii, sizeof(float) * particle_count, cudaMemcpyHostToDevice), "global dynamic particle radius upload"))
+                || !set_cuda_error(cudaMemcpy(scene->particle_source_ids, inputs->particle_source_ids, sizeof(int) * particle_count, cudaMemcpyHostToDevice), "global dynamic particle source upload")
+                || !set_cuda_error(cudaMemcpy(scene->particle_collision_layers, inputs->particle_collision_layers, sizeof(int) * particle_count, cudaMemcpyHostToDevice), "global dynamic particle layer upload")) {
+                return false;
+            }
+        }
+        scene->particle_count = particle_count;
+        scene->particle_motion_valid = had_previous ? 1 : 0;
+        Abi41Solver proxy{};
+        proxy.cfg.collision_margin = scene->collision_margin;
+        proxy.cfg.cloth_thickness = scene->cloth_thickness;
+        bind_global_scene_to_proxy(scene, &proxy);
+        if (!prepare_dynamic_particle_hash_buffers(&proxy, particle_count)) {
+            store_proxy_to_global_scene(&proxy, scene);
+            return false;
+        }
+        store_proxy_to_global_scene(&proxy, scene);
+    }
+
+    if (triangle_count == 0) {
+        scene->triangle_count = 0;
+        scene->triangle_hash_ready = 0;
+        scene->triangle_hash_cell_count = 0;
+        scene->triangle_motion_valid = 0;
+    } else {
+        const int vertex_count = triangle_count * 3;
+        const bool had_previous = scene->triangle_center
+            && scene->triangle_prev_center
+            && scene->triangle_count == triangle_count;
+        scene->triangle_hash_cell_size = dynamic_triangle_hash_cell_size_for_source(
+            max_dynamic_triangle_extent(inputs->triangle_vertices, triangle_count),
+            scene->collision_margin,
+            scene->cloth_thickness,
+            true
+        );
+        scene->triangle_hash_cell_count = triangle_count;
+        if (triangle_count > scene->triangle_capacity) {
+            cudaFree(scene->triangle_vertices);
+            cudaFree(scene->triangle_source_ids);
+            cudaFree(scene->triangle_collision_layers);
+            scene->triangle_vertices = nullptr;
+            scene->triangle_source_ids = nullptr;
+            scene->triangle_collision_layers = nullptr;
+            scene->triangle_capacity = 0;
+            if (!alloc_and_copy(&scene->triangle_vertices, reinterpret_cast<const Vec3*>(inputs->triangle_vertices), vertex_count, "global dynamic triangle vertices")
+                || !alloc_and_copy(&scene->triangle_source_ids, inputs->triangle_source_ids, triangle_count, "global dynamic triangle source ids")
+                || !alloc_and_copy(&scene->triangle_collision_layers, inputs->triangle_collision_layers, triangle_count, "global dynamic triangle layers")) {
+                return false;
+            }
+            scene->triangle_capacity = triangle_count;
+        } else if (!set_cuda_error(cudaMemcpy(scene->triangle_vertices, inputs->triangle_vertices, sizeof(Vec3) * vertex_count, cudaMemcpyHostToDevice), "global dynamic triangle upload")
+            || !set_cuda_error(cudaMemcpy(scene->triangle_source_ids, inputs->triangle_source_ids, sizeof(int) * triangle_count, cudaMemcpyHostToDevice), "global dynamic triangle source upload")
+            || !set_cuda_error(cudaMemcpy(scene->triangle_collision_layers, inputs->triangle_collision_layers, sizeof(int) * triangle_count, cudaMemcpyHostToDevice), "global dynamic triangle layer upload")) {
+            return false;
+        }
+        scene->triangle_count = triangle_count;
+        scene->triangle_motion_valid = had_previous ? 1 : 0;
+        Abi41Solver proxy{};
+        proxy.cfg.collision_margin = scene->collision_margin;
+        proxy.cfg.cloth_thickness = scene->cloth_thickness;
+        bind_global_scene_to_proxy(scene, &proxy);
+        if (!prepare_dynamic_triangle_hash_buffers(&proxy, triangle_count)) {
+            store_proxy_to_global_scene(&proxy, scene);
+            return false;
+        }
+        store_proxy_to_global_scene(&proxy, scene);
+        if (had_previous
+            && scene->triangle_prev_center
+            && scene->triangle_center
+            && !set_cuda_error(cudaMemcpy(scene->triangle_prev_center, scene->triangle_center, sizeof(Vec3) * triangle_count, cudaMemcpyDeviceToDevice), "preserve global dynamic triangle previous centers")) {
+            return false;
+        }
+        if (scene->triangle_large_count
+            && !set_cuda_error(cudaMemset(scene->triangle_large_count, 0, sizeof(int)), "reset global dynamic triangle large count")) {
+            return false;
+        }
+        Abi41Solver precompute_proxy{};
+        precompute_proxy.cfg.collision_margin = scene->collision_margin;
+        precompute_proxy.cfg.cloth_thickness = scene->cloth_thickness;
+        bind_global_scene_to_proxy(scene, &precompute_proxy);
+        abi41_precompute_dynamic_triangle_bounds_kernel<<<block_count(triangle_count), kThreads>>>(precompute_proxy);
+        if (!set_cuda_error(cudaGetLastError(), "precompute global dynamic triangle bounds")) {
+            return false;
+        }
+        if (!had_previous
+            && scene->triangle_prev_center
+            && scene->triangle_center
+            && !set_cuda_error(cudaMemcpy(scene->triangle_prev_center, scene->triangle_center, sizeof(Vec3) * triangle_count, cudaMemcpyDeviceToDevice), "initialize global dynamic triangle previous centers")) {
+            return false;
+        }
+    }
+
+    scene->pending_upload_ms = elapsed_ms_since(started);
+    const auto hash_started = std::chrono::high_resolution_clock::now();
+    Abi41Solver hash_proxy{};
+    hash_proxy.cfg.collision_margin = scene->collision_margin;
+    hash_proxy.cfg.cloth_thickness = scene->cloth_thickness;
+    bind_global_scene_to_proxy(scene, &hash_proxy);
+    if (!build_dynamic_triangle_hash(&hash_proxy) || !build_dynamic_particle_hash(&hash_proxy)) {
+        store_proxy_to_global_scene(&hash_proxy, scene);
+        return false;
+    }
+    store_proxy_to_global_scene(&hash_proxy, scene);
+    scene->pending_hash_ms = elapsed_ms_since(hash_started);
+    if (scene->counts) {
+        unsigned long long counts[kAbi41CountSlots] = {};
+        if (set_cuda_error(cudaMemcpy(counts, scene->counts, sizeof(counts), cudaMemcpyDeviceToHost), "fetch global dynamic scene counts")) {
+            scene->hash_overflow = static_cast<long long>(counts[kAbi41CountDynamicParticleOverflow])
+                + static_cast<long long>(counts[kAbi41CountDynamicTriangleBucketOverflow]);
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool prepare_self_collision_hash_buffers(Abi41Solver* solver) {
     if (!solver) {
         return true;
@@ -8267,7 +8695,98 @@ bool upload_dynamic_particles(
     return true;
 }
 
+void free_global_dynamic_scene(ReconGlobalDynamicScene* scene) {
+    if (!scene) {
+        return;
+    }
+    cudaFree(scene->particle_positions);
+    cudaFree(scene->particle_prev_positions);
+    cudaFree(scene->particle_radii);
+    cudaFree(scene->particle_source_ids);
+    cudaFree(scene->particle_collision_layers);
+    cudaFree(scene->particle_bucket_counts);
+    cudaFree(scene->particle_bucket_indices);
+    cudaFree(scene->particle_cell_coords);
+    cudaFree(scene->triangle_vertices);
+    cudaFree(scene->triangle_source_ids);
+    cudaFree(scene->triangle_collision_layers);
+    cudaFree(scene->triangle_aabb_min);
+    cudaFree(scene->triangle_aabb_max);
+    cudaFree(scene->triangle_center);
+    cudaFree(scene->triangle_prev_center);
+    cudaFree(scene->triangle_radius);
+    cudaFree(scene->triangle_bucket_counts);
+    cudaFree(scene->triangle_bucket_indices);
+    cudaFree(scene->triangle_bucket_offsets);
+    cudaFree(scene->triangle_bucket_cursors);
+    cudaFree(scene->triangle_cell_coords);
+    cudaFree(scene->triangle_cell_max_coords);
+    cudaFree(scene->triangle_large_indices);
+    cudaFree(scene->triangle_large_count);
+    cudaFree(scene->triangle_max_bucket_occupancy);
+    cudaFree(scene->counts);
+    *scene = ReconGlobalDynamicScene{};
+}
+
 } // namespace
+
+extern "C" SSBL_API void* ssbl_create_global_dynamic_scene(void) {
+    g_last_error.clear();
+    return new ReconGlobalDynamicScene();
+}
+
+extern "C" SSBL_API int ssbl_destroy_global_dynamic_scene(void* scene_handle) {
+    g_last_error.clear();
+    ReconGlobalDynamicScene* scene = reinterpret_cast<ReconGlobalDynamicScene*>(scene_handle);
+    if (!scene) {
+        return 1;
+    }
+    free_global_dynamic_scene(scene);
+    delete scene;
+    return 1;
+}
+
+extern "C" SSBL_API int ssbl_update_global_dynamic_scene(
+    void* scene_handle,
+    const SsblXpbdGlobalDynamicSceneInputs* inputs
+) {
+    g_last_error.clear();
+    ReconGlobalDynamicScene* scene = reinterpret_cast<ReconGlobalDynamicScene*>(scene_handle);
+    return update_global_dynamic_scene(scene, inputs) ? 1 : 0;
+}
+
+extern "C" SSBL_API int ssbl_attach_global_dynamic_scene(
+    void* handle,
+    void* scene_handle,
+    int target_source_id,
+    int target_collision_layer,
+    int collision_mode
+) {
+    g_last_error.clear();
+    Abi41Solver* solver = reinterpret_cast<Abi41Solver*>(handle);
+    ReconGlobalDynamicScene* scene = reinterpret_cast<ReconGlobalDynamicScene*>(scene_handle);
+    if (!solver || !scene) {
+        return set_error("invalid global dynamic scene attach") ? 1 : 0;
+    }
+    solver->global_dynamic_scene = scene;
+    solver->global_dynamic_target_source_id = target_source_id;
+    solver->global_dynamic_target_collision_layer = target_collision_layer;
+    solver->global_dynamic_cross_mode = collision_mode;
+    return 1;
+}
+
+extern "C" SSBL_API int ssbl_clear_global_dynamic_scene(void* handle) {
+    g_last_error.clear();
+    Abi41Solver* solver = reinterpret_cast<Abi41Solver*>(handle);
+    if (!solver) {
+        return set_error("invalid global dynamic scene clear") ? 1 : 0;
+    }
+    solver->global_dynamic_scene = nullptr;
+    solver->global_dynamic_target_source_id = 0;
+    solver->global_dynamic_target_collision_layer = 0;
+    solver->global_dynamic_cross_mode = kAbi41CrossModeOff;
+    return 1;
+}
 
 extern "C" SSBL_API void* ssbl_create_solver(const SsblXpbdConfig* config, const SsblXpbdMesh* mesh) {
     g_last_error.clear();
@@ -8587,17 +9106,33 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
     solver->diag.dynamic_particle_upload_ms = solver->pending_dynamic_particle_upload_ms;
     solver->pending_dynamic_triangle_upload_ms = 0.0f;
     solver->pending_dynamic_particle_upload_ms = 0.0f;
+    const bool use_global_dynamic_scene = (
+        solver->global_dynamic_scene != nullptr
+        && solver->global_dynamic_cross_mode != kAbi41CrossModeOff
+    );
+    if (use_global_dynamic_scene) {
+        ReconGlobalDynamicScene* scene = solver->global_dynamic_scene;
+        solver->diag.dynamic_triangle_count = scene->triangle_count;
+        solver->diag.dynamic_particle_count = scene->particle_count;
+        solver->diag.global_dynamic_scene_upload_ms = scene->pending_upload_ms;
+        solver->diag.global_dynamic_hash_ms = scene->pending_hash_ms;
+        solver->diag.global_dynamic_particle_count = scene->particle_count;
+        solver->diag.global_dynamic_triangle_count = scene->triangle_count;
+        solver->diag.global_dynamic_hash_overflow = scene->hash_overflow;
+    }
     solver->diag.force_field_count = solver->force_field_count;
     solver->diag.unsupported_force_field_count = solver->unsupported_force_field_count;
     populate_static_sdf_diagnostics(solver);
     if (!reset_abi41_counts(solver)) {
         return 0;
     }
-    if (!build_dynamic_triangle_hash(solver)) {
-        return 0;
-    }
-    if (!build_dynamic_particle_hash(solver)) {
-        return 0;
+    if (!use_global_dynamic_scene) {
+        if (!build_dynamic_triangle_hash(solver)) {
+            return 0;
+        }
+        if (!build_dynamic_particle_hash(solver)) {
+            return 0;
+        }
     }
 
     substeps = std::max(substeps, 1);
@@ -8701,18 +9236,19 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
             bool signed_dynamic_prepass_ran = false;
             if (run_dynamic_collision) {
                 const float collider_dt = dynamic_collider_frame_dt(solver, sub_dt);
-                if (solver->dynamic_triangle_count > 0 && solver->dynamic_triangle_signed_collision == 0) {
+                Abi41Solver dynamic_solver = use_global_dynamic_scene ? global_dynamic_launch_solver(solver) : *solver;
+                if (dynamic_solver.dynamic_triangle_count > 0 && dynamic_solver.dynamic_triangle_signed_collision == 0) {
                     const auto dynamic_started = std::chrono::high_resolution_clock::now();
-                    abi41_dynamic_triangle_collision_kernel<<<v_blocks, kThreads>>>(*solver, sub_dt, collider_dt, 0);
+                    abi41_dynamic_triangle_collision_kernel<<<v_blocks, kThreads>>>(dynamic_solver, sub_dt, collider_dt, 0);
                     solver->diag.dynamic_collision_ms += elapsed_ms_since(dynamic_started);
-                } else if (solver->dynamic_triangle_capacity > 0 && solver->dynamic_triangle_signed_collision == 0) {
+                } else if (dynamic_solver.dynamic_triangle_capacity > 0 && dynamic_solver.dynamic_triangle_signed_collision == 0) {
                     solver->diag.dynamic_collision_skipped_launches += 1;
                 }
-                if (solver->dynamic_particle_count > 0 && solver->dynamic_triangle_signed_collision == 0) {
+                if (dynamic_solver.dynamic_particle_count > 0 && dynamic_solver.dynamic_triangle_signed_collision == 0) {
                     const auto dynamic_particle_started = std::chrono::high_resolution_clock::now();
-                    abi41_dynamic_particle_collision_kernel<<<v_blocks, kThreads>>>(*solver, sub_dt, collider_dt);
+                    abi41_dynamic_particle_collision_kernel<<<v_blocks, kThreads>>>(dynamic_solver, sub_dt, collider_dt);
                     solver->diag.dynamic_particle_collision_ms += elapsed_ms_since(dynamic_particle_started);
-                } else if (solver->dynamic_particle_capacity > 0 && solver->dynamic_triangle_signed_collision == 0) {
+                } else if (dynamic_solver.dynamic_particle_capacity > 0 && dynamic_solver.dynamic_triangle_signed_collision == 0) {
                     solver->diag.dynamic_collision_skipped_launches += 1;
                 }
             }
@@ -8888,7 +9424,7 @@ extern "C" SSBL_API int ssbl_get_diagnostics(void* handle, SsblXpbdDiagnostics* 
 }
 
 extern "C" SSBL_API unsigned int ssbl_capabilities(void) {
-    return SSBL_CAP_STRETCH_OPTIMIZATION | SSBL_CAP_PIN_WEIGHTS;
+    return SSBL_CAP_STRETCH_OPTIMIZATION | SSBL_CAP_PIN_WEIGHTS | SSBL_CAP_GLOBAL_DYNAMIC_SCENE;
 }
 
 extern "C" SSBL_API const char* ssbl_last_error(void) {

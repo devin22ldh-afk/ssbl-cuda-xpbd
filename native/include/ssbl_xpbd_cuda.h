@@ -63,7 +63,8 @@ typedef struct SsblXpbdConfig {
 
 enum {
     SSBL_CAP_STRETCH_OPTIMIZATION = 1u << 0,
-    SSBL_CAP_PIN_WEIGHTS = 1u << 1
+    SSBL_CAP_PIN_WEIGHTS = 1u << 1,
+    SSBL_CAP_GLOBAL_DYNAMIC_SCENE = 1u << 2
 };
 
 typedef struct SsblXpbdDiagnostics {
@@ -197,6 +198,12 @@ typedef struct SsblXpbdDiagnostics {
     long long dynamic_triangle_large_primitive_count;
     long long dynamic_triangle_aabb_reject_count;
     long long dynamic_triangle_max_bucket_occupancy;
+    float global_dynamic_scene_pack_ms;
+    float global_dynamic_scene_upload_ms;
+    float global_dynamic_hash_ms;
+    long long global_dynamic_particle_count;
+    long long global_dynamic_triangle_count;
+    long long global_dynamic_hash_overflow;
 } SsblXpbdDiagnostics;
 
 typedef struct SsblXpbdMesh {
@@ -289,6 +296,21 @@ typedef struct SsblXpbdFrameInputs {
     int unsupported_force_field_count;
 } SsblXpbdFrameInputs;
 
+typedef struct SsblXpbdGlobalDynamicSceneInputs {
+    const float* particle_positions;
+    const float* particle_prev_positions;
+    const float* particle_radii;
+    const int* particle_source_ids;
+    const int* particle_collision_layers;
+    int particle_count;
+    const float* triangle_vertices;
+    const int* triangle_source_ids;
+    const int* triangle_collision_layers;
+    int triangle_count;
+    float collision_margin;
+    float cloth_thickness;
+} SsblXpbdGlobalDynamicSceneInputs;
+
 SSBL_API void* ssbl_create_solver(const SsblXpbdConfig* config, const SsblXpbdMesh* mesh);
 SSBL_API int ssbl_destroy_solver(void* handle);
 SSBL_API int ssbl_reset_solver(void* handle);
@@ -303,6 +325,11 @@ SSBL_API int ssbl_step_solver_ex(void* handle, int substeps, int iterations, int
 SSBL_API int ssbl_download_positions(void* handle, float* out_positions, int max_floats);
 SSBL_API int ssbl_get_diagnostics(void* handle, SsblXpbdDiagnostics* out_diag);
 SSBL_API unsigned int ssbl_capabilities(void);
+SSBL_API void* ssbl_create_global_dynamic_scene(void);
+SSBL_API int ssbl_destroy_global_dynamic_scene(void* scene_handle);
+SSBL_API int ssbl_update_global_dynamic_scene(void* scene_handle, const SsblXpbdGlobalDynamicSceneInputs* inputs);
+SSBL_API int ssbl_attach_global_dynamic_scene(void* handle, void* scene_handle, int target_source_id, int target_collision_layer, int collision_mode);
+SSBL_API int ssbl_clear_global_dynamic_scene(void* handle);
 SSBL_API const char* ssbl_last_error(void);
 
 #ifdef __cplusplus
