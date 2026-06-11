@@ -16,9 +16,9 @@
 
 namespace {
 
-using ReconSpring = ssbl_abi41::CudaSpringPBD;
-using ReconSymMat = ssbl_abi41::symMatCuda;
-using ReconTriangle = ssbl_abi41::CudaTriangle;
+using Abi41Spring = ssbl_abi41::CudaSpringPBD;
+using Abi41SymMat = ssbl_abi41::symMatCuda;
+using Abi41Triangle = ssbl_abi41::CudaTriangle;
 
 constexpr int kThreads = 256;
 constexpr float kEps = 1.0e-7f;
@@ -297,7 +297,7 @@ struct Vec3 {
     float z;
 };
 
-static_assert(sizeof(Vec3) == 12, "Recon Vec3 must match CUDA float3 stride.");
+static_assert(sizeof(Vec3) == 12, "ABI41 Vec3 must match CUDA float3 stride.");
 
 struct ReconPair {
     int x;
@@ -364,10 +364,10 @@ struct ReconGlobalDynamicScene {
 struct ReconCSRTextureObject {
     cudaTextureObject_t tex = 0;
 
-    __device__ __forceinline__ ReconSymMat getMatrixBlock(unsigned int index) const {
+    __device__ __forceinline__ Abi41SymMat getMatrixBlock(unsigned int index) const {
         const float4 data1 = tex1Dfetch<float4>(tex, static_cast<int>(index * 2u));
         const float4 data2 = tex1Dfetch<float4>(tex, static_cast<int>(index * 2u + 1u));
-        ReconSymMat mat{};
+        Abi41SymMat mat{};
         mat.m11 = data1.x;
         mat.m12 = data1.y;
         mat.m13 = data1.z;
@@ -405,14 +405,14 @@ struct Abi41Solver {
     float pressure_velocity_rest_scale = kAbi41PressureVelocityRestScale;
     float pressure_velocity_length_scale = 1.0f;
     unsigned int* state_flags = nullptr;
-    ReconSpring* springs = nullptr;
+    Abi41Spring* springs = nullptr;
     int* edge_color_offsets_host = nullptr;
     ReconPair* bends = nullptr;
     float* bend_rest = nullptr;
     int* bend_color_offsets_host = nullptr;
     ReconPair* lra_edges = nullptr;
     float* lra_rest = nullptr;
-    ReconTriangle* triangles = nullptr;
+    Abi41Triangle* triangles = nullptr;
     int* surface_vertex_offsets = nullptr;
     int* surface_vertex_triangles = nullptr;
     int surface_vertex_triangle_count = 0;
@@ -529,8 +529,8 @@ struct Abi41Solver {
     unsigned int* pcg_col_indices = nullptr;
     int* pcg_edge_entry_ij = nullptr;
     int* pcg_edge_entry_ji = nullptr;
-    ReconSymMat* pcg_diag_values = nullptr;
-    ReconSymMat* pcg_preconditioner_inv = nullptr;
+    Abi41SymMat* pcg_diag_values = nullptr;
+    Abi41SymMat* pcg_preconditioner_inv = nullptr;
     float4* pcg_offdiag_texels = nullptr;
     Vec3* pcg_rhs = nullptr;
     Vec3* pcg_solution = nullptr;
@@ -560,7 +560,7 @@ struct Abi41Solver {
 };
 
 bool set_error(const char* message) {
-    g_last_error = message ? message : "unknown ABI41 recon CUDA error";
+    g_last_error = message ? message : "unknown ABI41 CUDA error";
     return false;
 }
 
@@ -1103,7 +1103,7 @@ __device__ float abi41_pcg_stretch_writeback_limit(Abi41Solver solver) {
     );
 }
 
-__host__ __device__ ReconSymMat make_sym_mat(
+__host__ __device__ Abi41SymMat make_sym_mat(
     float m11,
     float m12,
     float m13,
@@ -1111,19 +1111,19 @@ __host__ __device__ ReconSymMat make_sym_mat(
     float m23,
     float m33
 ) {
-    ReconSymMat mat{m11, m12, m13, m22, m23, m33};
+    Abi41SymMat mat{m11, m12, m13, m22, m23, m33};
     return mat;
 }
 
-__host__ __device__ ReconSymMat zero_sym_mat() {
+__host__ __device__ Abi41SymMat zero_sym_mat() {
     return make_sym_mat(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
 }
 
-__host__ __device__ ReconSymMat identity_sym_mat(float scale) {
+__host__ __device__ Abi41SymMat identity_sym_mat(float scale) {
     return make_sym_mat(scale, 0.0f, 0.0f, scale, 0.0f, scale);
 }
 
-__host__ __device__ Vec3 sym_madd(ReconSymMat mat, Vec3 value, Vec3 acc) {
+__host__ __device__ Vec3 sym_madd(Abi41SymMat mat, Vec3 value, Vec3 acc) {
     return make_vec3(
         fma_rn(mat.m13, value.z, fma_rn(mat.m12, value.y, fma_rn(mat.m11, value.x, acc.x))),
         fma_rn(mat.m23, value.z, fma_rn(mat.m22, value.y, fma_rn(mat.m12, value.x, acc.y))),
@@ -1131,11 +1131,11 @@ __host__ __device__ Vec3 sym_madd(ReconSymMat mat, Vec3 value, Vec3 acc) {
     );
 }
 
-__host__ __device__ Vec3 sym_mul(ReconSymMat mat, Vec3 value) {
+__host__ __device__ Vec3 sym_mul(Abi41SymMat mat, Vec3 value) {
     return sym_madd(mat, value, make_vec3(0.0f, 0.0f, 0.0f));
 }
 
-__host__ __device__ ReconSymMat sym_outer(Vec3 normal, float scale) {
+__host__ __device__ Abi41SymMat sym_outer(Vec3 normal, float scale) {
     return make_sym_mat(
         normal.x * normal.x * scale,
         normal.x * normal.y * scale,
@@ -1146,7 +1146,7 @@ __host__ __device__ ReconSymMat sym_outer(Vec3 normal, float scale) {
     );
 }
 
-__device__ void atomic_add_sym(ReconSymMat* dst, ReconSymMat value) {
+__device__ void atomic_add_sym(Abi41SymMat* dst, Abi41SymMat value) {
     atomicAdd(&dst->m11, value.m11);
     atomicAdd(&dst->m12, value.m12);
     atomicAdd(&dst->m13, value.m13);
@@ -1155,7 +1155,7 @@ __device__ void atomic_add_sym(ReconSymMat* dst, ReconSymMat value) {
     atomicAdd(&dst->m33, value.m33);
 }
 
-__device__ ReconSymMat sym_inverse_or_diag(ReconSymMat mat, unsigned long long* guard_count) {
+__device__ Abi41SymMat sym_inverse_or_diag(Abi41SymMat mat, unsigned long long* guard_count) {
     const float a = mat.m11;
     const float b = mat.m12;
     const float c = mat.m13;
@@ -1190,7 +1190,7 @@ __device__ ReconSymMat sym_inverse_or_diag(ReconSymMat mat, unsigned long long* 
     );
 }
 
-__device__ void write_sym_texels(float4* texels, int entry, ReconSymMat value) {
+__device__ void write_sym_texels(float4* texels, int entry, Abi41SymMat value) {
     if (!texels || entry < 0) {
         return;
     }
@@ -1232,7 +1232,7 @@ __device__ int surface_normal_at_vertex(Abi41Solver solver, int vertex, Vec3* ou
         if (t < 0 || t >= solver.cfg.triangle_count) {
             continue;
         }
-        ReconTriangle tri = solver.triangles[t];
+        Abi41Triangle tri = solver.triangles[t];
         int i0 = static_cast<int>(tri.v0);
         int i1 = static_cast<int>(tri.v1);
         int i2 = static_cast<int>(tri.v2);
@@ -1929,7 +1929,7 @@ __global__ void abi41_spring_project_kernel(Abi41Solver solver, float dt) {
     if (s >= solver.cfg.edge_count) {
         return;
     }
-    ReconSpring spring = solver.springs[s];
+    Abi41Spring spring = solver.springs[s];
     int i = static_cast<int>(spring.id0);
     int j = static_cast<int>(spring.id1);
     if (i < 0 || j < 0 || i >= solver.cfg.vertex_count || j >= solver.cfg.vertex_count) {
@@ -2001,7 +2001,7 @@ __global__ void abi41_hard_stretch_polish_accumulate_kernel(Abi41Solver solver, 
         || solver.cfg.stretch_optimization_strength < kAbi41HardStretchPolishStart) {
         return;
     }
-    const ReconSpring spring = solver.springs[s];
+    const Abi41Spring spring = solver.springs[s];
     const int i = static_cast<int>(spring.id0);
     const int j = static_cast<int>(spring.id1);
     if (i < 0 || j < 0 || i >= solver.cfg.vertex_count || j >= solver.cfg.vertex_count || i == j) {
@@ -2141,7 +2141,7 @@ __global__ void abi41_hard_stretch_final_cap_accumulate_range_kernel(Abi41Solver
     if (s < 0 || s >= solver.cfg.edge_count) {
         return;
     }
-    const ReconSpring spring = solver.springs[s];
+    const Abi41Spring spring = solver.springs[s];
     const float rest = spring.rest_length;
     if (!isfinite(rest) || rest <= kEps || rest <= kAbi41TinyStretchRestThreshold) {
         return;
@@ -2257,7 +2257,7 @@ __global__ void abi41_hard_stretch_direct_cap_range_kernel(Abi41Solver solver, i
     if (s < 0 || s >= solver.cfg.edge_count) {
         return;
     }
-    const ReconSpring spring = solver.springs[s];
+    const Abi41Spring spring = solver.springs[s];
     const float rest = spring.rest_length;
     if (!isfinite(rest) || rest <= kEps || rest <= kAbi41TinyStretchRestThreshold) {
         return;
@@ -2405,7 +2405,7 @@ __global__ void abi41_tiny_stretch_accumulate_kernel(Abi41Solver solver, float d
         || solver.cfg.stretch_optimization_strength < kAbi41HardStretchPolishStart) {
         return;
     }
-    const ReconSpring spring = solver.springs[s];
+    const Abi41Spring spring = solver.springs[s];
     const float rest = spring.rest_length;
     if (!isfinite(rest) || rest <= kEps || rest > kAbi41TinyStretchRestThreshold) {
         return;
@@ -2504,7 +2504,7 @@ __global__ void abi41_tiny_stretch_hard_cap_range_kernel(Abi41Solver solver, int
     if (s < 0 || s >= solver.cfg.edge_count) {
         return;
     }
-    const ReconSpring spring = solver.springs[s];
+    const Abi41Spring spring = solver.springs[s];
     const float rest = spring.rest_length;
     if (!isfinite(rest) || rest <= kEps || rest > kAbi41TinyStretchRestThreshold) {
         return;
@@ -2611,7 +2611,7 @@ __global__ void abi41_extreme_stretch_hard_cap_range_kernel(Abi41Solver solver, 
     if (s < 0 || s >= solver.cfg.edge_count) {
         return;
     }
-    const ReconSpring spring = solver.springs[s];
+    const Abi41Spring spring = solver.springs[s];
     const float rest = spring.rest_length;
     if (!isfinite(rest) || rest <= kEps || rest <= kAbi41TinyStretchRestThreshold) {
         return;
@@ -3095,7 +3095,7 @@ __global__ void abi41_pcg_build_stretch_system_kernel(Abi41Solver solver) {
         return;
     }
 
-    const ReconSpring spring = solver.springs[s];
+    const Abi41Spring spring = solver.springs[s];
     const int i = static_cast<int>(spring.id0);
     const int j = static_cast<int>(spring.id1);
     if (i < 0 || j < 0 || i >= solver.cfg.vertex_count || j >= solver.cfg.vertex_count || i == j) {
@@ -3164,7 +3164,7 @@ __global__ void abi41_pcg_build_stretch_system_kernel(Abi41Solver solver) {
     }
 
     const float stiffness = fmaxf(strength, 1.0e-3f);
-    const ReconSymMat block = sym_outer(normal, stiffness);
+    const Abi41SymMat block = sym_outer(normal, stiffness);
     if (active_i) {
         atomic_add_sym(&solver.pcg_diag_values[i], block);
     }
@@ -3172,7 +3172,7 @@ __global__ void abi41_pcg_build_stretch_system_kernel(Abi41Solver solver) {
         atomic_add_sym(&solver.pcg_diag_values[j], block);
     }
     if (active_i && active_j) {
-        const ReconSymMat offdiag = make_sym_mat(
+        const Abi41SymMat offdiag = make_sym_mat(
             -block.m11,
             -block.m12,
             -block.m13,
@@ -3206,7 +3206,7 @@ __global__ void abi41_pcg_finalize_preconditioner_kernel(Abi41Solver solver) {
             solver.pcg_solution[i] = make_vec3(0.0f, 0.0f, 0.0f);
             solver.pcg_preconditioner_inv[i] = identity_sym_mat(1.0f);
         } else {
-            const ReconSymMat inv = sym_inverse_or_diag(solver.pcg_diag_values[i], solver.pcg_guard_count);
+            const Abi41SymMat inv = sym_inverse_or_diag(solver.pcg_diag_values[i], solver.pcg_guard_count);
             const Vec3 r = solver.pcg_rhs[i];
             const Vec3 z = sym_mul(inv, r);
             solver.pcg_preconditioner_inv[i] = inv;
@@ -4574,7 +4574,7 @@ __global__ void abi41_build_self_hash_kernel(Abi41Solver solver) {
     }
 }
 
-__device__ bool abi41_triangle_indices_valid(Abi41Solver solver, ReconTriangle tri) {
+__device__ bool abi41_triangle_indices_valid(Abi41Solver solver, Abi41Triangle tri) {
     const int a = static_cast<int>(tri.v0);
     const int b = static_cast<int>(tri.v1);
     const int c = static_cast<int>(tri.v2);
@@ -4612,7 +4612,7 @@ __device__ void triangle_barycentric(Vec3 p, Vec3 a, Vec3 b, Vec3 c, float* wa, 
     *wc = w / sum;
 }
 
-__device__ bool abi41_rest_vertex_triangle_neighbor(Abi41Solver solver, int vertex, ReconTriangle tri, float target, float onset) {
+__device__ bool abi41_rest_vertex_triangle_neighbor(Abi41Solver solver, int vertex, Abi41Triangle tri, float target, float onset) {
     const int a = static_cast<int>(tri.v0);
     const int b = static_cast<int>(tri.v1);
     const int c = static_cast<int>(tri.v2);
@@ -4639,7 +4639,7 @@ __global__ void abi41_build_self_triangle_hash_kernel(Abi41Solver solver) {
         || solver.self_triangle_hash_bucket_count <= 0) {
         return;
     }
-    const ReconTriangle tri = solver.triangles[triangle_index];
+    const Abi41Triangle tri = solver.triangles[triangle_index];
     if (!abi41_triangle_indices_valid(solver, tri)) {
         return;
     }
@@ -5000,7 +5000,7 @@ __device__ bool abi41_apply_soft_vertex_triangle_pair(
     if (triangle_index < 0 || triangle_index >= solver.cfg.triangle_count || target <= 0.0f || onset <= target) {
         return false;
     }
-    const ReconTriangle tri = solver.triangles[triangle_index];
+    const Abi41Triangle tri = solver.triangles[triangle_index];
     if (!abi41_triangle_indices_valid(solver, tri)) {
         return false;
     }
@@ -5307,7 +5307,7 @@ __global__ void abi41_fast_overlap_island_aggregate_kernel(Abi41Solver solver) {
                         abi41_count(solver, kAbi41CountFastOverlapIslandGuarded);
                         continue;
                     }
-                    const ReconTriangle tri = solver.triangles[triangle_index];
+                    const Abi41Triangle tri = solver.triangles[triangle_index];
                     if (!abi41_triangle_indices_valid(solver, tri)
                         || abi41_rest_vertex_triangle_neighbor(solver, vertex, tri, target, onset)) {
                         continue;
@@ -5442,7 +5442,7 @@ __host__ __device__ float clamp01(float value) {
     return fminf(fmaxf(value, 0.0f), 1.0f);
 }
 
-__device__ bool abi41_edge_indices_valid(Abi41Solver solver, ReconSpring edge) {
+__device__ bool abi41_edge_indices_valid(Abi41Solver solver, Abi41Spring edge) {
     const int a = static_cast<int>(edge.id0);
     const int b = static_cast<int>(edge.id1);
     return a >= 0 && b >= 0
@@ -5451,7 +5451,7 @@ __device__ bool abi41_edge_indices_valid(Abi41Solver solver, ReconSpring edge) {
         && a != b;
 }
 
-__device__ bool abi41_edges_share_vertex(ReconSpring a, ReconSpring b) {
+__device__ bool abi41_edges_share_vertex(Abi41Spring a, Abi41Spring b) {
     return a.id0 == b.id0 || a.id0 == b.id1 || a.id1 == b.id0 || a.id1 == b.id1;
 }
 
@@ -5504,7 +5504,7 @@ __device__ void closest_segment_parameters(
     }
 }
 
-__device__ bool abi41_rest_edges_neighbor(Abi41Solver solver, ReconSpring edge_a, ReconSpring edge_b, float target, float onset) {
+__device__ bool abi41_rest_edges_neighbor(Abi41Solver solver, Abi41Spring edge_a, Abi41Spring edge_b, float target, float onset) {
     if (abi41_edges_share_vertex(edge_a, edge_b)) {
         return true;
     }
@@ -5539,7 +5539,7 @@ __global__ void abi41_build_self_edge_hash_kernel(Abi41Solver solver) {
         || solver.self_edge_hash_bucket_count <= 0) {
         return;
     }
-    const ReconSpring edge = solver.springs[edge_index];
+    const Abi41Spring edge = solver.springs[edge_index];
     if (!abi41_edge_indices_valid(solver, edge)) {
         return;
     }
@@ -5611,8 +5611,8 @@ __device__ bool abi41_apply_soft_edge_edge_pair(
         || onset <= target) {
         return false;
     }
-    const ReconSpring edge_a = solver.springs[edge_a_index];
-    const ReconSpring edge_b = solver.springs[edge_b_index];
+    const Abi41Spring edge_a = solver.springs[edge_a_index];
+    const Abi41Spring edge_b = solver.springs[edge_b_index];
     if (!abi41_edge_indices_valid(solver, edge_a)
         || !abi41_edge_indices_valid(solver, edge_b)) {
         return false;
@@ -5731,7 +5731,7 @@ __global__ void abi41_soft_edge_edge_repulsion_hash_kernel(Abi41Solver solver) {
         || solver.self_edge_hash_bucket_count <= 0) {
         return;
     }
-    const ReconSpring edge = solver.springs[edge_index];
+    const Abi41Spring edge = solver.springs[edge_index];
     if (!abi41_edge_indices_valid(solver, edge)) {
         return;
     }
@@ -7051,13 +7051,13 @@ bool upload_pins(Abi41Solver* solver, const int* indices, const float* positions
 bool build_surface_vertex_triangles(
     Abi41Solver* solver,
     int vertex_count,
-    const std::vector<ReconTriangle>& triangles
+    const std::vector<Abi41Triangle>& triangles
 ) {
     if (!solver || vertex_count <= 0 || triangles.empty()) {
         return true;
     }
     std::vector<int> counts(vertex_count, 0);
-    for (const ReconTriangle& tri : triangles) {
+    for (const Abi41Triangle& tri : triangles) {
         const int i0 = static_cast<int>(tri.v0);
         const int i1 = static_cast<int>(tri.v1);
         const int i2 = static_cast<int>(tri.v2);
@@ -7079,7 +7079,7 @@ bool build_surface_vertex_triangles(
     std::vector<int> cursor(offsets.begin(), offsets.end());
     std::vector<int> incident(offsets.back(), -1);
     for (int t = 0; t < static_cast<int>(triangles.size()); ++t) {
-        const ReconTriangle tri = triangles[t];
+        const Abi41Triangle tri = triangles[t];
         const int i0 = static_cast<int>(tri.v0);
         const int i1 = static_cast<int>(tri.v1);
         const int i2 = static_cast<int>(tri.v2);
@@ -7192,7 +7192,7 @@ float rest_dihedral_angle(
 
 bool prepare_bending_wing_buffers(
     Abi41Solver* solver,
-    const std::vector<ReconTriangle>& triangles,
+    const std::vector<Abi41Triangle>& triangles,
     const Vec3* rest_positions
 ) {
     if (!solver) {
@@ -7219,7 +7219,7 @@ bool prepare_bending_wing_buffers(
     std::vector<uint4> wing_indices;
     std::vector<float2> wing_params;
     const int vertex_count = solver->cfg.vertex_count;
-    for (const ReconTriangle& tri : triangles) {
+    for (const Abi41Triangle& tri : triangles) {
         const int a = static_cast<int>(tri.v0);
         const int b = static_cast<int>(tri.v1);
         const int c = static_cast<int>(tri.v2);
@@ -7303,7 +7303,7 @@ bool prepare_bending_wing_buffers(
 
 bool prepare_pcg_stretch_buffers(
     Abi41Solver* solver,
-    const std::vector<ReconSpring>& springs
+    const std::vector<Abi41Spring>& springs
 ) {
     if (!solver || !solver->cfg.stretch_optimization_enabled) {
         return true;
@@ -7357,8 +7357,8 @@ bool prepare_pcg_stretch_buffers(
         && alloc_and_copy(&solver->pcg_col_indices, col_indices.data(), static_cast<int>(nnz), "PCG CSR column allocation")
         && alloc_and_copy(&solver->pcg_edge_entry_ij, edge_entry_ij.data(), edge_count, "PCG edge ij map allocation")
         && alloc_and_copy(&solver->pcg_edge_entry_ji, edge_entry_ji.data(), edge_count, "PCG edge ji map allocation")
-        && alloc_and_copy(&solver->pcg_diag_values, static_cast<const ReconSymMat*>(nullptr), vertex_count, "PCG diagonal block allocation")
-        && alloc_and_copy(&solver->pcg_preconditioner_inv, static_cast<const ReconSymMat*>(nullptr), vertex_count, "PCG preconditioner allocation")
+        && alloc_and_copy(&solver->pcg_diag_values, static_cast<const Abi41SymMat*>(nullptr), vertex_count, "PCG diagonal block allocation")
+        && alloc_and_copy(&solver->pcg_preconditioner_inv, static_cast<const Abi41SymMat*>(nullptr), vertex_count, "PCG preconditioner allocation")
         && alloc_and_copy(&solver->pcg_offdiag_texels, static_cast<const float4*>(nullptr), static_cast<int>(nnz) * 2, "PCG offdiag texture allocation")
         && alloc_and_copy(&solver->pcg_rhs, static_cast<const Vec3*>(nullptr), vertex_count, "PCG rhs allocation")
         && alloc_and_copy(&solver->pcg_solution, static_cast<const Vec3*>(nullptr), vertex_count, "PCG solution allocation")
@@ -7412,7 +7412,7 @@ bool fetch_pcg_reductions(Abi41Solver* solver, float* out_values, const char* la
 
 std::vector<float> build_pressure_area_shares(
     int vertex_count,
-    const std::vector<ReconTriangle>& triangles,
+    const std::vector<Abi41Triangle>& triangles,
     const Vec3* rest_positions
 ) {
     std::vector<float> shares(vertex_count, 0.0f);
@@ -7421,7 +7421,7 @@ std::vector<float> build_pressure_area_shares(
     }
     double total_area = 0.0;
     int valid_triangle_count = 0;
-    for (const ReconTriangle& tri : triangles) {
+    for (const Abi41Triangle& tri : triangles) {
         const int i0 = static_cast<int>(tri.v0);
         const int i1 = static_cast<int>(tri.v1);
         const int i2 = static_cast<int>(tri.v2);
@@ -7468,7 +7468,7 @@ std::vector<float> build_pressure_area_shares(
 
 std::vector<float> build_pressure_rest_scales(
     int vertex_count,
-    const std::vector<ReconSpring>& springs,
+    const std::vector<Abi41Spring>& springs,
     const std::vector<float>& area_shares
 ) {
     std::vector<float> scales(vertex_count, 0.0f);
@@ -7478,7 +7478,7 @@ std::vector<float> build_pressure_rest_scales(
 
     std::vector<double> length_sums(static_cast<size_t>(vertex_count), 0.0);
     std::vector<int> length_counts(static_cast<size_t>(vertex_count), 0);
-    for (const ReconSpring& spring : springs) {
+    for (const Abi41Spring& spring : springs) {
         const int i = static_cast<int>(spring.id0);
         const int j = static_cast<int>(spring.id1);
         const float rest = spring.rest_length;
@@ -8030,7 +8030,7 @@ bool reset_abi41_counts(Abi41Solver* solver) {
     if (!solver->abi41_counts) {
         return true;
     }
-    if (!set_cuda_error(cudaMemset(solver->abi41_counts, 0, sizeof(unsigned long long) * kAbi41CountSlots), "reset recon diagnostics")) {
+    if (!set_cuda_error(cudaMemset(solver->abi41_counts, 0, sizeof(unsigned long long) * kAbi41CountSlots), "reset ABI41 diagnostics")) {
         return false;
     }
     if (solver->self_max_smoothed_delta_device
@@ -8059,7 +8059,7 @@ bool reset_abi41_counts(Abi41Solver* solver) {
 bool fetch_abi41_counts(Abi41Solver* solver) {
     unsigned long long counts[kAbi41CountSlots]{};
     if (solver->abi41_counts
-        && !set_cuda_error(cudaMemcpy(counts, solver->abi41_counts, sizeof(counts), cudaMemcpyDeviceToHost), "fetch recon diagnostics")) {
+        && !set_cuda_error(cudaMemcpy(counts, solver->abi41_counts, sizeof(counts), cudaMemcpyDeviceToHost), "fetch ABI41 diagnostics")) {
         return false;
     }
     solver->diag.abi41_soft_contact_count = static_cast<long long>(counts[kAbi41CountSoftContacts]);
@@ -8791,7 +8791,7 @@ extern "C" SSBL_API int ssbl_clear_global_dynamic_scene(void* handle) {
 extern "C" SSBL_API void* ssbl_create_solver(const SsblXpbdConfig* config, const SsblXpbdMesh* mesh) {
     g_last_error.clear();
     if (!finite_config(config) || !mesh || !mesh->positions || !mesh->inv_mass) {
-        set_error("invalid ABI41 ABI41 solver create request");
+        set_error("invalid ABI41 solver create request");
         return nullptr;
     }
     auto* solver = new Abi41Solver();
@@ -8863,31 +8863,31 @@ extern "C" SSBL_API void* ssbl_create_solver(const SsblXpbdConfig* config, const
             flags[i] = ssbl_abi41::kPinnedOrKinematicFlag;
         }
     }
-    std::vector<ReconSpring> springs;
+    std::vector<Abi41Spring> springs;
     springs.reserve(static_cast<size_t>(solver->cfg.edge_count));
     for (int e = 0; e < solver->cfg.edge_count; ++e) {
         int i = mesh->edges ? mesh->edges[e * 2 + 0] : 0;
         int j = mesh->edges ? mesh->edges[e * 2 + 1] : 0;
         float rest = mesh->edge_rest_lengths ? mesh->edge_rest_lengths[e] : 0.0f;
-        springs.push_back(ReconSpring{static_cast<unsigned int>(std::max(i, 0)), static_cast<unsigned int>(std::max(j, 0)), rest});
+        springs.push_back(Abi41Spring{static_cast<unsigned int>(std::max(i, 0)), static_cast<unsigned int>(std::max(j, 0)), rest});
     }
     if (solver->cfg.bend_count > 0 && (!mesh->bends || !mesh->bend_rest_lengths)) {
-        set_error("ABI41 recon bend constraints require bend pairs and rest lengths");
+        set_error("ABI41 bend constraints require bend pairs and rest lengths");
         free_solver(solver);
         return nullptr;
     }
     if (solver->cfg.lra_count > 0 && (!mesh->lra_edges || !mesh->lra_rest_lengths)) {
-        set_error("ABI41 recon LRA constraints require edge pairs and rest lengths");
+        set_error("ABI41 LRA constraints require edge pairs and rest lengths");
         free_solver(solver);
         return nullptr;
     }
-    std::vector<ReconTriangle> triangles;
+    std::vector<Abi41Triangle> triangles;
     triangles.reserve(static_cast<size_t>(solver->cfg.triangle_count));
     for (int t = 0; t < solver->cfg.triangle_count; ++t) {
         int i = mesh->triangles ? mesh->triangles[t * 3 + 0] : 0;
         int j = mesh->triangles ? mesh->triangles[t * 3 + 1] : 0;
         int k = mesh->triangles ? mesh->triangles[t * 3 + 2] : 0;
-        triangles.push_back(ReconTriangle{
+        triangles.push_back(Abi41Triangle{
             static_cast<unsigned int>(std::max(i, 0)),
             static_cast<unsigned int>(std::max(j, 0)),
             static_cast<unsigned int>(std::max(k, 0))
@@ -8916,7 +8916,7 @@ extern "C" SSBL_API void* ssbl_create_solver(const SsblXpbdConfig* config, const
             &solver->edge_color_offsets_host,
             mesh->edge_color_offsets,
             solver->cfg.edge_color_count + 1,
-            "ABI41 recon edge color offsets are required"
+            "ABI41 edge color offsets are required"
         ))
         && alloc_and_copy(&solver->bends, reinterpret_cast<const ReconPair*>(mesh->bends), solver->cfg.bend_count, "bend pair allocation")
         && alloc_and_copy(&solver->bend_rest, mesh->bend_rest_lengths, solver->cfg.bend_count, "bend rest allocation")
@@ -8924,13 +8924,13 @@ extern "C" SSBL_API void* ssbl_create_solver(const SsblXpbdConfig* config, const
             &solver->bend_color_offsets_host,
             mesh->bend_color_offsets,
             solver->cfg.bend_color_count + 1,
-            "ABI41 recon bend color offsets are required"
+            "ABI41 bend color offsets are required"
         ))
         && alloc_and_copy(&solver->lra_edges, reinterpret_cast<const ReconPair*>(mesh->lra_edges), solver->cfg.lra_count, "LRA pair allocation")
         && alloc_and_copy(&solver->lra_rest, mesh->lra_rest_lengths, solver->cfg.lra_count, "LRA rest allocation")
         && alloc_and_copy(&solver->triangles, triangles.data(), solver->cfg.triangle_count, "triangle allocation")
         && build_surface_vertex_triangles(solver, n, triangles)
-        && alloc_and_copy(&solver->abi41_counts, static_cast<const unsigned long long*>(nullptr), kAbi41CountSlots, "recon diagnostic allocation")
+        && alloc_and_copy(&solver->abi41_counts, static_cast<const unsigned long long*>(nullptr), kAbi41CountSlots, "ABI41 diagnostic allocation")
         && alloc_and_copy(&solver->self_collision_counts, static_cast<const unsigned int*>(nullptr), n, "self collision count allocation")
         && alloc_and_copy(&solver->self_collision_indices, static_cast<const unsigned int*>(nullptr), n * kAbi41SelfCollisionNeighborSlots, "self collision index allocation")
         && alloc_and_copy(&solver->self_collision_radii, static_cast<const float*>(nullptr), n, "self collision radius allocation")
@@ -9167,7 +9167,7 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
         if (solver->pin_count > 0) {
             abi41_pin_project_kernel<<<p_blocks, kThreads>>>(*solver, pin_pass_exponent, sub_dt);
         }
-        if (!set_cuda_error(cudaGetLastError(), "launch ABI41 recon integrate/pin")) {
+        if (!set_cuda_error(cudaGetLastError(), "launch ABI41 integrate/pin")) {
             return 0;
         }
         for (int it = 0; it < iterations; ++it) {
@@ -9367,18 +9367,18 @@ extern "C" SSBL_API int ssbl_step_solver_ex(
             if (run_final_pin_polish) {
                 abi41_pin_project_kernel<<<p_blocks, kThreads>>>(*solver, pin_pass_exponent, sub_dt);
             }
-            if (!set_cuda_error(cudaGetLastError(), "launch ABI41 recon constraints")) {
+            if (!set_cuda_error(cudaGetLastError(), "launch ABI41 constraints")) {
                 return 0;
             }
         }
         abi41_update_velocity_kernel<<<v_blocks, kThreads>>>(*solver, sub_dt);
-        if (!set_cuda_error(cudaGetLastError(), "launch ABI41 recon velocity")) {
+        if (!set_cuda_error(cudaGetLastError(), "launch ABI41 velocity")) {
             return 0;
         }
     }
     if (force_sync != 0 || fetch_diagnostics != 0) {
         const auto sync_started = std::chrono::high_resolution_clock::now();
-        if (!set_cuda_error(cudaDeviceSynchronize(), "ABI41 ABI41 solver step")) {
+        if (!set_cuda_error(cudaDeviceSynchronize(), "ABI41 solver step")) {
             return 0;
         }
         solver->diag.sync_ms = elapsed_ms_since(sync_started);
@@ -9409,7 +9409,7 @@ extern "C" SSBL_API int ssbl_download_positions(void* handle, float* out_positio
     }
     return set_cuda_error(
         cudaMemcpy(out_positions, solver->pos, sizeof(Vec3) * solver->cfg.vertex_count, cudaMemcpyDeviceToHost),
-        "download ABI41 recon positions"
+        "download ABI41 positions"
     ) ? 1 : 0;
 }
 

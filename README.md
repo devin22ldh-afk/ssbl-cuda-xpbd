@@ -112,7 +112,7 @@ Build the ABI41 backend and run the native smoke check:
 
 ```powershell
 Push-Location .\native
-.\build_recon.ps1
+.\build_abi41.ps1
 Pop-Location
 ```
 
@@ -169,7 +169,7 @@ Run the native backend smoke through:
 
 ```powershell
 Push-Location .\native
-.\build_recon.ps1
+.\build_abi41.ps1
 Pop-Location
 ```
 

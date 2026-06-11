@@ -15,7 +15,7 @@ Legacy ABI36 is no longer used as an automatic fallback.
 For the ABI41 smoke build, run:
 
 ```powershell
-.\build_recon.ps1
+.\build_abi41.ps1
 ```
 
 This builds only the ABI41 target and runs `ssbl_abi41_smoke.exe`, which should

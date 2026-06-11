@@ -1,5 +1,5 @@
-// Reconstructed SSBL CUDA type skeleton.
-// Source priority: sm_89 instructions/demangled symbols from cuda_extract.
+// SSBL ABI41 CUDA type skeleton used by the ABI41 backend.
+// Keep these helper structs layout-stable with the ABI41 CUDA implementation.
 #pragma once
 
 #include <cstdint>
@@ -38,7 +38,7 @@ struct symMatCuda {
 constexpr u32 kPinnedOrKinematicFlag = 0x4;
 constexpr u32 kProbableMaxSelfCollisionNeighbors = 32;
 
-static_assert(sizeof(float3) == 12, "SSBL reconstructed float3 must stay 12 bytes.");
+static_assert(sizeof(float3) == 12, "SSBL ABI41 float3 must stay 12 bytes.");
 static_assert(sizeof(CudaSpringPBD) == 12, "CudaSpringPBD must stay 12 bytes.");
 static_assert(sizeof(CudaTriangle) == 12, "CudaTriangle must stay 12 bytes.");
 static_assert(sizeof(symMatCuda) == 24, "symMatCuda must stay 24 bytes.");

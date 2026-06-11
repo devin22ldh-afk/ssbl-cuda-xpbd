@@ -140,7 +140,7 @@ $lines = @(
     "set ""CUDA_PATH=$cudaRoot""",
     "set ""CudaToolkitDir=$cudaToolkitDir""",
     """$cmake"" -S ""$Root"" -B ""$BuildDir"" -G ""Visual Studio 17 2022"" -A x64 -T ""cuda=$cudaRoot"" -DCMAKE_CUDA_COMPILER=""$cudaBin\nvcc.exe"" -DSSBL_BUILD_LEGACY=OFF -DSSBL_BUILD_ABI41=ON -DSSBL_ABI41_OUTPUT_NAME=""$OutputName"" -DSSBL_ABI41_OUTPUT_DIR=""$outputDirPath"" || exit /b 1",
-    """$cmake"" --build ""$BuildDir"" --config $Config --target ssbl_xpbd_cuda_recon ssbl_abi41_smoke || exit /b 1"
+    """$cmake"" --build ""$BuildDir"" --config $Config --target ssbl_xpbd_cuda_abi41 ssbl_abi41_smoke || exit /b 1"
 )
 if (-not $NoRun) {
     $lines += """$(Join-Path $outputDirPath 'ssbl_abi41_smoke.exe')"" || exit /b 1"
@@ -150,7 +150,7 @@ try {
     Set-Content -LiteralPath $tempCmd -Value $lines -Encoding ASCII
     & cmd.exe /d /s /c """$tempCmd"""
     if ($LASTEXITCODE -ne 0) {
-        throw "ABI41 recon build failed with exit code $LASTEXITCODE."
+        throw "ABI41 build failed with exit code $LASTEXITCODE."
     }
 } finally {
     Remove-Item -LiteralPath $tempCmd -Force -ErrorAction SilentlyContinue

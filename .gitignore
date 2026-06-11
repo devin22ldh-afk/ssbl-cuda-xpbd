@@ -17,6 +17,13 @@ native/bin/*.dll
 native/bin/*.exe
 native/bin/*.exp
 native/bin/*.lib
+native/bin/*.jsonl
+native/bin/*.out.txt
+native/bin/*.err.txt
+native/bin/*smoke*.txt
+
+# Generated release archives
+dist/*.zip
 
 # Generated validation media
 recordings/
